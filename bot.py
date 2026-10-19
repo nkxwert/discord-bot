@@ -15,8 +15,10 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "uptime.db")
-CHECK_INTERVAL_SECONDS = max(30, int(os.getenv("CHECK_INTERVAL_SECONDS", "60")))
+CHECK_INTERVAL_SECONDS = max(1, int(os.getenv("CHECK_INTERVAL_SECONDS", "10")))
 HISTORY_DAYS = 30
+PRUNE_INTERVAL_SECONDS = 60
+last_prune = 0.0
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -108,7 +110,8 @@ async def query_server(address: str):
         server = JavaServer.lookup(address)
         status = await asyncio.wait_for(server.async_status(), timeout=5)
         return True, float(status.latency) if status.latency is not None else None, status.players.online, status.players.max
-    except Exception:
+    except Exception as exc:
+        print(f"상태 확인 실패 ({address}): {type(exc).__name__}: {exc}")
         return False, None, None, None
 
 
@@ -127,16 +130,19 @@ def all_shared_servers():
 
 
 def save_sample(guild_id: int, online: bool, latency_ms):
+    global last_prune
     now = time.time()
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO samples(guild_id, checked_at, online, latency_ms) VALUES (?, ?, ?, ?)",
             (guild_id, now, int(online), latency_ms),
         )
-        conn.execute(
-            "DELETE FROM samples WHERE checked_at < ?",
-            (now - HISTORY_DAYS * 24 * 60 * 60,),
-        )
+        if now - last_prune >= PRUNE_INTERVAL_SECONDS:
+            conn.execute(
+                "DELETE FROM samples WHERE checked_at < ?",
+                (now - HISTORY_DAYS * 24 * 60 * 60,),
+            )
+            last_prune = now
         conn.commit()
 
 
