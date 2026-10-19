@@ -18,6 +18,9 @@ DB_PATH = os.getenv("DATABASE_PATH", "uptime.db")
 CHECK_INTERVAL_SECONDS = max(1, int(os.getenv("CHECK_INTERVAL_SECONDS", "10")))
 HISTORY_DAYS = 30
 PRUNE_INTERVAL_SECONDS = 60
+MAX_SERVERS_PER_GUILD = 10
+MAX_NAME_LENGTH = 30
+NO_SERVER_MESSAGE = "등록된 서버가 없습니다. `!주소추가 <주소> [이름]`으로 추가해 주세요."
 last_prune = 0.0
 
 intents = discord.Intents.default()
@@ -33,10 +36,12 @@ def connect_db():
 
 def init_db():
     with connect_db() as conn:
-        # One shared address per Discord server (guild), visible to all members.
+        # Several named servers per Discord server (guild), visible to all members.
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS shared_servers (
-                guild_id INTEGER PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
                 address TEXT NOT NULL,
                 registered_by INTEGER NOT NULL,
                 registered_at REAL NOT NULL
@@ -51,9 +56,33 @@ def init_db():
                 latency_ms REAL
             )
         """)
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(samples)")]
+        if "server_id" not in columns:
+            conn.execute("ALTER TABLE samples ADD COLUMN server_id INTEGER")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_samples_guild_time ON samples(guild_id, checked_at)"
+            "CREATE INDEX IF NOT EXISTS idx_samples_server_time ON samples(server_id, checked_at)"
         )
+
+        # Move the old one-address-per-guild table into the new one, keeping its history.
+        legacy = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'shared_servers'"
+        ).fetchone()
+        if legacy:
+            for row in conn.execute(
+                "SELECT guild_id, address, registered_by, registered_at FROM shared_servers"
+            ).fetchall():
+                cursor = conn.execute(
+                    "INSERT INTO servers(guild_id, name, address, registered_by, registered_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (row["guild_id"], row["address"], row["address"],
+                     row["registered_by"], row["registered_at"]),
+                )
+                conn.execute(
+                    "UPDATE samples SET server_id = ? WHERE guild_id = ? AND server_id IS NULL",
+                    (cursor.lastrowid, row["guild_id"]),
+                )
+            conn.execute("DROP TABLE shared_servers")
+        conn.execute("DELETE FROM samples WHERE server_id IS NULL")
         conn.commit()
 
 
@@ -115,27 +144,39 @@ async def query_server(address: str):
         return False, None, None, None
 
 
-def shared_server(guild_id: int):
+def guild_servers(guild_id: int):
     with connect_db() as conn:
         return conn.execute(
-            "SELECT guild_id, address, registered_by, registered_at "
-            "FROM shared_servers WHERE guild_id = ?",
+            "SELECT id, name, address FROM servers WHERE guild_id = ? ORDER BY id",
             (guild_id,),
-        ).fetchone()
+        ).fetchall()
 
 
-def all_shared_servers():
+def find_server(guild_id: int, key: str):
+    key = key.strip().lower()
+    servers = guild_servers(guild_id)
+    for server in servers:
+        if server["name"].lower() == key:
+            return server
+    for server in servers:
+        if server["address"].lower() == key:
+            return server
+    return None
+
+
+def all_servers():
     with connect_db() as conn:
-        return conn.execute("SELECT guild_id, address FROM shared_servers").fetchall()
+        return conn.execute("SELECT id, guild_id, address FROM servers").fetchall()
 
 
-def save_sample(guild_id: int, online: bool, latency_ms):
+def save_sample(server_id: int, guild_id: int, online: bool, latency_ms):
     global last_prune
     now = time.time()
     with connect_db() as conn:
         conn.execute(
-            "INSERT INTO samples(guild_id, checked_at, online, latency_ms) VALUES (?, ?, ?, ?)",
-            (guild_id, now, int(online), latency_ms),
+            "INSERT INTO samples(server_id, guild_id, checked_at, online, latency_ms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (server_id, guild_id, now, int(online), latency_ms),
         )
         if now - last_prune >= PRUNE_INTERVAL_SECONDS:
             conn.execute(
@@ -146,12 +187,12 @@ def save_sample(guild_id: int, online: bool, latency_ms):
         conn.commit()
 
 
-def uptime_stats(guild_id: int, since: float):
+def uptime_stats(server_id: int, since: float):
     with connect_db() as conn:
         rows = conn.execute(
             "SELECT online, latency_ms FROM samples "
-            "WHERE guild_id = ? AND checked_at >= ? ORDER BY checked_at",
-            (guild_id, since),
+            "WHERE server_id = ? AND checked_at >= ? ORDER BY checked_at",
+            (server_id, since),
         ).fetchall()
     if not rows:
         return None, 0, None
@@ -163,6 +204,10 @@ def uptime_stats(guild_id: int, since: float):
     ]
     average_latency = sum(latencies) / len(latencies) if latencies else None
     return percentage, len(rows), average_latency
+
+
+def percent_text(percentage):
+    return f"{percentage:.2f}%" if percentage is not None else "수집 중"
 
 
 @bot.event
@@ -180,23 +225,24 @@ async def help_command(ctx):
         color=discord.Color.green(),
     )
     embed.add_field(
-        name="!주소설정 <주소>",
-        value="서버 주소를 등록하거나 변경합니다. (예: `!주소설정 hypixel.net`)",
+        name="!주소추가 <주소> [이름]",
+        value="서버를 추가합니다. (예: `!주소추가 hypixel.net 하이픽셀`)",
         inline=False,
     )
-    embed.add_field(name="!업타임", value="서버 상태와 업타임을 확인합니다.", inline=False)
-    embed.add_field(name="!주소", value="등록된 주소를 확인합니다.", inline=False)
-    embed.add_field(name="!주소삭제", value="주소와 기록을 삭제합니다. (서버 관리 권한 필요)", inline=False)
+    embed.add_field(name="!업타임", value="등록된 모든 서버의 상태를 봅니다.", inline=False)
+    embed.add_field(name="!업타임 <이름>", value="서버 하나의 자세한 업타임을 봅니다.", inline=False)
+    embed.add_field(name="!주소", value="등록된 서버 목록을 봅니다.", inline=False)
+    embed.add_field(name="!주소삭제 <이름>", value="서버를 삭제합니다. (서버 관리 권한 필요)", inline=False)
     embed.set_footer(text=f"확인 주기: {CHECK_INTERVAL_SECONDS}초")
     await ctx.reply(embed=embed, mention_author=False)
 
 
-@bot.command(name="주소설정")
+@bot.command(name="주소추가")
 @commands.guild_only()
-async def set_address(ctx, *, address: str = ""):
+async def add_server(ctx, address: str = "", name: str = ""):
     if not address:
         await ctx.reply(
-            "사용법: `!주소설정 <주소>` (예: `!주소설정 hypixel.net`)",
+            "사용법: `!주소추가 <주소> [이름]` (예: `!주소추가 hypixel.net 하이픽셀`)",
             mention_author=False,
         )
         return
@@ -207,52 +253,69 @@ async def set_address(ctx, *, address: str = ""):
         await ctx.reply(f"주소 형식 오류: {exc}", mention_author=False)
         return
 
+    name = name or address
+    if len(name) > MAX_NAME_LENGTH:
+        await ctx.reply(f"이름은 {MAX_NAME_LENGTH}자 이하로 입력해 주세요.", mention_author=False)
+        return
+
+    servers = guild_servers(ctx.guild.id)
+    if len(servers) >= MAX_SERVERS_PER_GUILD:
+        await ctx.reply(f"서버는 최대 {MAX_SERVERS_PER_GUILD}개까지 등록할 수 있습니다.", mention_author=False)
+        return
+    if any(
+        s["name"].lower() == name.lower() or s["address"].lower() == address.lower()
+        for s in servers
+    ):
+        await ctx.reply("이미 등록된 이름 또는 주소입니다.", mention_author=False)
+        return
+
     # Register even if temporarily offline, but tell the user the initial probe result.
     online, latency, players_online, players_max = await query_server(address)
-    now = time.time()
     with connect_db() as conn:
         conn.execute(
-            "INSERT INTO shared_servers(guild_id, address, registered_by, registered_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET "
-            "address = excluded.address, registered_by = excluded.registered_by, "
-            "registered_at = excluded.registered_at",
-            (ctx.guild.id, address, ctx.author.id, now),
+            "INSERT INTO servers(guild_id, name, address, registered_by, registered_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ctx.guild.id, name, address, ctx.author.id, time.time()),
         )
-        # Reset prior samples because they belong to the old shared address.
-        conn.execute("DELETE FROM samples WHERE guild_id = ?", (ctx.guild.id,))
         conn.commit()
 
+    msg = f"추가했습니다: **{name}** (`{address}`)\n"
     if online:
-        msg = f"주소를 등록했습니다: `{address}`\n🟢 온라인 ({latency:.0f} ms)"
+        msg += f"🟢 온라인 ({latency:.0f} ms)"
         if players_online is not None and players_max is not None:
             msg += f" · 접속 {players_online}/{players_max}"
     else:
-        msg = (
-            f"주소를 등록했습니다: `{address}`\n"
-            "🔴 응답이 없습니다. 주소와 포트를 확인해 주세요."
-        )
+        msg += "🔴 응답이 없습니다. 주소와 포트를 확인해 주세요."
     await ctx.reply(msg, mention_author=False)
 
 
 @bot.command(name="주소")
 @commands.guild_only()
 async def show_address(ctx):
-    server = shared_server(ctx.guild.id)
-    if not server:
-        await ctx.reply("등록된 주소가 없습니다. `!주소설정 <주소>`로 등록해 주세요.", mention_author=False)
+    servers = guild_servers(ctx.guild.id)
+    if not servers:
+        await ctx.reply(NO_SERVER_MESSAGE, mention_author=False)
         return
-    await ctx.reply(f"현재 주소: `{server['address']}`", mention_author=False)
+    lines = [f"• **{s['name']}** — `{s['address']}`" for s in servers]
+    await ctx.reply("\n".join(lines), mention_author=False)
 
 
 @bot.command(name="주소삭제")
 @commands.guild_only()
 @commands.has_guild_permissions(manage_guild=True)
-async def delete_address(ctx):
+async def delete_address(ctx, *, name: str = ""):
+    if not name:
+        await ctx.reply("사용법: `!주소삭제 <이름>`", mention_author=False)
+        return
+    server = find_server(ctx.guild.id, name)
+    if not server:
+        await ctx.reply(f"`{name}` 서버가 없습니다. `!주소`로 목록을 확인해 주세요.", mention_author=False)
+        return
     with connect_db() as conn:
-        conn.execute("DELETE FROM shared_servers WHERE guild_id = ?", (ctx.guild.id,))
-        conn.execute("DELETE FROM samples WHERE guild_id = ?", (ctx.guild.id,))
+        conn.execute("DELETE FROM servers WHERE id = ?", (server["id"],))
+        conn.execute("DELETE FROM samples WHERE server_id = ?", (server["id"],))
         conn.commit()
-    await ctx.reply("주소와 업타임 기록을 삭제했습니다.", mention_author=False)
+    await ctx.reply(f"**{server['name']}** 서버와 업타임 기록을 삭제했습니다.", mention_author=False)
 
 
 @delete_address.error
@@ -263,25 +326,48 @@ async def delete_address_error(ctx, error):
         await ctx.reply("오류가 발생했습니다.", mention_author=False)
 
 
-@bot.command(name="업타임")
-@commands.guild_only()
-async def uptime(ctx):
-    server = shared_server(ctx.guild.id)
-    if not server:
-        await ctx.reply("등록된 주소가 없습니다. `!주소설정 <주소>`로 등록해 주세요.", mention_author=False)
-        return
+def build_list_embed(servers, results, now):
+    lines_by_server = []
+    online_count = 0
+    for server, (online, latency, players_online, players_max) in zip(servers, results):
+        online_count += int(online)
+        day_percent, _, _ = uptime_stats(server["id"], now - 24 * 60 * 60)
+        week_percent, _, _ = uptime_stats(server["id"], now - 7 * 24 * 60 * 60)
+        if online:
+            status = f"{latency:.0f} ms" if latency is not None else "-"
+            if players_online is not None and players_max is not None:
+                status = f"접속 {players_online}/{players_max} · {status}"
+        else:
+            status = "응답 없음"
+        value = f"{status}\n24시간 {percent_text(day_percent)} · 7일 {percent_text(week_percent)}"
+        lines_by_server.append((f"{'🟢' if online else '🔴'} {server['name']}", value))
 
-    address = server["address"]
-    online, latency, players_online, players_max = await query_server(address)
-    save_sample(ctx.guild.id, online, latency)
-
-    now = time.time()
-    day_percent, day_samples, avg_latency = uptime_stats(ctx.guild.id, now - 24 * 60 * 60)
-    week_percent, week_samples, _ = uptime_stats(ctx.guild.id, now - 7 * 24 * 60 * 60)
-
+    if online_count == len(servers):
+        color = discord.Color.green()
+    elif online_count == 0:
+        color = discord.Color.red()
+    else:
+        color = discord.Color.orange()
     embed = discord.Embed(
         title="서버 업타임",
-        description=f"`{address}`",
+        description=f"{online_count}/{len(servers)} 온라인",
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    for name, value in lines_by_server:
+        embed.add_field(name=name, value=value, inline=False)
+    embed.set_footer(text=f"{CHECK_INTERVAL_SECONDS}초마다 확인 · 자세히: !업타임 <이름>")
+    return embed
+
+
+def build_detail_embed(server, result, now):
+    online, latency, players_online, players_max = result
+    day_percent, day_samples, avg_latency = uptime_stats(server["id"], now - 24 * 60 * 60)
+    week_percent, week_samples, _ = uptime_stats(server["id"], now - 7 * 24 * 60 * 60)
+
+    embed = discord.Embed(
+        title=f"{server['name']} 업타임",
+        description=f"`{server['address']}`",
         color=discord.Color.green() if online else discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
@@ -304,14 +390,41 @@ async def uptime(ctx):
     if avg_latency is not None:
         embed.add_field(name="평균 응답", value=f"{avg_latency:.0f} ms", inline=True)
     embed.set_footer(text=f"{CHECK_INTERVAL_SECONDS}초마다 확인")
+    return embed
+
+
+@bot.command(name="업타임")
+@commands.guild_only()
+async def uptime(ctx, *, name: str = ""):
+    servers = guild_servers(ctx.guild.id)
+    if not servers:
+        await ctx.reply(NO_SERVER_MESSAGE, mention_author=False)
+        return
+
+    if name:
+        server = find_server(ctx.guild.id, name)
+        if not server:
+            await ctx.reply(f"`{name}` 서버가 없습니다. `!주소`로 목록을 확인해 주세요.", mention_author=False)
+            return
+        servers = [server]
+
+    results = await asyncio.gather(*(query_server(s["address"]) for s in servers))
+    for server, (online, latency, _, _) in zip(servers, results):
+        save_sample(server["id"], ctx.guild.id, online, latency)
+
+    now = time.time()
+    if name:
+        embed = build_detail_embed(servers[0], results[0], now)
+    else:
+        embed = build_list_embed(servers, results, now)
     await ctx.reply(embed=embed, mention_author=False)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def monitor_servers():
-    for row in all_shared_servers():
+    for row in all_servers():
         online, latency, _, _ = await query_server(row["address"])
-        save_sample(row["guild_id"], online, latency)
+        save_sample(row["id"], row["guild_id"], online, latency)
         await asyncio.sleep(0.2)
 
 
