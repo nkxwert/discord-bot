@@ -1,20 +1,21 @@
-# 공용 Minecraft Uptime Discord Bot
+# Minecraft 업타임 디스코드 봇
 
-각 디스코드 서버(guild)마다 공용 Minecraft Java Edition 주소 하나를 저장합니다. 한 사람이 주소를 등록하면 해당 디스코드 서버의 모든 멤버가 `!업타임`으로 같은 서버를 조회할 수 있습니다.
+디스코드 서버마다 Minecraft Java Edition 주소 하나를 저장하고, 누구나 `!업타임`으로 상태를 확인할 수 있습니다.
 
 ## 명령어
-- `!주소설정 hypixel.net` — 현재 디스코드 서버의 공용 주소 등록/변경
-- `!업타임` — 누구나 공용 서버 상태, 응답 시간, 최근 24시간/7일 관측 업타임 조회
-- `!주소` — 공용 주소 확인
-- `!주소삭제` — 서버 관리 권한이 있는 사용자만 공용 주소 삭제
+- `!주소설정 hypixel.net` — 주소 등록/변경 (누구나 사용 가능)
+- `!업타임` — 상태, 응답 시간, 24시간/7일 업타임
+- `!주소` — 등록된 주소 확인
+- `!주소삭제` — 주소와 기록 삭제 (서버 관리 권한 필요)
 - `!도움말` — 명령어 안내
 
+## 봇 설정
+1. Discord Developer Portal에서 봇을 만들고 **Message Content Intent**를 켭니다.
+2. OAuth2 URL Generator에서 `bot` 스코프와 아래 권한을 선택해 초대합니다.
+   - View Channels, Send Messages, Embed Links, Read Message History (권한 값 `84992`)
+
 ## Windows 실행
-1. Python 3.11 이상 설치
-2. Discord Developer Portal에서 애플리케이션/봇 생성
-3. Bot 설정에서 **Message Content Intent** 활성화
-4. OAuth2 URL Generator에서 `bot` 권한과 `Send Messages`, `Embed Links` 권한을 선택해 봇 초대
-5. 프로젝트 폴더에서 PowerShell 실행:
+Python 3.11 이상이 필요합니다. PowerShell에서 실행합니다.
 
 ```powershell
 py -m venv .venv
@@ -25,11 +26,9 @@ notepad .env
 python bot.py
 ```
 
-`.env`의 `DISCORD_TOKEN`에 봇 토큰을 입력하고 저장한 다음 `python bot.py`를 실행합니다. 토큰을 공유하거나 GitHub에 올리지 마세요.
+`.env`의 `DISCORD_TOKEN`에 봇 토큰을 입력합니다. 토큰은 공유하거나 GitHub에 올리지 마세요.
 
 ## 참고
-- Minecraft **Java Edition** 상태 조회용입니다.
-- 서버 주소는 디스코드 서버별로 공유되므로 한 디스코드 서버에 등록한 주소는 다른 디스코드 서버와 자동 공유되지 않습니다.
-- 업타임은 봇이 주기적으로 수집한 상태 표본을 바탕으로 계산합니다. 봇이 꺼져 있던 시간은 정확히 측정할 수 없습니다.
-- 상태 확인 간격 기본값은 60초이며 `.env`의 `CHECK_INTERVAL_SECONDS`로 조절할 수 있습니다(최소 30초).
-- `!주소삭제`는 서버 관리 권한이 필요합니다.
+- Java Edition 전용이며, 주소는 디스코드 서버별로 따로 저장됩니다.
+- 업타임은 봇이 수집한 표본 기준이라 봇이 꺼진 시간은 측정되지 않습니다.
+- 확인 간격은 `.env`의 `CHECK_INTERVAL_SECONDS`로 조절합니다. (기본 60초, 최소 30초)
