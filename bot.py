@@ -5,7 +5,9 @@ import sqlite3
 import asyncio
 import ipaddress
 from datetime import datetime, timezone
+from urllib.parse import quote
 
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 from mcstatus import JavaServer
@@ -21,6 +23,12 @@ PRUNE_INTERVAL_SECONDS = 60
 MAX_SERVERS_PER_GUILD = 10
 MAX_NAME_LENGTH = 30
 NO_SERVER_MESSAGE = "등록된 서버가 없습니다. `!주소추가 <주소> [이름]`으로 추가해 주세요."
+# Last resort when the direct ping fails; only domain names are ever sent out, never IPs.
+EXTERNAL_FALLBACK = os.getenv("EXTERNAL_FALLBACK", "true").strip().lower() not in ("0", "false", "no", "off")
+EXTERNAL_API_URL = "https://api.mcsrvstat.us/3/"
+EXTERNAL_TIMEOUT_SECONDS = 8
+EXTERNAL_COOLDOWN_SECONDS = 60
+external_cache = {}
 last_prune = 0.0
 
 intents = discord.Intents.default()
@@ -134,14 +142,58 @@ def validate_address(raw: str) -> str:
     return address
 
 
+def address_host(address: str) -> str:
+    if address.startswith("["):
+        return address[1:address.index("]")]
+    if address.count(":") == 1:
+        return address.rsplit(":", 1)[0]
+    return address
+
+
+def can_use_external(address: str) -> bool:
+    host = address_host(address).strip(".")
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return "." in host
+
+
+async def query_external(address: str):
+    now = time.time()
+    cached = external_cache.get(address.lower())
+    if cached and now - cached[0] < EXTERNAL_COOLDOWN_SECONDS:
+        return cached[1]
+
+    result = (False, None, None, None)
+    try:
+        timeout = aiohttp.ClientTimeout(total=EXTERNAL_TIMEOUT_SECONDS)
+        headers = {"User-Agent": "discord-minecraft-uptime-bot"}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(EXTERNAL_API_URL + quote(address, safe=":")) as response:
+                response.raise_for_status()
+                data = await response.json()
+        players = data.get("players") or {}
+        result = (bool(data.get("online")), None, players.get("online"), players.get("max"))
+    except Exception as exc:
+        print(f"외부 조회 실패 ({address}): {type(exc).__name__}: {exc}")
+    external_cache[address.lower()] = (now, result)
+    return result
+
+
 async def query_server(address: str):
+    """Returns (online, latency_ms, players_online, players_max, via_external)."""
     try:
         server = JavaServer.lookup(address)
         status = await asyncio.wait_for(server.async_status(), timeout=5)
-        return True, float(status.latency) if status.latency is not None else None, status.players.online, status.players.max
+        latency = float(status.latency) if status.latency is not None else None
+        return True, latency, status.players.online, status.players.max, False
     except Exception as exc:
         print(f"상태 확인 실패 ({address}): {type(exc).__name__}: {exc}")
-        return False, None, None, None
+    if EXTERNAL_FALLBACK and can_use_external(address):
+        return (*await query_external(address), True)
+    return False, None, None, None, False
 
 
 def guild_servers(guild_id: int):
@@ -270,7 +322,7 @@ async def add_server(ctx, address: str = "", name: str = ""):
         return
 
     # Register even if temporarily offline, but tell the user the initial probe result.
-    online, latency, players_online, players_max = await query_server(address)
+    online, latency, players_online, players_max, external = await query_server(address)
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO servers(guild_id, name, address, registered_by, registered_at) "
@@ -281,7 +333,7 @@ async def add_server(ctx, address: str = "", name: str = ""):
 
     msg = f"추가했습니다: **{name}** (`{address}`)\n"
     if online:
-        msg += f"🟢 온라인 ({latency:.0f} ms)"
+        msg += "🟢 온라인 (외부 조회)" if external else f"🟢 온라인 ({latency:.0f} ms)"
         if players_online is not None and players_max is not None:
             msg += f" · 접속 {players_online}/{players_max}"
     else:
@@ -329,12 +381,12 @@ async def delete_address_error(ctx, error):
 def build_list_embed(servers, results, now):
     lines_by_server = []
     online_count = 0
-    for server, (online, latency, players_online, players_max) in zip(servers, results):
+    for server, (online, latency, players_online, players_max, external) in zip(servers, results):
         online_count += int(online)
         day_percent, _, _ = uptime_stats(server["id"], now - 24 * 60 * 60)
         week_percent, _, _ = uptime_stats(server["id"], now - 7 * 24 * 60 * 60)
         if online:
-            status = f"{latency:.0f} ms" if latency is not None else "-"
+            status = f"{latency:.0f} ms" if latency is not None else "외부 조회" if external else "-"
             if players_online is not None and players_max is not None:
                 status = f"접속 {players_online}/{players_max} · {status}"
         else:
@@ -361,7 +413,7 @@ def build_list_embed(servers, results, now):
 
 
 def build_detail_embed(server, result, now):
-    online, latency, players_online, players_max = result
+    online, latency, players_online, players_max, external = result
     day_percent, day_samples, avg_latency = uptime_stats(server["id"], now - 24 * 60 * 60)
     week_percent, week_samples, _ = uptime_stats(server["id"], now - 7 * 24 * 60 * 60)
 
@@ -372,7 +424,11 @@ def build_detail_embed(server, result, now):
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="상태", value="🟢 온라인" if online else "🔴 오프라인", inline=True)
-    embed.add_field(name="응답", value=f"{latency:.0f} ms" if latency is not None else "-", inline=True)
+    embed.add_field(
+        name="응답",
+        value=f"{latency:.0f} ms" if latency is not None else "외부 조회" if online and external else "-",
+        inline=True,
+    )
 
     if players_online is not None and players_max is not None:
         embed.add_field(name="접속", value=f"{players_online}/{players_max}", inline=True)
@@ -409,7 +465,7 @@ async def uptime(ctx, *, name: str = ""):
         servers = [server]
 
     results = await asyncio.gather(*(query_server(s["address"]) for s in servers))
-    for server, (online, latency, _, _) in zip(servers, results):
+    for server, (online, latency, _, _, _) in zip(servers, results):
         save_sample(server["id"], ctx.guild.id, online, latency)
 
     now = time.time()
@@ -423,7 +479,7 @@ async def uptime(ctx, *, name: str = ""):
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def monitor_servers():
     for row in all_servers():
-        online, latency, _, _ = await query_server(row["address"])
+        online, latency, _, _, _ = await query_server(row["address"])
         save_sample(row["id"], row["guild_id"], online, latency)
         await asyncio.sleep(0.2)
 
