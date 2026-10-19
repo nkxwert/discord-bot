@@ -28,6 +28,7 @@ EXTERNAL_FALLBACK = os.getenv("EXTERNAL_FALLBACK", "true").strip().lower() not i
 EXTERNAL_API_URL = "https://api.mcsrvstat.us/3/"
 EXTERNAL_TIMEOUT_SECONDS = 8
 EXTERNAL_COOLDOWN_SECONDS = 60
+SLOW_NOTICE_SECONDS = 2
 external_cache = {}
 last_prune = 0.0
 
@@ -322,7 +323,8 @@ async def add_server(ctx, address: str = "", name: str = ""):
         return
 
     # Register even if temporarily offline, but tell the user the initial probe result.
-    online, latency, players_online, players_max, external = await query_server(address)
+    result, notice = await run_with_notice(ctx, query_server(address))
+    online, latency, players_online, players_max, external = result
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO servers(guild_id, name, address, registered_by, registered_at) "
@@ -338,7 +340,7 @@ async def add_server(ctx, address: str = "", name: str = ""):
             msg += f" · 접속 {players_online}/{players_max}"
     else:
         msg += "🔴 응답이 없습니다. 주소와 포트를 확인해 주세요."
-    await ctx.reply(msg, mention_author=False)
+    await send_result(ctx, notice, content=msg)
 
 
 @bot.command(name="주소")
@@ -376,6 +378,26 @@ async def delete_address_error(ctx, error):
         await ctx.reply("서버 관리 권한이 필요합니다.", mention_author=False)
     else:
         await ctx.reply("오류가 발생했습니다.", mention_author=False)
+
+
+async def run_with_notice(ctx, awaitable):
+    """Await a slow lookup, posting a waiting notice only if it takes a while."""
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait({task}, timeout=SLOW_NOTICE_SECONDS)
+    notice = None if done else await ctx.reply("잠시만 기다려 주세요...", mention_author=False)
+    try:
+        return await task, notice
+    except Exception:
+        if notice:
+            await notice.edit(content="오류가 발생했습니다.")
+        raise
+
+
+async def send_result(ctx, notice, content=None, embed=None):
+    if notice:
+        await notice.edit(content=content, embed=embed)
+    else:
+        await ctx.reply(content=content, embed=embed, mention_author=False)
 
 
 def build_list_embed(servers, results, now):
@@ -464,7 +486,9 @@ async def uptime(ctx, *, name: str = ""):
             return
         servers = [server]
 
-    results = await asyncio.gather(*(query_server(s["address"]) for s in servers))
+    results, notice = await run_with_notice(
+        ctx, asyncio.gather(*(query_server(s["address"]) for s in servers))
+    )
     for server, (online, latency, _, _, _) in zip(servers, results):
         save_sample(server["id"], ctx.guild.id, online, latency)
 
@@ -473,7 +497,7 @@ async def uptime(ctx, *, name: str = ""):
         embed = build_detail_embed(servers[0], results[0], now)
     else:
         embed = build_list_embed(servers, results, now)
-    await ctx.reply(embed=embed, mention_author=False)
+    await send_result(ctx, notice, embed=embed)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
