@@ -110,7 +110,8 @@ async def query_server(address: str):
         server = JavaServer.lookup(address)
         status = await asyncio.wait_for(server.async_status(), timeout=5)
         return True, float(status.latency) if status.latency is not None else None, status.players.online, status.players.max
-    except Exception:
+    except Exception as exc:
+        print(f"상태 확인 실패 ({address}): {type(exc).__name__}: {exc}")
         return False, None, None, None
 
 
