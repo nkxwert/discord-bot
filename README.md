@@ -31,4 +31,4 @@ python bot.py
 ## 참고
 - Java Edition 전용이며, 주소는 디스코드 서버별로 따로 저장됩니다.
 - 업타임은 봇이 수집한 표본 기준이라 봇이 꺼진 시간은 측정되지 않습니다.
-- 확인 간격은 `.env`의 `CHECK_INTERVAL_SECONDS`로 조절합니다. (기본 1초, 최소 1초)
+- 확인 간격은 `.env`의 `CHECK_INTERVAL_SECONDS`로 조절합니다. (기본 10초, 최소 1초)
