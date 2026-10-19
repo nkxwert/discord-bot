@@ -170,24 +170,18 @@ async def on_ready():
 @bot.command(name="도움말", aliases=["help"])
 async def help_command(ctx):
     embed = discord.Embed(
-        title="공용 마인크래프트 업타임 봇",
-        description="주소는 디스코드 서버 전체에서 공유됩니다.",
+        title="마인크래프트 업타임 봇",
         color=discord.Color.green(),
     )
     embed.add_field(
-        name="!주소설정 <주소 또는 IP>",
-        value="이 디스코드 서버의 공용 서버 주소를 등록하거나 변경합니다.\n"
-              "예: `!주소설정 hypixel.net`",
+        name="!주소설정 <주소>",
+        value="서버 주소를 등록하거나 변경합니다. (예: `!주소설정 hypixel.net`)",
         inline=False,
     )
-    embed.add_field(
-        name="!업타임",
-        value="누구나 공용 서버의 현재 상태와 관측 업타임을 확인합니다.",
-        inline=False,
-    )
-    embed.add_field(name="!주소", value="현재 공용 서버 주소를 확인합니다.", inline=False)
-    embed.add_field(name="!주소삭제", value="공용 서버 주소와 업타임 기록을 삭제합니다.", inline=False)
-    embed.set_footer(text=f"상태 확인 주기: {CHECK_INTERVAL_SECONDS}초")
+    embed.add_field(name="!업타임", value="서버 상태와 업타임을 확인합니다.", inline=False)
+    embed.add_field(name="!주소", value="등록된 주소를 확인합니다.", inline=False)
+    embed.add_field(name="!주소삭제", value="주소와 기록을 삭제합니다. (서버 관리 권한 필요)", inline=False)
+    embed.set_footer(text=f"확인 주기: {CHECK_INTERVAL_SECONDS}초")
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -196,7 +190,7 @@ async def help_command(ctx):
 async def set_address(ctx, *, address: str = ""):
     if not address:
         await ctx.reply(
-            "사용법: `!주소설정 <주소 또는 IP>`\n예: `!주소설정 hypixel.net`",
+            "사용법: `!주소설정 <주소>` (예: `!주소설정 hypixel.net`)",
             mention_author=False,
         )
         return
@@ -223,13 +217,13 @@ async def set_address(ctx, *, address: str = ""):
         conn.commit()
 
     if online:
-        msg = f"공용 서버 주소를 등록했어: `{address}`\n현재 상태: 🟢 온라인 ({latency:.0f} ms)"
+        msg = f"주소를 등록했습니다: `{address}`\n🟢 온라인 ({latency:.0f} ms)"
         if players_online is not None and players_max is not None:
-            msg += f"\n접속 인원: {players_online}/{players_max}"
+            msg += f" · 접속 {players_online}/{players_max}"
     else:
         msg = (
-            f"공용 서버 주소를 등록했어: `{address}`\n"
-            "현재 응답이 없어. 주소와 포트를 확인해 줘. 등록은 완료됐고 이후 상태를 계속 확인할게."
+            f"주소를 등록했습니다: `{address}`\n"
+            "🔴 응답이 없습니다. 주소와 포트를 확인해 주세요."
         )
     await ctx.reply(msg, mention_author=False)
 
@@ -239,9 +233,9 @@ async def set_address(ctx, *, address: str = ""):
 async def show_address(ctx):
     server = shared_server(ctx.guild.id)
     if not server:
-        await ctx.reply("아직 공용 서버 주소가 등록되지 않았어. `!주소설정 <주소 또는 IP>`를 사용해 줘.", mention_author=False)
+        await ctx.reply("등록된 주소가 없습니다. `!주소설정 <주소>`로 등록해 주세요.", mention_author=False)
         return
-    await ctx.reply(f"현재 공용 서버 주소: `{server['address']}`", mention_author=False)
+    await ctx.reply(f"현재 주소: `{server['address']}`", mention_author=False)
 
 
 @bot.command(name="주소삭제")
@@ -252,15 +246,15 @@ async def delete_address(ctx):
         conn.execute("DELETE FROM shared_servers WHERE guild_id = ?", (ctx.guild.id,))
         conn.execute("DELETE FROM samples WHERE guild_id = ?", (ctx.guild.id,))
         conn.commit()
-    await ctx.reply("이 디스코드 서버의 공용 주소와 업타임 기록을 삭제했어.", mention_author=False)
+    await ctx.reply("주소와 업타임 기록을 삭제했습니다.", mention_author=False)
 
 
 @delete_address.error
 async def delete_address_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("`!주소삭제`는 서버 관리 권한이 있는 사람만 사용할 수 있어.", mention_author=False)
+        await ctx.reply("서버 관리 권한이 필요합니다.", mention_author=False)
     else:
-        await ctx.reply("명령어 처리 중 오류가 발생했어.", mention_author=False)
+        await ctx.reply("오류가 발생했습니다.", mention_author=False)
 
 
 @bot.command(name="업타임")
@@ -268,7 +262,7 @@ async def delete_address_error(ctx, error):
 async def uptime(ctx):
     server = shared_server(ctx.guild.id)
     if not server:
-        await ctx.reply("아직 공용 서버 주소가 등록되지 않았어. `!주소설정 <주소 또는 IP>`를 사용해 줘.", mention_author=False)
+        await ctx.reply("등록된 주소가 없습니다. `!주소설정 <주소>`로 등록해 주세요.", mention_author=False)
         return
 
     address = server["address"]
@@ -280,32 +274,30 @@ async def uptime(ctx):
     week_percent, week_samples, _ = uptime_stats(ctx.guild.id, now - 7 * 24 * 60 * 60)
 
     embed = discord.Embed(
-        title="마인크래프트 서버 업타임",
-        description=f"공용 서버 주소: `{address}`",
+        title="서버 업타임",
+        description=f"`{address}`",
         color=discord.Color.green() if online else discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="현재 상태", value="🟢 온라인" if online else "🔴 오프라인 / 응답 없음", inline=True)
-    embed.add_field(name="응답 시간", value=f"{latency:.0f} ms" if latency is not None else "측정 불가", inline=True)
+    embed.add_field(name="상태", value="🟢 온라인" if online else "🔴 오프라인", inline=True)
+    embed.add_field(name="응답", value=f"{latency:.0f} ms" if latency is not None else "-", inline=True)
 
     if players_online is not None and players_max is not None:
-        embed.add_field(name="접속 인원", value=f"{players_online}/{players_max}", inline=True)
+        embed.add_field(name="접속", value=f"{players_online}/{players_max}", inline=True)
 
     embed.add_field(
-        name="최근 24시간 관측 업타임",
-        value=f"{day_percent:.2f}% ({day_samples}회 확인)" if day_percent is not None else "기록 수집 중",
-        inline=False,
+        name="24시간 업타임",
+        value=f"{day_percent:.2f}% ({day_samples}회)" if day_percent is not None else "수집 중",
+        inline=True,
     )
     embed.add_field(
-        name="최근 7일 관측 업타임",
-        value=f"{week_percent:.2f}% ({week_samples}회 확인)" if week_percent is not None else "기록 수집 중",
-        inline=False,
+        name="7일 업타임",
+        value=f"{week_percent:.2f}% ({week_samples}회)" if week_percent is not None else "수집 중",
+        inline=True,
     )
     if avg_latency is not None:
-        embed.add_field(name="평균 응답 시간 (24시간)", value=f"{avg_latency:.0f} ms", inline=True)
-    embed.set_footer(
-        text=f"이 디스코드 서버의 공용 주소 · 확인 주기 {CHECK_INTERVAL_SECONDS}초 · 기록은 봇 관측 표본 기준"
-    )
+        embed.add_field(name="평균 응답", value=f"{avg_latency:.0f} ms", inline=True)
+    embed.set_footer(text=f"{CHECK_INTERVAL_SECONDS}초마다 확인")
     await ctx.reply(embed=embed, mention_author=False)
 
 
