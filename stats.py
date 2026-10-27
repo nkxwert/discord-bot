@@ -20,6 +20,8 @@ SKIN_URLS = (
     "https://mc-heads.net/body/{uuid}/240",
 )
 VALORANT_REGIONS = ("kr", "ap", "na", "eu", "latam", "br")
+MATCH_COUNT = 10  # matches used for K/D and other averages
+MATCHES_SHOWN = 5
 
 _cache = {}
 
@@ -306,19 +308,53 @@ def match_summary(match):
     meta = match.get("meta") or {}
     stats = match.get("stats") or {}
     teams = match.get("teams") or {}
+    shots = stats.get("shots") or {}
     team = (stats.get("team") or "").lower()
-    result = "-"
+    result, won, rounds = "-", None, 0
     if team in ("red", "blue"):
         mine, theirs = teams.get(team), teams.get("blue" if team == "red" else "red")
         if isinstance(mine, int) and isinstance(theirs, int):
             result = "승" if mine > theirs else "패" if mine < theirs else "무"
             result += f" {mine}:{theirs}"
+            won = mine > theirs if mine != theirs else None
+            rounds = mine + theirs
+    kills, deaths, assists = (stats.get(k, 0) or 0 for k in ("kills", "deaths", "assists"))
     return {
         "result": result,
+        "won": won,
         "agent": (stats.get("character") or {}).get("name") or "-",
         "map": (meta.get("map") or {}).get("name") or "-",
         "mode": meta.get("mode") or "-",
-        "kda": f"{stats.get('kills', 0)}/{stats.get('deaths', 0)}/{stats.get('assists', 0)}",
+        "kills": kills,
+        "deaths": deaths,
+        "assists": assists,
+        "kda": f"{kills}/{deaths}/{assists}",
+        "headshots": shots.get("head", 0) or 0,
+        "shots": sum(shots.get(k, 0) or 0 for k in ("head", "body", "leg")),
+        "damage": (stats.get("damage") or {}).get("made", 0) or 0,
+        "rounds": rounds,
+    }
+
+
+def match_totals(matches):
+    """Win rate, K/D, average KDA, headshot % and ADR over matches, skipping Deathmatch modes."""
+    counted = [m for m in matches if "deathmatch" not in m["mode"].lower()]
+    if not counted:
+        return None
+    n = len(counted)
+    kills = sum(m["kills"] for m in counted)
+    deaths = sum(m["deaths"] for m in counted)
+    assists = sum(m["assists"] for m in counted)
+    decided = [m["won"] for m in counted if m["won"] is not None]
+    shots = sum(m["shots"] for m in counted)
+    rounds = sum(m["rounds"] for m in counted)
+    return {
+        "games": n,
+        "win_rate": f"{sum(decided) / len(decided) * 100:.0f}% ({sum(decided)}승 {len(decided) - sum(decided)}패)" if decided else "-",
+        "kd": ratio(kills, deaths),
+        "kda": f"{kills / n:.1f} / {deaths / n:.1f} / {assists / n:.1f}",
+        "headshot": f"{sum(m['headshots'] for m in counted) / shots * 100:.1f}%" if shots else "-",
+        "adr": f"{sum(m['damage'] for m in counted) / rounds:.0f}" if rounds else "-",
     }
 
 
@@ -327,9 +363,10 @@ async def valorant_profile(name, tag, region):
         base = f"{region}/{quote(name, safe='')}/{quote(tag, safe='')}"
         mmr = await _henrik(f"v2/mmr/{base}") or {}
         try:
-            matches = await _henrik(f"v1/stored-matches/{base}?size=5") or []
+            matches = await _henrik(f"v1/stored-matches/{base}?size={MATCH_COUNT}") or []
         except StatsError:
             matches = []
+        summaries = [match_summary(m) for m in matches[:MATCH_COUNT] if isinstance(m, dict)]
         current = mmr.get("current_data") or {}
         highest = mmr.get("highest_rank") or {}
         return {
@@ -337,12 +374,14 @@ async def valorant_profile(name, tag, region):
             "tag": mmr.get("tag") or tag,
             "region": region,
             "rank": current.get("currenttierpatched") or "Unrated",
+            "rank_icon": (current.get("images") or {}).get("small"),
             "rr": current.get("ranking_in_tier"),
             "rr_change": current.get("mmr_change_to_last_game"),
             "elo": current.get("elo"),
             "peak": highest.get("patched_tier"),
             "peak_season": highest.get("season"),
-            "matches": [match_summary(m) for m in matches[:5] if isinstance(m, dict)],
+            "matches": summaries[:MATCHES_SHOWN],
+            "totals": match_totals(summaries),
         }
 
     return await _cached(("valorant", region, name.lower(), tag.lower()), load)
