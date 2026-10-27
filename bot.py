@@ -13,6 +13,9 @@ from discord.ext import commands, tasks
 from mcstatus import JavaServer
 from dotenv import load_dotenv
 
+import cards
+import stats
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -29,12 +32,18 @@ EXTERNAL_API_URL = "https://api.mcsrvstat.us/3/"
 EXTERNAL_TIMEOUT_SECONDS = 8
 EXTERNAL_COOLDOWN_SECONDS = 60
 SLOW_NOTICE_SECONDS = 2
+STATS_COOLDOWN_SECONDS = 5
+HYPIXEL_GAMES = {
+    "bw": "bedwars", "bedwars": "bedwars", "베드워즈": "bedwars", "베워": "bedwars",
+    "sw": "skywars", "skywars": "skywars", "스카이워즈": "skywars", "스카": "skywars",
+    "duels": "duels", "duel": "duels", "듀얼": "duels",
+}
 external_cache = {}
 last_prune = 0.0
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, case_insensitive=True)
 
 
 def connect_db():
@@ -286,6 +295,16 @@ async def help_command(ctx):
     embed.add_field(name="!업타임 <이름>", value="서버 하나의 자세한 업타임을 봅니다.", inline=False)
     embed.add_field(name="!주소", value="등록된 서버 목록을 봅니다.", inline=False)
     embed.add_field(name="!주소삭제 <이름>", value="서버를 삭제합니다. (서버 관리 권한 필요)", inline=False)
+    embed.add_field(
+        name="!H전적 <닉네임> [bw|sw|duels]",
+        value="하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임별 전적을 봅니다.",
+        inline=False,
+    )
+    embed.add_field(
+        name="!V전적 <이름#태그> [지역]",
+        value="발로란트 랭크와 최근 경기를 봅니다. 지역 기본값은 kr입니다.",
+        inline=False,
+    )
     embed.set_footer(text=f"확인 주기: {CHECK_INTERVAL_SECONDS}초")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -393,9 +412,11 @@ async def run_with_notice(ctx, awaitable):
         raise
 
 
-async def send_result(ctx, notice, content=None, embed=None):
+async def send_result(ctx, notice, content=None, embed=None, file=None):
     if notice:
-        await notice.edit(content=content, embed=embed)
+        await notice.edit(content=content, embed=embed, attachments=[file] if file else [])
+    elif file:
+        await ctx.reply(content=content, embed=embed, file=file, mention_author=False)
     else:
         await ctx.reply(content=content, embed=embed, mention_author=False)
 
@@ -498,6 +519,96 @@ async def uptime(ctx, *, name: str = ""):
     else:
         embed = build_list_embed(servers, results, now)
     await send_result(ctx, notice, embed=embed)
+
+
+async def lookup(awaitable):
+    """Turn a StatsError into a (None, message) pair so it can be shown to the user."""
+    try:
+        return await awaitable, None
+    except stats.StatsError as exc:
+        return None, str(exc)
+
+
+@bot.command(name="H전적")
+@commands.cooldown(1, STATS_COOLDOWN_SECONDS, commands.BucketType.user)
+async def hypixel_stats(ctx, name: str = "", game: str = ""):
+    if not name:
+        ctx.command.reset_cooldown(ctx)
+        await ctx.reply("사용법: `!H전적 <닉네임> [bw|sw|duels]` (예: `!H전적 hypixel bw`)", mention_author=False)
+        return
+    game_key = HYPIXEL_GAMES.get(game.lower()) if game else None
+    if game and not game_key:
+        ctx.command.reset_cooldown(ctx)
+        await ctx.reply("게임은 `bw`(베드워즈), `sw`(스카이워즈), `duels`(듀얼) 중에서 골라 주세요.", mention_author=False)
+        return
+
+    (profile, error), notice = await run_with_notice(ctx, lookup(stats.hypixel_profile(name)))
+    if error:
+        await send_result(ctx, notice, content=error)
+        return
+    if game_key:
+        image = await asyncio.to_thread(cards.hypixel_game_card, profile, game_key)
+    else:
+        image = await asyncio.to_thread(cards.hypixel_card, profile)
+    await send_result(ctx, notice, file=discord.File(image, filename=f"hypixel_{profile['name']}.png"))
+
+
+def build_valorant_embed(profile):
+    embed = discord.Embed(
+        title=f"{profile['name']}#{profile['tag']}",
+        description=f"지역: {profile['region'].upper()}",
+        color=discord.Color.from_rgb(255, 70, 85),
+        timestamp=datetime.now(timezone.utc),
+    )
+    current = profile["rank"]
+    if profile["rr"] is not None:
+        current += f" · {profile['rr']} RR"
+    if profile["rr_change"] is not None:
+        current += f" ({int(profile['rr_change']):+d})"
+    embed.add_field(name="현재 랭크", value=current, inline=True)
+    peak = profile["peak"] or "-"
+    if profile["peak"] and profile["peak_season"]:
+        peak += f" ({profile['peak_season']})"
+    embed.add_field(name="최고 랭크", value=peak, inline=True)
+
+    lines = [
+        f"`{m['result']:<8}` {m['agent']} · {m['map']} · {m['mode']} · {m['kda']}"
+        for m in profile["matches"]
+    ]
+    embed.add_field(name="최근 경기", value="\n".join(lines) or "기록이 없습니다.", inline=False)
+    embed.set_footer(text="HenrikDev API · 5분간 같은 결과를 보여 줍니다")
+    return embed
+
+
+@bot.command(name="V전적")
+@commands.cooldown(1, STATS_COOLDOWN_SECONDS, commands.BucketType.user)
+async def valorant_stats(ctx, *, riot_id: str = ""):
+    if not riot_id:
+        ctx.command.reset_cooldown(ctx)
+        await ctx.reply("사용법: `!V전적 <이름#태그> [지역]` (예: `!V전적 Hide on bush#KR1`)", mention_author=False)
+        return
+    try:
+        name, tag, region = stats.parse_riot_id(riot_id)
+    except stats.StatsError as exc:
+        ctx.command.reset_cooldown(ctx)
+        await ctx.reply(str(exc), mention_author=False)
+        return
+
+    (profile, error), notice = await run_with_notice(ctx, lookup(stats.valorant_profile(name, tag, region)))
+    if error:
+        await send_result(ctx, notice, content=error)
+        return
+    await send_result(ctx, notice, embed=build_valorant_embed(profile))
+
+
+@hypixel_stats.error
+@valorant_stats.error
+async def stats_command_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.reply(f"{error.retry_after:.0f}초 후에 다시 시도해 주세요.", mention_author=False)
+    else:
+        print(f"전적 명령어 오류: {type(error).__name__}: {error}")
+        await ctx.reply("오류가 발생했습니다.", mention_author=False)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
