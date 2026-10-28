@@ -553,42 +553,6 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
     await send_result(ctx, notice, file=discord.File(image, filename=f"hypixel_{profile['name']}.png"))
 
 
-def build_valorant_embed(profile):
-    embed = discord.Embed(
-        title=f"{profile['name']}#{profile['tag']}",
-        description=f"지역: {profile['region'].upper()}",
-        color=discord.Color.from_rgb(255, 70, 85),
-        timestamp=datetime.now(timezone.utc),
-    )
-    current = profile["rank"]
-    if profile["rr"] is not None:
-        current += f" · {profile['rr']} RR"
-    if profile["rr_change"] is not None:
-        current += f" ({int(profile['rr_change']):+d})"
-    # The author line is the only embed slot that puts an image to the left of text.
-    embed.set_author(name=current, icon_url=profile["rank_icon"] or None)
-    peak = profile["peak"] or "-"
-    if profile["peak"] and profile["peak_season"]:
-        peak += f" ({profile['peak_season']})"
-    embed.add_field(name="최고 랭크", value=peak, inline=False)
-
-    totals = profile["totals"]
-    if totals:
-        embed.add_field(name=f"최근 {totals['games']}경기 승률", value=totals["win_rate"], inline=True)
-        embed.add_field(name="K/D", value=totals["kd"], inline=True)
-        embed.add_field(name="평균 K / D / A", value=totals["kda"], inline=True)
-        embed.add_field(name="헤드샷", value=totals["headshot"], inline=True)
-        embed.add_field(name="ADR", value=totals["adr"], inline=True)
-
-    lines = [
-        f"`{m['result']:<8}` {m['agent']} · {m['map']} · {m['mode']} · {m['kda']}"
-        for m in profile["matches"]
-    ]
-    embed.add_field(name="최근 경기", value="\n".join(lines) or "기록이 없습니다.", inline=False)
-    embed.set_footer(text="데스매치 제외 · HenrikDev API · 5분간 같은 결과를 보여 줍니다")
-    return embed
-
-
 @bot.command(name="V전적")
 @commands.cooldown(1, STATS_COOLDOWN_SECONDS, commands.BucketType.user)
 async def valorant_stats(ctx, *, riot_id: str = ""):
@@ -607,7 +571,8 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
     if error:
         await send_result(ctx, notice, content=error)
         return
-    await send_result(ctx, notice, embed=build_valorant_embed(profile))
+    image = await asyncio.to_thread(cards.valorant_card, profile)
+    await send_result(ctx, notice, file=discord.File(image, filename="valorant.png"))
 
 
 @hypixel_stats.error
