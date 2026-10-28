@@ -22,8 +22,11 @@ SKIN_URLS = (
 VALORANT_REGIONS = ("kr", "ap", "na", "eu", "latam", "br")
 MATCH_COUNT = 10  # matches used for K/D and other averages
 MATCHES_SHOWN = 5
+AGENT_ICON_URL = "https://media.valorant-api.com/agents/{id}/displayicon.png"
+MAX_IMAGE_CACHE = 100
 
 _cache = {}
+_image_cache = {}  # static game assets (rank and agent icons), keyed by URL
 
 
 class StatsError(Exception):
@@ -231,6 +234,21 @@ async def fetch_skin(uuid):
     return None
 
 
+async def fetch_image(url):
+    if not url:
+        return None
+    if url in _image_cache:
+        return _image_cache[url]
+    try:
+        status, body = await _request(url, raw=True)
+    except StatsError:
+        return None
+    data = body if status == 200 and body else None
+    if data and len(_image_cache) < MAX_IMAGE_CACHE:
+        _image_cache[url] = data
+    return data
+
+
 async def hypixel_profile(name):
     async def load():
         uuid, real_name = await minecraft_profile(name)
@@ -323,6 +341,8 @@ def match_summary(match):
         "result": result,
         "won": won,
         "agent": (stats.get("character") or {}).get("name") or "-",
+        "agent_id": (stats.get("character") or {}).get("id"),
+        "kd": ratio(kills, deaths),
         "map": (meta.get("map") or {}).get("name") or "-",
         "mode": meta.get("mode") or "-",
         "kills": kills,
@@ -350,7 +370,8 @@ def match_totals(matches):
     rounds = sum(m["rounds"] for m in counted)
     return {
         "games": n,
-        "win_rate": f"{sum(decided) / len(decided) * 100:.0f}% ({sum(decided)}승 {len(decided) - sum(decided)}패)" if decided else "-",
+        "win_rate": f"{sum(decided) / len(decided) * 100:.0f}%" if decided else "-",
+        "record": f"{sum(decided)}승 {len(decided) - sum(decided)}패" if decided else "",
         "kd": ratio(kills, deaths),
         "kda": f"{kills / n:.1f} / {deaths / n:.1f} / {assists / n:.1f}",
         "headshot": f"{sum(m['headshots'] for m in counted) / shots * 100:.1f}%" if shots else "-",
@@ -367,20 +388,36 @@ async def valorant_profile(name, tag, region):
         except StatsError:
             matches = []
         summaries = [match_summary(m) for m in matches[:MATCH_COUNT] if isinstance(m, dict)]
+        shown = summaries[:MATCHES_SHOWN]
         current = mmr.get("current_data") or {}
         highest = mmr.get("highest_rank") or {}
+
+        images = current.get("images") or {}
+        rank_icon_url = images.get("large") or images.get("small")
+        # Rank icons share one URL pattern (.../competitivetiers/<set>/<tier>/...); swap the tier for the peak.
+        peak_icon_url = None
+        if rank_icon_url and current.get("currenttier") is not None and highest.get("tier") is not None:
+            peak_icon_url = rank_icon_url.replace(f"/{current['currenttier']}/", f"/{highest['tier']}/", 1)
+        agent_ids = list(dict.fromkeys(m["agent_id"] for m in shown if m["agent_id"]))
+        rank_icon, peak_icon, *agent_icons = await asyncio.gather(
+            fetch_image(rank_icon_url),
+            fetch_image(peak_icon_url),
+            *(fetch_image(AGENT_ICON_URL.format(id=quote(agent_id, safe=""))) for agent_id in agent_ids),
+        )
         return {
             "name": mmr.get("name") or name,
             "tag": mmr.get("tag") or tag,
             "region": region,
             "rank": current.get("currenttierpatched") or "Unrated",
-            "rank_icon": (current.get("images") or {}).get("small"),
+            "rank_icon": rank_icon,
+            "peak_icon": peak_icon,
+            "agent_icons": dict(zip(agent_ids, agent_icons)),
             "rr": current.get("ranking_in_tier"),
             "rr_change": current.get("mmr_change_to_last_game"),
             "elo": current.get("elo"),
             "peak": highest.get("patched_tier"),
             "peak_season": highest.get("season"),
-            "matches": summaries[:MATCHES_SHOWN],
+            "matches": shown,
             "totals": match_totals(summaries),
         }
 
