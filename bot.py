@@ -595,7 +595,9 @@ class RiotIdChoice(discord.ui.View):
             self.stop()
             riot_id = f"{account['name']}#{account['tag']}"
             await interaction.response.edit_message(content=f"`{riot_id}` 전적을 불러오는 중입니다...", view=None)
-            profile, error, _ = await valorant_lookup(account["name"], account["tag"], self.region, suggest=False)
+            profile, error, _ = await valorant_lookup(
+                account["query_name"], account["query_tag"], self.region, suggest=False
+            )
             if error:
                 await interaction.edit_original_response(content=error)
                 return

@@ -23,7 +23,7 @@ VALORANT_REGIONS = ("kr", "ap", "na", "eu", "latam", "br")
 MATCH_COUNT = 10  # matches used for K/D and other averages
 MATCHES_SHOWN = 5
 CONFUSABLE = {"i": "l1", "l": "i1", "1": "li", "o": "0", "0": "o"}
-MAX_VARIANT_LOOKUPS = 5
+MAX_VARIANT_LOOKUPS = 6
 MAX_SUGGESTIONS = 3
 AGENT_ICON_URL = "https://media.valorant-api.com/agents/{id}/displayicon.png"
 MAX_IMAGE_CACHE = 100
@@ -307,8 +307,10 @@ def parse_riot_id(text):
         text, region = parts[0], parts[1].lower()
     if "#" not in text:
         raise StatsError("Riot ID를 `이름#태그` 형식으로 입력해 주세요. (예: `!V전적 Hide on bush#KR1`)")
-    name, tag = (s.strip() for s in text.rsplit("#", 1))
-    if not name or not tag or len(name) > 16 or len(tag) > 5:
+    # Keep spaces in the name as typed: a space before '#' can be part of a real Riot ID.
+    name, tag = text.rsplit("#", 1)
+    tag = tag.strip()
+    if not name.strip() or not tag or len(name) > 16 or len(tag) > 5:
         raise StatsError("Riot ID 형식이 올바르지 않습니다. (이름 16자, 태그 5자 이하)")
     return name, tag, region
 
@@ -400,25 +402,41 @@ async def valorant_account(name, tag):
 
 
 def riot_id_variants(name, tag):
-    """Riot IDs that differ by one easily confused character (I/l/1, O/0), tag first."""
+    """Riot IDs one small slip away from name#tag: spacing first, then one confused character (I/l/1, O/0)."""
     variants = []
+
+    def add(n, t):
+        if n.strip() and len(n) <= 16 and (n, t) != (name, tag) and (n, t) not in variants:
+            variants.append((n, t))
+
+    # A missing or stray space before '#', or spaces typed inside the name.
+    add(name.rstrip() if name != name.rstrip() else name + " ", tag)
+    add(name.replace(" ", ""), tag)
     for in_tag in (True, False):
         text = tag if in_tag else name
         for i, char in enumerate(text):
             for replacement in CONFUSABLE.get(char.lower(), ""):
                 changed = text[:i] + replacement + text[i + 1:]
-                pair = (name, changed) if in_tag else (changed, tag)
-                if pair not in variants:
-                    variants.append(pair)
+                add(*((name, changed) if in_tag else (changed, tag)))
     return variants[:MAX_VARIANT_LOOKUPS]
 
 
 async def similar_accounts(name, tag):
-    """Existing accounts whose Riot ID is one confusable character away from name#tag."""
-    results = await asyncio.gather(
-        *(valorant_account(n, t) for n, t in riot_id_variants(name, tag)), return_exceptions=True
-    )
-    return [r for r in results if isinstance(r, dict)][:MAX_SUGGESTIONS]
+    """Existing accounts one small slip away from name#tag.
+
+    Each result carries the Riot ID that found it (query_name/query_tag), which is what to look up again.
+    """
+    variants = riot_id_variants(name, tag)
+    results = await asyncio.gather(*(valorant_account(n, t) for n, t in variants), return_exceptions=True)
+    found, seen = [], set()
+    for (query_name, query_tag), account in zip(variants, results):
+        if not isinstance(account, dict):
+            continue
+        key = (account["name"].lower(), account["tag"].lower())
+        if key not in seen:
+            seen.add(key)
+            found.append(dict(account, query_name=query_name, query_tag=query_tag))
+    return found[:MAX_SUGGESTIONS]
 
 
 async def valorant_profile(name, tag, region=None):
