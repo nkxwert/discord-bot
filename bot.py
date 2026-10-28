@@ -302,7 +302,7 @@ async def help_command(ctx):
     )
     embed.add_field(
         name="!V전적 <이름#태그> [지역]",
-        value="발로란트 랭크와 최근 경기를 봅니다. 지역 기본값은 kr입니다.",
+        value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
     embed.set_footer(text=f"확인 주기: {CHECK_INTERVAL_SECONDS}초")
@@ -412,13 +412,14 @@ async def run_with_notice(ctx, awaitable):
         raise
 
 
-async def send_result(ctx, notice, content=None, embed=None, file=None):
+async def send_result(ctx, notice, content=None, embed=None, file=None, view=None):
+    """Post the result (editing the waiting notice if there is one) and return the message."""
     if notice:
-        await notice.edit(content=content, embed=embed, attachments=[file] if file else [])
-    elif file:
-        await ctx.reply(content=content, embed=embed, file=file, mention_author=False)
-    else:
-        await ctx.reply(content=content, embed=embed, mention_author=False)
+        return await notice.edit(content=content, embed=embed, attachments=[file] if file else [], view=view)
+    extra = {"file": file} if file else {}
+    if view:
+        extra["view"] = view
+    return await ctx.reply(content=content, embed=embed, mention_author=False, **extra)
 
 
 def build_list_embed(servers, results, now):
@@ -553,6 +554,69 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
     await send_result(ctx, notice, file=discord.File(image, filename=f"hypixel_{profile['name']}.png"))
 
 
+async def valorant_lookup(name, tag, region, suggest=True):
+    """Returns (profile, error, suggestions); suggestions are similar existing accounts when name#tag is unknown."""
+    try:
+        return await stats.valorant_profile(name, tag, region), None, []
+    except stats.PlayerNotFound:
+        error = f"`{name}#{tag}` 계정을 찾을 수 없습니다."
+        suggestions = await stats.similar_accounts(name, tag) if suggest else []
+        if not suggestions:
+            error += " 이름과 태그를 다시 확인해 주세요. (대문자 I와 소문자 l, 숫자 0과 영문 O를 헷갈리기 쉽습니다)"
+        return None, error, suggestions
+    except stats.StatsError as exc:
+        return None, str(exc), []
+
+
+class RiotIdChoice(discord.ui.View):
+    """Buttons asking whether the user meant one of the similar Riot IDs."""
+
+    def __init__(self, author_id, accounts, region):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.region = region
+        self.message = None
+        for account in accounts:
+            button = discord.ui.Button(label=f"{account['name']}#{account['tag']}", style=discord.ButtonStyle.primary)
+            button.callback = self.choose(account)
+            self.add_item(button)
+        decline = discord.ui.Button(label="아니요", style=discord.ButtonStyle.secondary)
+        decline.callback = self.decline
+        self.add_item(decline)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("명령어를 입력한 사람만 고를 수 있습니다.", ephemeral=True)
+            return False
+        return True
+
+    def choose(self, account):
+        async def callback(interaction):
+            self.stop()
+            riot_id = f"{account['name']}#{account['tag']}"
+            await interaction.response.edit_message(content=f"`{riot_id}` 전적을 불러오는 중입니다...", view=None)
+            profile, error, _ = await valorant_lookup(account["name"], account["tag"], self.region, suggest=False)
+            if error:
+                await interaction.edit_original_response(content=error)
+                return
+            image = await asyncio.to_thread(cards.valorant_card, profile)
+            await interaction.edit_original_response(
+                content=None, attachments=[discord.File(image, filename="valorant.png")]
+            )
+        return callback
+
+    async def decline(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(content="알겠습니다. Riot ID를 다시 확인해 주세요.", view=None)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
 @bot.command(name="V전적")
 @commands.cooldown(1, STATS_COOLDOWN_SECONDS, commands.BucketType.user)
 async def valorant_stats(ctx, *, riot_id: str = ""):
@@ -567,7 +631,11 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
         await ctx.reply(str(exc), mention_author=False)
         return
 
-    (profile, error), notice = await run_with_notice(ctx, lookup(stats.valorant_profile(name, tag, region)))
+    (profile, error, suggestions), notice = await run_with_notice(ctx, valorant_lookup(name, tag, region))
+    if suggestions:
+        view = RiotIdChoice(ctx.author.id, suggestions, region)
+        view.message = await send_result(ctx, notice, content=f"{error}\n혹시 아래 계정인가요?", view=view)
+        return
     if error:
         await send_result(ctx, notice, content=error)
         return
