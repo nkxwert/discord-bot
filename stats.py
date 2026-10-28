@@ -22,6 +22,9 @@ SKIN_URLS = (
 VALORANT_REGIONS = ("kr", "ap", "na", "eu", "latam", "br")
 MATCH_COUNT = 10  # matches used for K/D and other averages
 MATCHES_SHOWN = 5
+CONFUSABLE = {"i": "l1", "l": "i1", "1": "li", "o": "0", "0": "o"}
+MAX_VARIANT_LOOKUPS = 5
+MAX_SUGGESTIONS = 3
 AGENT_ICON_URL = "https://media.valorant-api.com/agents/{id}/displayicon.png"
 MAX_IMAGE_CACHE = 100
 
@@ -31,6 +34,10 @@ _image_cache = {}  # static game assets (rank and agent icons), keyed by URL
 
 class StatsError(Exception):
     """An error whose message can be shown to Discord users as-is."""
+
+
+class PlayerNotFound(StatsError):
+    """The API answered 404 for the requested player."""
 
 
 async def _cached(key, loader):
@@ -292,9 +299,9 @@ async def hypixel_profile(name):
 # ---------------------------------------------------------------- Valorant
 
 def parse_riot_id(text):
-    """'이름#태그 [지역]' -> (name, tag, region)."""
+    """'이름#태그 [지역]' -> (name, tag, region). region is None when it should be detected."""
     text = text.strip()
-    region = "kr"
+    region = None
     parts = text.rsplit(maxsplit=1)
     if len(parts) == 2 and parts[1].lower() in VALORANT_REGIONS and "#" in parts[0]:
         text, region = parts[0], parts[1].lower()
@@ -312,7 +319,7 @@ async def _henrik(path):
         raise StatsError("HenrikDev API 키가 설정되지 않았습니다. `.env`의 `HENRIK_API_KEY`를 확인해 주세요.")
     status, data = await _request(HENRIK_API_URL + path, headers={"Authorization": key})
     if status == 404:
-        raise StatsError("플레이어를 찾을 수 없습니다. Riot ID와 지역을 확인해 주세요.")
+        raise PlayerNotFound("플레이어를 찾을 수 없습니다. Riot ID를 확인해 주세요.")
     if status in (401, 403):
         raise StatsError("HenrikDev API 키가 올바르지 않습니다.")
     if status == 429:
@@ -379,10 +386,52 @@ def match_totals(matches):
     }
 
 
-async def valorant_profile(name, tag, region):
+async def valorant_account(name, tag):
+    """Canonical name/tag and home region of a Riot ID. Raises PlayerNotFound if it doesn't exist."""
+    async def load():
+        data = await _henrik(f"v1/account/{quote(name, safe='')}/{quote(tag, safe='')}") or {}
+        return {
+            "name": data.get("name") or name,
+            "tag": data.get("tag") or tag,
+            "region": (data.get("region") or "").lower() or None,
+        }
+
+    return await _cached(("valorant-account", name.lower(), tag.lower()), load)
+
+
+def riot_id_variants(name, tag):
+    """Riot IDs that differ by one easily confused character (I/l/1, O/0), tag first."""
+    variants = []
+    for in_tag in (True, False):
+        text = tag if in_tag else name
+        for i, char in enumerate(text):
+            for replacement in CONFUSABLE.get(char.lower(), ""):
+                changed = text[:i] + replacement + text[i + 1:]
+                pair = (name, changed) if in_tag else (changed, tag)
+                if pair not in variants:
+                    variants.append(pair)
+    return variants[:MAX_VARIANT_LOOKUPS]
+
+
+async def similar_accounts(name, tag):
+    """Existing accounts whose Riot ID is one confusable character away from name#tag."""
+    results = await asyncio.gather(
+        *(valorant_account(n, t) for n, t in riot_id_variants(name, tag)), return_exceptions=True
+    )
+    return [r for r in results if isinstance(r, dict)][:MAX_SUGGESTIONS]
+
+
+async def valorant_profile(name, tag, region=None):
+    account = await valorant_account(name, tag)
+    name, tag = account["name"], account["tag"]
+    region = region or account["region"] or "kr"
+
     async def load():
         base = f"{region}/{quote(name, safe='')}/{quote(tag, safe='')}"
-        mmr = await _henrik(f"v2/mmr/{base}") or {}
+        try:
+            mmr = await _henrik(f"v2/mmr/{base}") or {}
+        except PlayerNotFound:
+            mmr = {}  # the account exists but has no ranked data in this region
         try:
             matches = await _henrik(f"v1/stored-matches/{base}?size={MATCH_COUNT}") or []
         except StatsError:
