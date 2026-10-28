@@ -565,18 +565,27 @@ def build_valorant_embed(profile):
         current += f" · {profile['rr']} RR"
     if profile["rr_change"] is not None:
         current += f" ({int(profile['rr_change']):+d})"
-    embed.add_field(name="현재 랭크", value=current, inline=True)
+    # The author line is the only embed slot that puts an image to the left of text.
+    embed.set_author(name=current, icon_url=profile["rank_icon"] or None)
     peak = profile["peak"] or "-"
     if profile["peak"] and profile["peak_season"]:
         peak += f" ({profile['peak_season']})"
-    embed.add_field(name="최고 랭크", value=peak, inline=True)
+    embed.add_field(name="최고 랭크", value=peak, inline=False)
+
+    totals = profile["totals"]
+    if totals:
+        embed.add_field(name=f"최근 {totals['games']}경기 승률", value=totals["win_rate"], inline=True)
+        embed.add_field(name="K/D", value=totals["kd"], inline=True)
+        embed.add_field(name="평균 K / D / A", value=totals["kda"], inline=True)
+        embed.add_field(name="헤드샷", value=totals["headshot"], inline=True)
+        embed.add_field(name="ADR", value=totals["adr"], inline=True)
 
     lines = [
         f"`{m['result']:<8}` {m['agent']} · {m['map']} · {m['mode']} · {m['kda']}"
         for m in profile["matches"]
     ]
     embed.add_field(name="최근 경기", value="\n".join(lines) or "기록이 없습니다.", inline=False)
-    embed.set_footer(text="HenrikDev API · 5분간 같은 결과를 보여 줍니다")
+    embed.set_footer(text="데스매치 제외 · HenrikDev API · 5분간 같은 결과를 보여 줍니다")
     return embed
 
 
