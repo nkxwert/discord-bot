@@ -69,6 +69,12 @@ async def _request(url, *, headers=None, params=None, raw=False):
         raise StatsError("외부 서비스에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
 
 
+async def _report(progress, step):
+    """Tell the caller which step a lookup is on; progress is an optional async callable."""
+    if progress:
+        await progress(step)
+
+
 def ratio(a, b):
     return f"{a / b:.2f}" if b else f"{a:.2f}"
 
@@ -256,12 +262,16 @@ async def fetch_image(url):
     return data
 
 
-async def hypixel_profile(name):
+async def hypixel_profile(name, progress=None):
+    """Steps reported to progress: "account", "player", "extra"."""
     async def load():
+        await _report(progress, "account")
         uuid, real_name = await minecraft_profile(name)
+        await _report(progress, "player")
         player = (await _hypixel("player", uuid=uuid)).get("player")
         if not player:
             raise StatsError(f"`{real_name}` 님은 Hypixel에 접속한 기록이 없습니다.")
+        await _report(progress, "extra")
         guild_data, status_data, skin = await asyncio.gather(
             _hypixel("guild", player=uuid),
             _hypixel("status", uuid=uuid),
@@ -439,21 +449,27 @@ async def similar_accounts(name, tag):
     return found[:MAX_SUGGESTIONS]
 
 
-async def valorant_profile(name, tag, region=None):
+async def valorant_profile(name, tag, region=None, progress=None):
+    """Steps reported to progress: "account", "data", "icons"."""
+    await _report(progress, "account")
     account = await valorant_account(name, tag)
     name, tag = account["name"], account["tag"]
     region = region or account["region"] or "kr"
 
     async def load():
+        await _report(progress, "data")
         base = f"{region}/{quote(name, safe='')}/{quote(tag, safe='')}"
-        try:
-            mmr = await _henrik(f"v2/mmr/{base}") or {}
-        except PlayerNotFound:
+        mmr, matches = await asyncio.gather(
+            _henrik(f"v2/mmr/{base}"),
+            _henrik(f"v1/stored-matches/{base}?size={MATCH_COUNT}"),
+            return_exceptions=True,
+        )
+        if isinstance(mmr, PlayerNotFound):
             mmr = {}  # the account exists but has no ranked data in this region
-        try:
-            matches = await _henrik(f"v1/stored-matches/{base}?size={MATCH_COUNT}") or []
-        except StatsError:
-            matches = []
+        elif isinstance(mmr, BaseException):
+            raise mmr
+        mmr = mmr or {}
+        matches = [] if isinstance(matches, BaseException) else matches or []
         summaries = [match_summary(m) for m in matches[:MATCH_COUNT] if isinstance(m, dict)]
         shown = summaries[:MATCHES_SHOWN]
         current = mmr.get("current_data") or {}
@@ -466,6 +482,7 @@ async def valorant_profile(name, tag, region=None):
         if rank_icon_url and current.get("currenttier") is not None and highest.get("tier") is not None:
             peak_icon_url = rank_icon_url.replace(f"/{current['currenttier']}/", f"/{highest['tier']}/", 1)
         agent_ids = list(dict.fromkeys(m["agent_id"] for m in shown if m["agent_id"]))
+        await _report(progress, "icons")
         rank_icon, peak_icon, *agent_icons = await asyncio.gather(
             fetch_image(rank_icon_url),
             fetch_image(peak_icon_url),

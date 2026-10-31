@@ -5,6 +5,7 @@ import time
 import sqlite3
 import asyncio
 import ipaddress
+import traceback
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -33,12 +34,16 @@ EXTERNAL_API_URL = "https://api.mcsrvstat.us/3/"
 EXTERNAL_TIMEOUT_SECONDS = 8
 EXTERNAL_COOLDOWN_SECONDS = 60
 SLOW_NOTICE_SECONDS = 2
+PROGRESS_EDIT_INTERVAL = 0.8  # seconds between progress message edits, to stay clear of rate limits
 STATS_COOLDOWN_SECONDS = 5
 HYPIXEL_GAMES = {
     "bw": "bedwars", "bedwars": "bedwars", "베드워즈": "bedwars", "베워": "bedwars",
     "sw": "skywars", "skywars": "skywars", "스카이워즈": "skywars", "스카": "skywars",
     "duels": "duels", "duel": "duels", "듀얼": "duels",
 }
+# Progress checklist steps; keys match the steps stats.py reports, plus "card" for rendering.
+HYPIXEL_STEPS = [("account", "마인크래프트 계정 확인"), ("player", "하이픽셀 전적"), ("extra", "길드·스킨"), ("card", "카드 만들기")]
+VALORANT_STEPS = [("account", "계정 찾기"), ("data", "랭크·최근 경기"), ("icons", "랭크·요원 아이콘"), ("card", "카드 만들기")]
 external_cache = {}
 last_prune = 0.0
 
@@ -408,14 +413,98 @@ async def delete_address_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.reply("서버 관리 권한이 필요합니다.", mention_author=False)
     else:
-        await ctx.reply("오류가 발생했습니다.", mention_author=False)
+        await report_error(ctx, error)
 
 
-async def run_with_notice(ctx, awaitable):
-    """Await a slow lookup, posting a waiting notice only if it takes a while."""
+async def report_error(ctx, error):
+    """Log an unexpected command error and tell the user, replacing the waiting notice if one is up."""
+    original = getattr(error, "original", error)
+    traceback.print_exception(type(original), original, original.__traceback__)
+    notice = getattr(ctx, "notice", None)
+    if notice:
+        try:
+            await notice.edit(content="오류가 발생했습니다.", embed=None, attachments=[], view=None)
+            return
+        except discord.HTTPException:
+            pass
+    await ctx.reply("오류가 발생했습니다.", mention_author=False)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if ctx.command and ctx.command.has_error_handler():
+        return  # the command's own handler deals with it
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.NoPrivateMessage):
+        await ctx.reply("디스코드 서버 채널에서만 사용할 수 있습니다.", mention_author=False)
+        return
+    await report_error(ctx, error)
+
+
+class Progress:
+    """Waiting message shown as a checklist of steps, so slow lookups show where they are."""
+
+    ICONS = {"done": "✅", "failed": "❌", "current": "⏳", "todo": "▫️"}
+
+    def __init__(self, title, steps):
+        self.title = title
+        self.steps = dict(steps)  # step key -> label, in order
+        self.state = {}  # step key -> "done" / "failed"
+        self.current = next(iter(self.steps))
+        self.edit = None  # async callable(text) once the message exists
+        self.last_edit = 0.0
+
+    def render(self):
+        lines = [self.title]
+        for key, label in self.steps.items():
+            icon = self.state.get(key) or ("current" if key == self.current else "todo")
+            lines.append(f"{self.ICONS[icon]} {label}")
+        return "\n".join(lines)
+
+    def attach(self, edit):
+        self.edit = edit
+        self.last_edit = time.monotonic()
+
+    async def step(self, key):
+        """Mark every step before key as done and show key as the current one."""
+        for earlier in self.steps:
+            if earlier == key:
+                break
+            self.state.setdefault(earlier, "done")
+        self.current = key
+        await self.refresh()
+
+    async def fail_into(self, failed, key, label):
+        """Mark failed as failed and replace the steps after it with a single new step."""
+        self.state[failed] = "failed"
+        keys = list(self.steps)
+        self.steps = {k: self.steps[k] for k in keys[:keys.index(failed) + 1]}
+        self.steps[key] = label
+        self.current = key
+        await self.refresh()
+
+    async def refresh(self):
+        # Skipped edits are fine: the next step or the final result overwrites the message anyway.
+        if not self.edit or time.monotonic() - self.last_edit < PROGRESS_EDIT_INTERVAL:
+            return
+        self.last_edit = time.monotonic()
+        try:
+            await self.edit(self.render())
+        except discord.HTTPException:
+            pass
+
+
+async def run_with_notice(ctx, awaitable, progress=None):
+    """Await a slow lookup, posting a waiting notice (or progress checklist) only if it takes a while."""
     task = asyncio.ensure_future(awaitable)
     done, _ = await asyncio.wait({task}, timeout=SLOW_NOTICE_SECONDS)
-    notice = None if done else await ctx.reply("잠시만 기다려 주세요...", mention_author=False)
+    notice = None
+    if not done:
+        notice = await ctx.reply(progress.render() if progress else "잠시만 기다려 주세요...", mention_author=False)
+        ctx.notice = notice  # lets report_error replace it if the command fails later
+        if progress:
+            progress.attach(lambda text: notice.edit(content=text))
     try:
         return await task, notice
     except Exception:
@@ -555,10 +644,14 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
         await ctx.reply("게임은 `bw`(베드워즈), `sw`(스카이워즈), `duels`(듀얼) 중에서 골라 주세요.", mention_author=False)
         return
 
-    (profile, error), notice = await run_with_notice(ctx, lookup(stats.hypixel_profile(name)))
+    progress = Progress(f"`{name}` 하이픽셀 전적을 불러오는 중...", HYPIXEL_STEPS)
+    (profile, error), notice = await run_with_notice(
+        ctx, lookup(stats.hypixel_profile(name, progress.step)), progress
+    )
     if error:
         await send_result(ctx, notice, content=error)
         return
+    await progress.step("card")
     if game_key:
         image = await asyncio.to_thread(cards.hypixel_game_card, profile, game_key)
     else:
@@ -566,12 +659,14 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
     await send_result(ctx, notice, file=discord.File(image, filename=f"hypixel_{profile['name']}.png"))
 
 
-async def valorant_lookup(name, tag, region, suggest=True):
+async def valorant_lookup(name, tag, region, suggest=True, progress=None):
     """Returns (profile, error, suggestions); suggestions are similar existing accounts when name#tag is unknown."""
     try:
-        return await stats.valorant_profile(name, tag, region), None, []
+        return await stats.valorant_profile(name, tag, region, progress.step if progress else None), None, []
     except stats.PlayerNotFound:
         error = f"`{name}#{tag}` 계정을 찾을 수 없습니다."
+        if suggest and progress:
+            await progress.fail_into("account", "similar", "비슷한 계정 찾기")
         suggestions = await stats.similar_accounts(name, tag) if suggest else []
         if not suggestions:
             error += " 이름과 태그를 다시 확인해 주세요. (대문자 I와 소문자 l, 숫자 0과 영문 O를 헷갈리기 쉽습니다)"
@@ -605,15 +700,17 @@ class RiotIdChoice(discord.ui.View):
     def choose(self, account):
         async def callback(interaction):
             self.stop()
-            riot_id = f"{account['name']}#{account['tag']}"
-            await interaction.response.edit_message(content=f"`{riot_id}` 전적을 불러오는 중입니다...", view=None)
+            progress = Progress(f"`{account['name']}#{account['tag']}` 전적을 불러오는 중...", VALORANT_STEPS)
+            await interaction.response.edit_message(content=progress.render(), view=None)
+            progress.attach(lambda text: interaction.edit_original_response(content=text))
             try:
                 profile, error, _ = await valorant_lookup(
-                    account["query_name"], account["query_tag"], self.region, suggest=False
+                    account["query_name"], account["query_tag"], self.region, suggest=False, progress=progress
                 )
                 if error:
                     await interaction.edit_original_response(content=error)
                     return
+                await progress.step("card")
                 image = await asyncio.to_thread(cards.valorant_card, profile)
                 await interaction.edit_original_response(
                     content=None, attachments=[discord.File(image, filename="valorant.png")]
@@ -650,7 +747,10 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
         await ctx.reply(str(exc), mention_author=False)
         return
 
-    (profile, error, suggestions), notice = await run_with_notice(ctx, valorant_lookup(name, tag, region))
+    progress = Progress(f"`{name}#{tag}` 전적을 불러오는 중...", VALORANT_STEPS)
+    (profile, error, suggestions), notice = await run_with_notice(
+        ctx, valorant_lookup(name, tag, region, progress=progress), progress
+    )
     if suggestions:
         view = RiotIdChoice(ctx.author.id, suggestions, region)
         view.message = await send_result(ctx, notice, content=f"{error}\n혹시 아래 계정인가요?", view=view)
@@ -658,6 +758,7 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
     if error:
         await send_result(ctx, notice, content=error)
         return
+    await progress.step("card")
     image = await asyncio.to_thread(cards.valorant_card, profile)
     await send_result(ctx, notice, file=discord.File(image, filename="valorant.png"))
 
@@ -668,8 +769,7 @@ async def stats_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.reply(f"{math.ceil(error.retry_after)}초 후에 다시 시도해 주세요.", mention_author=False)
     else:
-        print(f"전적 명령어 오류: {type(error).__name__}: {error}")
-        await ctx.reply("오류가 발생했습니다.", mention_author=False)
+        await report_error(ctx, error)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
