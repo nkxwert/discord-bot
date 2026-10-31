@@ -455,8 +455,7 @@ async def on_command_error(ctx, error):
 class Progress:
     """Waiting message that says, in one sentence, which step a slow lookup is on."""
 
-    def __init__(self, subject, steps):
-        self.subject = subject  # e.g. "`name#tag`", put in front of the step sentence
+    def __init__(self, steps):
         self.steps = dict(steps)  # step key -> sentence such as "계정 찾는 중", in order
         self.current = next(iter(self.steps))
         self.edit = None  # async callable(text) once the message exists
@@ -465,7 +464,7 @@ class Progress:
     def render(self):
         keys = list(self.steps)
         position = f"({keys.index(self.current) + 1}/{len(keys)})"
-        return f"⏳ {self.subject} {self.steps[self.current]}... {position}"
+        return f"{self.steps[self.current]}... {position}"
 
     def attach(self, edit):
         self.edit = edit
@@ -644,7 +643,7 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
         await ctx.reply("게임은 `bw`(베드워즈), `sw`(스카이워즈), `duels`(듀얼) 중에서 골라 주세요.", mention_author=False)
         return
 
-    progress = Progress(f"`{name}`", HYPIXEL_STEPS)
+    progress = Progress(HYPIXEL_STEPS)
     (profile, error), notice = await run_with_notice(
         ctx, lookup(stats.hypixel_profile(name, progress.step)), progress
     )
@@ -700,7 +699,7 @@ class RiotIdChoice(discord.ui.View):
     def choose(self, account):
         async def callback(interaction):
             self.stop()
-            progress = Progress(f"`{account['name']}#{account['tag']}`", VALORANT_STEPS)
+            progress = Progress(VALORANT_STEPS)
             await interaction.response.edit_message(content=progress.render(), view=None)
             progress.attach(lambda text: interaction.edit_original_response(content=text))
             try:
@@ -747,7 +746,7 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
         await ctx.reply(str(exc), mention_author=False)
         return
 
-    progress = Progress(f"`{name}#{tag}`", VALORANT_STEPS)
+    progress = Progress(VALORANT_STEPS)
     (profile, error, suggestions), notice = await run_with_notice(
         ctx, valorant_lookup(name, tag, region, progress=progress), progress
     )
