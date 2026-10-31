@@ -42,8 +42,18 @@ HYPIXEL_GAMES = {
     "duels": "duels", "duel": "duels", "듀얼": "duels",
 }
 # Progress checklist steps; keys match the steps stats.py reports, plus "card" for rendering.
-HYPIXEL_STEPS = [("account", "마인크래프트 계정 확인"), ("player", "하이픽셀 전적"), ("extra", "길드·스킨"), ("card", "카드 만들기")]
-VALORANT_STEPS = [("account", "계정 찾기"), ("data", "랭크·최근 경기"), ("icons", "랭크·요원 아이콘"), ("card", "카드 만들기")]
+HYPIXEL_STEPS = [
+    ("account", "마인크래프트 계정 확인하는 중"),
+    ("player", "하이픽셀 전적 불러오는 중"),
+    ("extra", "길드와 스킨 불러오는 중"),
+    ("card", "카드 만드는 중"),
+]
+VALORANT_STEPS = [
+    ("account", "계정 찾는 중"),
+    ("data", "랭크와 최근 경기 불러오는 중"),
+    ("icons", "랭크·요원 아이콘 불러오는 중"),
+    ("card", "카드 만드는 중"),
+]
 external_cache = {}
 last_prune = 0.0
 
@@ -443,46 +453,36 @@ async def on_command_error(ctx, error):
 
 
 class Progress:
-    """Waiting message shown as a checklist of steps, so slow lookups show where they are."""
+    """Waiting message that says, in one sentence, which step a slow lookup is on."""
 
-    ICONS = {"done": "✅", "failed": "❌", "current": "⏳", "todo": "▫️"}
-
-    def __init__(self, title, steps):
-        self.title = title
-        self.steps = dict(steps)  # step key -> label, in order
-        self.state = {}  # step key -> "done" / "failed"
+    def __init__(self, subject, steps):
+        self.subject = subject  # e.g. "`name#tag`", put in front of the step sentence
+        self.steps = dict(steps)  # step key -> sentence such as "계정 찾는 중", in order
         self.current = next(iter(self.steps))
         self.edit = None  # async callable(text) once the message exists
         self.last_edit = 0.0
 
     def render(self):
-        lines = [self.title]
-        for key, label in self.steps.items():
-            icon = self.state.get(key) or ("current" if key == self.current else "todo")
-            lines.append(f"{self.ICONS[icon]} {label}")
-        return "\n".join(lines)
+        keys = list(self.steps)
+        position = f"({keys.index(self.current) + 1}/{len(keys)})"
+        return f"⏳ {self.subject} {self.steps[self.current]}... {position}"
 
     def attach(self, edit):
         self.edit = edit
         self.last_edit = time.monotonic()
 
     async def step(self, key):
-        """Mark every step before key as done and show key as the current one."""
-        for earlier in self.steps:
-            if earlier == key:
-                break
-            self.state.setdefault(earlier, "done")
+        if key == self.current:
+            return  # same sentence; editing would only spend rate limit
         self.current = key
         await self.refresh()
 
-    async def fail_into(self, failed, key, label):
-        """Mark failed as failed and replace the steps after it with a single new step."""
-        self.state[failed] = "failed"
+    async def switch(self, after, key, sentence):
+        """Drop the steps after `after` and continue with a new step instead."""
         keys = list(self.steps)
-        self.steps = {k: self.steps[k] for k in keys[:keys.index(failed) + 1]}
-        self.steps[key] = label
-        self.current = key
-        await self.refresh()
+        self.steps = {k: self.steps[k] for k in keys[:keys.index(after) + 1]}
+        self.steps[key] = sentence
+        await self.step(key)
 
     async def refresh(self):
         # Skipped edits are fine: the next step or the final result overwrites the message anyway.
@@ -644,7 +644,7 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
         await ctx.reply("게임은 `bw`(베드워즈), `sw`(스카이워즈), `duels`(듀얼) 중에서 골라 주세요.", mention_author=False)
         return
 
-    progress = Progress(f"`{name}` 하이픽셀 전적을 불러오는 중...", HYPIXEL_STEPS)
+    progress = Progress(f"`{name}`", HYPIXEL_STEPS)
     (profile, error), notice = await run_with_notice(
         ctx, lookup(stats.hypixel_profile(name, progress.step)), progress
     )
@@ -666,7 +666,7 @@ async def valorant_lookup(name, tag, region, suggest=True, progress=None):
     except stats.PlayerNotFound:
         error = f"`{name}#{tag}` 계정을 찾을 수 없습니다."
         if suggest and progress:
-            await progress.fail_into("account", "similar", "비슷한 계정 찾기")
+            await progress.switch("account", "similar", "계정이 없어서 비슷한 계정 찾는 중")
         suggestions = await stats.similar_accounts(name, tag) if suggest else []
         if not suggestions:
             error += " 이름과 태그를 다시 확인해 주세요. (대문자 I와 소문자 l, 숫자 0과 영문 O를 헷갈리기 쉽습니다)"
@@ -700,7 +700,7 @@ class RiotIdChoice(discord.ui.View):
     def choose(self, account):
         async def callback(interaction):
             self.stop()
-            progress = Progress(f"`{account['name']}#{account['tag']}` 전적을 불러오는 중...", VALORANT_STEPS)
+            progress = Progress(f"`{account['name']}#{account['tag']}`", VALORANT_STEPS)
             await interaction.response.edit_message(content=progress.render(), view=None)
             progress.attach(lambda text: interaction.edit_original_response(content=text))
             try:
@@ -747,7 +747,7 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
         await ctx.reply(str(exc), mention_author=False)
         return
 
-    progress = Progress(f"`{name}#{tag}` 전적을 불러오는 중...", VALORANT_STEPS)
+    progress = Progress(f"`{name}#{tag}`", VALORANT_STEPS)
     (profile, error, suggestions), notice = await run_with_notice(
         ctx, valorant_lookup(name, tag, region, progress=progress), progress
     )
