@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import time
 import sqlite3
 import asyncio
@@ -43,7 +44,14 @@ last_prune = 0.0
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, case_insensitive=True)
+# Replies echo user input (server names, Riot IDs); never let that ping @everyone, roles or users.
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+    case_insensitive=True,
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
 
 def connect_db():
@@ -127,7 +135,7 @@ def validate_address(raw: str) -> str:
             raise ValueError("포트 번호는 숫자로 입력해 주세요.")
         port = possible_port
     elif address.count(":") > 1:
-        host = address
+        raise ValueError("IPv6 주소는 대괄호로 감싸 주세요. 예: `[2001:db8::1]:25565`")
 
     if port is not None and not (1 <= int(port) <= 65535):
         raise ValueError("포트 번호는 1~65535 범위여야 합니다.")
@@ -148,6 +156,9 @@ def validate_address(raw: str) -> str:
         )
         if not re.fullmatch(hostname_pattern, host):
             raise ValueError("올바른 도메인 또는 공인 IP 주소를 입력해 주세요.")
+        # Single-label names (localhost, LAN hostnames) would make the bot probe its own network.
+        if "." not in host.rstrip("."):
+            raise ValueError("도메인 전체를 입력해 주세요. 예: `play.example.com`")
 
     return address
 
@@ -195,7 +206,8 @@ async def query_external(address: str):
 async def query_server(address: str):
     """Returns (online, latency_ms, players_online, players_max, via_external)."""
     try:
-        server = JavaServer.lookup(address)
+        # async_lookup: the plain lookup() resolves SRV records synchronously and freezes the whole bot.
+        server = await JavaServer.async_lookup(address)
         status = await asyncio.wait_for(server.async_status(), timeout=5)
         latency = float(status.latency) if status.latency is not None else None
         return True, latency, status.players.online, status.players.max, False
@@ -311,7 +323,7 @@ async def help_command(ctx):
 
 @bot.command(name="주소추가")
 @commands.guild_only()
-async def add_server(ctx, address: str = "", name: str = ""):
+async def add_server(ctx, address: str = "", *, name: str = ""):
     if not address:
         await ctx.reply(
             "사용법: `!주소추가 <주소> [이름]` (예: `!주소추가 hypixel.net 하이픽셀`)",
@@ -595,16 +607,21 @@ class RiotIdChoice(discord.ui.View):
             self.stop()
             riot_id = f"{account['name']}#{account['tag']}"
             await interaction.response.edit_message(content=f"`{riot_id}` 전적을 불러오는 중입니다...", view=None)
-            profile, error, _ = await valorant_lookup(
-                account["query_name"], account["query_tag"], self.region, suggest=False
-            )
-            if error:
-                await interaction.edit_original_response(content=error)
-                return
-            image = await asyncio.to_thread(cards.valorant_card, profile)
-            await interaction.edit_original_response(
-                content=None, attachments=[discord.File(image, filename="valorant.png")]
-            )
+            try:
+                profile, error, _ = await valorant_lookup(
+                    account["query_name"], account["query_tag"], self.region, suggest=False
+                )
+                if error:
+                    await interaction.edit_original_response(content=error)
+                    return
+                image = await asyncio.to_thread(cards.valorant_card, profile)
+                await interaction.edit_original_response(
+                    content=None, attachments=[discord.File(image, filename="valorant.png")]
+                )
+            except Exception as exc:
+                # Without this the message would stay on "불러오는 중입니다..." forever.
+                print(f"전적 버튼 오류: {type(exc).__name__}: {exc}")
+                await interaction.edit_original_response(content="오류가 발생했습니다.")
         return callback
 
     async def decline(self, interaction):
@@ -649,7 +666,7 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
 @valorant_stats.error
 async def stats_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.reply(f"{error.retry_after:.0f}초 후에 다시 시도해 주세요.", mention_author=False)
+        await ctx.reply(f"{math.ceil(error.retry_after)}초 후에 다시 시도해 주세요.", mention_author=False)
     else:
         print(f"전적 명령어 오류: {type(error).__name__}: {error}")
         await ctx.reply("오류가 발생했습니다.", mention_author=False)
@@ -657,9 +674,18 @@ async def stats_command_error(ctx, error):
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def monitor_servers():
-    for row in all_servers():
-        online, latency, _, _, _ = await query_server(row["address"])
-        save_sample(row["id"], row["guild_id"], online, latency)
+    # An exception escaping this loop stops background checks for good, so contain every error.
+    try:
+        rows = all_servers()
+    except sqlite3.Error as exc:
+        print(f"백그라운드 확인 오류: {type(exc).__name__}: {exc}")
+        return
+    for row in rows:
+        try:
+            online, latency, _, _, _ = await query_server(row["address"])
+            save_sample(row["id"], row["guild_id"], online, latency)
+        except Exception as exc:
+            print(f"백그라운드 확인 오류 ({row['address']}): {type(exc).__name__}: {exc}")
         await asyncio.sleep(0.2)
 
 
