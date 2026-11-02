@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>개인정보 보호 정책</title>
+  <style>
+    :root { --bg: #ffffff; --text: #1f2328; --muted: #59636e; --line: #d1d9e0; --link: #0969da; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0d1117; --text: #e6edf3; --muted: #9198a1; --line: #3d444d; --link: #4493f8; }
+    }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; line-height: 1.7; }
+    main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+    h1 { margin-bottom: 4px; }
+    h2 { margin-top: 32px; padding-bottom: 4px; border-bottom: 1px solid var(--line); font-size: 1.2rem; }
+    .date, footer { color: var(--muted); font-size: 0.9rem; }
+    footer { margin-top: 48px; border-top: 1px solid var(--line); padding-top: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+    th, td { border: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }
+    .table-wrap { overflow-x: auto; }
+    a { color: var(--link); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>개인정보 보호 정책</h1>
+  <p class="date">시행일: 2026년 11월 2일</p>
+
+  <p>이 정책은 디스코드 봇 "Minecraft Uptime Bot"(이하 "봇")이 어떤 정보를 저장하고, 어디로 보내며, 어떻게 지울 수 있는지 설명합니다.</p>
+
+  <h2>1. 저장하는 정보</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>기능</th><th>저장하는 정보</th><th>보관 기간</th></tr>
+    <tr><td>서버 등록 (<code>!주소추가</code>)</td><td>디스코드 서버 ID, 등록한 사용자의 디스코드 ID, 마인크래프트 서버 주소와 이름, 등록 시각</td><td>삭제할 때까지</td></tr>
+    <tr><td>업타임 기록</td><td>확인 시각, 온라인 여부, 응답 시간</td><td>30일 후 자동 삭제</td></tr>
+    <tr><td>이스터에그</td><td>디스코드 서버 ID와 이름, 등록한 명령어와 문장 (등록한 사람은 저장하지 않음)</td><td>삭제할 때까지</td></tr>
+  </table>
+  </div>
+  <p>봇은 명령어를 처리하기 위해 메시지 내용을 읽지만, 위 표에 적은 것 외의 메시지 내용은 저장하지 않습니다.</p>
+  <p>전적 조회 결과는 같은 요청을 줄이기 위해 봇 메모리에 5분 동안만 보관하며, 파일로 저장하지 않습니다.</p>
+  <p>오류가 나면 원인을 찾기 위해 서버 주소나 오류 내용이 봇의 실행 로그에 남을 수 있습니다.</p>
+
+  <h2>2. 외부 서비스로 보내는 정보</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>서비스</th><th>보내는 정보</th><th>보내는 때</th></tr>
+    <tr><td>등록한 마인크래프트 서버</td><td>상태 확인 요청</td><td>주기적으로, <code>!업타임</code> 사용 시</td></tr>
+    <tr><td>mcsrvstat.us</td><td>서버 도메인 주소 (IP 주소는 보내지 않음)</td><td>직접 확인이 실패했을 때만</td></tr>
+    <tr><td>Mojang API</td><td>조회한 마인크래프트 닉네임</td><td><code>!H전적</code> 사용 시</td></tr>
+    <tr><td>Hypixel API</td><td>조회한 플레이어의 UUID</td><td><code>!H전적</code> 사용 시</td></tr>
+    <tr><td>crafatar.com, mc-heads.net</td><td>조회한 플레이어의 UUID (스킨 이미지용)</td><td><code>!H전적</code> 사용 시</td></tr>
+    <tr><td>HenrikDev API</td><td>조회한 Riot ID, 지역</td><td><code>!V전적</code> 사용 시</td></tr>
+    <tr><td>media.valorant-api.com</td><td>사용자 정보 없음 (랭크·요원 아이콘 이미지 요청)</td><td><code>!V전적</code> 사용 시</td></tr>
+  </table>
+  </div>
+  <p>각 서비스가 받은 정보를 어떻게 처리하는지는 해당 서비스의 정책을 따릅니다. 봇 운영자는 정보를 판매하거나 위 목적 외로 다른 곳에 제공하지 않습니다.</p>
+
+  <h2>3. 저장 위치</h2>
+  <p>정보는 봇을 실행하는 호스팅 서버에 저장됩니다.</p>
+
+  <h2>4. 정보 삭제</h2>
+  <ul>
+    <li>등록한 서버와 업타임 기록: 서버 관리 권한이 있는 사람이 <code>!주소삭제 &lt;이름&gt;</code>으로 지울 수 있습니다.</li>
+    <li>이스터에그와 그 밖의 정보: 아래 문의처로 요청하면 지웁니다.</li>
+    <li>봇을 서버에서 내보내도 저장된 정보는 자동으로 지워지지 않으니, 지우려면 내보내기 전에 삭제하거나 요청해 주세요.</li>
+  </ul>
+
+  <h2>5. 정책의 변경</h2>
+  <p>정책은 필요에 따라 바뀔 수 있으며, 바뀐 정책은 이 페이지에 게시한 때부터 적용됩니다.</p>
+
+  <h2>6. 문의</h2>
+  <p>개인정보 관련 문의와 삭제 요청은 <a href="https://github.com/nkxwert/discord-bot/issues">GitHub Issues</a>로 남겨 주세요.</p>
+
+  <footer><a href="terms.html">이용 약관</a> · <a href="./">봇 초대하기</a></footer>
+</main>
+</body>
+</html>
