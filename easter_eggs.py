@@ -76,7 +76,9 @@ def parse_registration(content):
     match = REGISTER_PATTERN.fullmatch(content.strip())
     if not match:
         return None
-    return _strip_parens(match.group(1)), _strip_parens(match.group(2))
+    # "if €김치 then say ..." means the 김치 egg; keeping the € would make it "€€김치" to trigger.
+    key = _strip_parens(_strip_parens(match.group(1)).lstrip("€"))
+    return key, _strip_parens(match.group(2))
 
 
 def register(guild_id, guild_name, key, text):
