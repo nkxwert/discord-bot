@@ -307,6 +307,16 @@ async def on_ready():
     print(f"로그인 완료: {bot.user} (ID: {bot.user.id})")
 
 
+@bot.listen("on_message")
+async def easter_egg(message):
+    # Easter egg: "€이름" gets "바보". A listener, so the bot's own on_message still runs commands.
+    if message.author.bot:
+        return
+    content = message.content.strip()
+    if content.startswith("€") and content[1:].strip():
+        await message.reply("바보", mention_author=False)
+
+
 @bot.command(name="도움말", aliases=["help"])
 async def help_command(ctx):
     embed = discord.Embed(
