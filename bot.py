@@ -328,9 +328,9 @@ async def easter_egg(message):
             return
         except OSError as exc:
             print(f"이스터에그 저장 실패: {type(exc).__name__}: {exc}")
-            await message.reply("이스터에그를 저장하지 못했습니다.", mention_author=False)
+            await message.reply("저장 실패", mention_author=False)
             return
-        await message.reply(f"이스터에그를 저장했습니다: `€{key}`", mention_author=False)
+        await message.reply(f"굿: `€{key}`", mention_author=False)
         return
 
     if content.startswith("€") and content[1:].strip():
