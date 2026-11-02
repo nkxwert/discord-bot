@@ -16,6 +16,7 @@ from mcstatus import JavaServer
 from dotenv import load_dotenv
 
 import cards
+import easter_eggs
 import stats
 
 load_dotenv()
@@ -309,12 +310,37 @@ async def on_ready():
 
 @bot.listen("on_message")
 async def easter_egg(message):
-    # Easter egg: "€이름" gets "바보". A listener, so the bot's own on_message still runs commands.
+    # Easter eggs: "if 김치 then say 맛있다" saves one for this server, "€김치" says it, and any other
+    # "€이름" gets "바보". A listener, so the bot's own on_message still runs commands.
     if message.author.bot:
         return
     content = message.content.strip()
+
+    registration = easter_eggs.parse_registration(content)
+    if registration:
+        if message.guild is None:
+            await message.reply("이스터에그는 디스코드 서버에서만 등록할 수 있습니다.", mention_author=False)
+            return
+        try:
+            key = easter_eggs.register(message.guild.id, message.guild.name, *registration)
+        except ValueError as exc:
+            await message.reply(str(exc), mention_author=False)
+            return
+        except OSError as exc:
+            print(f"이스터에그 저장 실패: {type(exc).__name__}: {exc}")
+            await message.reply("이스터에그를 저장하지 못했습니다.", mention_author=False)
+            return
+        await message.reply(f"이스터에그를 저장했습니다: `€{key}`", mention_author=False)
+        return
+
     if content.startswith("€") and content[1:].strip():
-        await message.reply("바보", mention_author=False)
+        text = None
+        if message.guild:
+            try:
+                text = easter_eggs.find(message.guild.id, content[1:].strip())
+            except OSError as exc:
+                print(f"이스터에그 파일 읽기 실패: {type(exc).__name__}: {exc}")
+        await message.reply(text or "바보", mention_author=False)
 
 
 @bot.command(name="도움말", aliases=["help"])
