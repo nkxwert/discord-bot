@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Discord Bot</title>
-  <meta name="description" content="마인크래프트 서버 업타임, 하이픽셀·발로란트 전적을 확인하는 디스코드 봇">
+  <title>마코</title>
+  <meta name="description" content="마코 디스코드 봇 초대하기">
   <meta name="theme-color" content="#a9bfae">
   <link rel="preload" as="image" href="assets/images/background.webp" type="image/webp">
   <style>
@@ -65,24 +65,16 @@
       -webkit-backdrop-filter: blur(10px);
       backdrop-filter: blur(10px);
     }
-    .logo {
-      width: clamp(72px, 22vw, 96px);
+    .avatar {
+      width: clamp(120px, 40vw, 160px);
       height: auto;
       display: block;
-      margin: 0 auto 16px;
-      color: var(--blue);
+      margin: 0 auto 12px;
     }
     h1 {
-      margin: 0 0 8px;
+      margin: 0 0 24px;
       font-size: clamp(1.6rem, 6vw, 2rem);
       line-height: 1.2;
-    }
-    .tagline {
-      margin: 0 0 28px;
-      color: var(--muted);
-      font-size: clamp(0.95rem, 3.6vw, 1.05rem);
-      line-height: 1.6;
-      word-break: keep-all;
     }
 
     .invite {
@@ -99,14 +91,13 @@
       font-size: 1.05rem;
       font-weight: 700;
       text-decoration: none;
-      box-shadow: 0 8px 20px rgba(88, 101, 242, 0.35);
-      transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+      transition: background-color 0.15s ease, transform 0.15s ease;
       -webkit-tap-highlight-color: transparent;
     }
     .invite svg { width: 24px; height: 24px; flex: none; }
-    .invite:hover { background: var(--blue-hover); transform: translateY(-1px); box-shadow: 0 10px 24px rgba(88, 101, 242, 0.45); }
+    .invite:hover { background: var(--blue-hover); transform: translateY(-1px); }
     .invite:active { transform: translateY(1px); }
-    .invite:focus-visible { outline: 3px solid #fff; outline-offset: 3px; box-shadow: 0 0 0 6px var(--blue); }
+    .invite:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
 
     footer {
       margin-top: 20px;
@@ -127,9 +118,8 @@
     @media (max-height: 520px) {
       body { padding-top: max(12px, env(safe-area-inset-top)); padding-bottom: max(12px, env(safe-area-inset-bottom)); }
       .card { padding: 20px 28px; }
-      .logo { width: 56px; margin-bottom: 8px; }
-      h1 { font-size: 1.4rem; margin-bottom: 4px; }
-      .tagline { margin-bottom: 16px; }
+      .avatar { width: 96px; margin-bottom: 8px; }
+      h1 { font-size: 1.4rem; margin-bottom: 16px; }
       footer { margin-top: 12px; }
     }
 
@@ -143,11 +133,11 @@
   <div class="background" aria-hidden="true"></div>
 
   <main class="card">
-    <svg class="logo" viewBox="0 0 24 24" fill="currentColor" role="img" aria-label="Discord">
-      <path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/>
-    </svg>
-    <h1>Discord Bot</h1>
-    <p class="tagline">마인크래프트 서버 업타임과<br>하이픽셀·발로란트 전적을 확인하세요</p>
+    <picture>
+      <source srcset="assets/images/avatar.webp" type="image/webp">
+      <img class="avatar" src="assets/images/avatar.png" width="512" height="512" alt="마코">
+    </picture>
+    <h1>마코입니다</h1>
     <a class="invite" href="https://discord.com/oauth2/authorize?client_id=1561618276763570186&amp;permissions=8515702525262144&amp;integration_type=0&amp;scope=bot">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/>
