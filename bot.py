@@ -532,9 +532,11 @@ async def help_command(ctx):
         value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
+    # Divider between the feature commands and contacting the developer (embeds have no real separator).
+    embed.add_field(name="​", value="─" * 24, inline=False)
     embed.add_field(
         name="/개발자소통",
-        value="개발자에게 메시지를 보냅니다. 나만 보이는 입력 창이 열립니다.\n(슬래시 명령어가 안 보이면 `!개발자소통`)",
+        value="개발자에게 메시지를 보냅니다.\n(슬래시 명령어가 안 보이면 `!개발자소통`)",
         inline=False,
     )
     await ctx.reply(embed=embed, mention_author=False)
