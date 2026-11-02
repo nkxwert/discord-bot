@@ -152,8 +152,9 @@ class Card:
             x0, y0, x1, y1 = box
             self.text((x0 + x1) / 2, (y0 + y1) / 2 - 20, "?", 40, GRAY)
 
-    def footer(self, y, text="§7Minecraft Uptime Bot"):
-        self.text(WIDTH / 2, y, text, 16)
+    def footer(self, y, text="§7마코 - Maco"):
+        # Always the Hangul-capable font: Monocraft (Hypixel cards) has no Korean glyphs.
+        self.text(WIDTH / 2, y, text, 16, family="kr")
 
     def render(self):
         self.image.alpha_composite(self.overlay)
@@ -343,5 +344,5 @@ def valorant_card(profile):
         card.text(WIDTH - MARGIN - 20, y + 30, match["kd"], 22,
                   VALORANT_RED if float(match["kd"]) < 1 else WIN_GREEN, align="right")
 
-    card.footer(card.image.height - 30, "§7HenrikDev API · Minecraft Uptime Bot")
+    card.footer(card.image.height - 30, "§7HenrikDev API · 마코 - Maco")
     return card.render()
