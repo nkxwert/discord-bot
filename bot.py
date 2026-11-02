@@ -29,6 +29,7 @@ PRUNE_INTERVAL_SECONDS = 60
 MAX_SERVERS_PER_GUILD = 10
 MAX_NAME_LENGTH = 30
 NO_SERVER_MESSAGE = "등록된 서버가 없습니다. `!주소추가 <주소> [이름]`으로 추가해 주세요."
+SERVER_ONLY_MESSAGE = "디스코드 서버 채널에서만 사용할 수 있습니다."
 # Last resort when the direct ping fails; only domain names are ever sent out, never IPs.
 EXTERNAL_FALLBACK = os.getenv("EXTERNAL_FALLBACK", "true").strip().lower() not in ("0", "false", "no", "off")
 EXTERNAL_API_URL = "https://api.mcsrvstat.us/3/"
@@ -490,7 +491,9 @@ async def show_address(ctx):
         await ctx.reply(NO_SERVER_MESSAGE, mention_author=False)
         return
     lines = [f"• **{s['name']}** — `{s['address']}`" for s in servers]
-    await ctx.reply("\n".join(lines), mention_author=False)
+    # An embed allows 4096 characters; ten long addresses can pass a plain message's 2000.
+    embed = discord.Embed(title="등록된 서버", description="\n".join(lines), color=discord.Color.green())
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="주소삭제")
@@ -515,6 +518,8 @@ async def delete_address(ctx, *, name: str = ""):
 async def delete_address_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.reply("서버 관리 권한이 필요합니다.", mention_author=False)
+    elif isinstance(error, commands.NoPrivateMessage):
+        await ctx.reply(SERVER_ONLY_MESSAGE, mention_author=False)
     else:
         await report_error(ctx, error)
 
@@ -540,7 +545,7 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.NoPrivateMessage):
-        await ctx.reply("디스코드 서버 채널에서만 사용할 수 있습니다.", mention_author=False)
+        await ctx.reply(SERVER_ONLY_MESSAGE, mention_author=False)
         return
     await report_error(ctx, error)
 
@@ -591,7 +596,12 @@ async def run_with_notice(ctx, awaitable, progress=None):
     done, _ = await asyncio.wait({task}, timeout=SLOW_NOTICE_SECONDS)
     notice = None
     if not done:
-        notice = await ctx.reply(progress.render() if progress else "잠시만 기다려 주세요...", mention_author=False)
+        try:
+            notice = await ctx.reply(progress.render() if progress else "잠시만 기다려 주세요...", mention_author=False)
+        except discord.HTTPException as exc:
+            # The notice is only a courtesy; keep waiting for the lookup and send the result normally.
+            print(f"대기 문구 전송 실패: {type(exc).__name__}: {exc}")
+    if notice:
         ctx.notice = notice  # lets report_error replace it if the command fails later
         if progress:
             progress.attach(lambda text: notice.edit(content=text))
