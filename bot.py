@@ -58,6 +58,8 @@ VALORANT_STEPS = [
 external_cache = {}
 last_prune = 0.0
 
+OWNER_IDS = {int(i) for i in re.findall(r"\d+", os.getenv("BOT_OWNER_IDS", ""))}
+
 intents = discord.Intents.default()
 intents.message_content = True
 # Replies echo user input (server names, Riot IDs); never let that ping @everyone, roles or users.
@@ -67,7 +69,25 @@ bot = commands.Bot(
     help_command=None,
     case_insensitive=True,
     allowed_mentions=discord.AllowedMentions.none(),
+    # Owner-only commands (£servers). Empty means "the account that owns the app in the Developer Portal".
+    owner_ids=OWNER_IDS or None,
 )
+
+# Per-server activity for £servers: kind -> guild id -> {hour number: count}. Memory only, last 24 hours.
+traffic = {"messages": {}, "commands": {}}
+
+
+def record_traffic(kind, guild_id):
+    hour = int(time.time() // 3600)
+    buckets = traffic[kind].setdefault(guild_id, {})
+    buckets[hour] = buckets.get(hour, 0) + 1
+    for old in [h for h in buckets if h <= hour - 24]:
+        del buckets[old]
+
+
+def traffic_24h(kind, guild_id):
+    hour = int(time.time() // 3600)
+    return sum(count for h, count in traffic[kind].get(guild_id, {}).items() if h > hour - 24)
 
 
 def connect_db():
@@ -343,24 +363,62 @@ async def easter_egg(message):
         await message.reply(text or "바보", mention_author=False)
 
 
+@bot.listen("on_message")
+async def count_messages(message):
+    if message.guild and message.author != bot.user:
+        record_traffic("messages", message.guild.id)
+
+
+@bot.listen("on_command")
+async def count_commands(ctx):
+    if ctx.guild:
+        record_traffic("commands", ctx.guild.id)
+
+
+@bot.listen("on_message")
+async def owner_servers(message):
+    # Developer-only "£servers": lists the servers the bot is in. Anyone else gets no reaction at all.
+    if message.author.bot or message.content.strip().lower() != "£servers":
+        return
+    if not await bot.is_owner(message.author):
+        return
+    guilds = sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)
+    lines = [
+        f"**{discord.utils.escape_markdown(g.name)}** · 멤버 "
+        f"{f'{g.member_count:,}' if g.member_count is not None else '?'}명 · "
+        f"메시지 {traffic_24h('messages', g.id):,} · 명령어 {traffic_24h('commands', g.id):,}"
+        for g in guilds
+    ]
+    description = ""
+    for i, line in enumerate(lines):
+        if len(description) + len(line) + 30 > 4000:  # embed description limit is 4096
+            description += f"… 외 {len(lines) - i}개"
+            break
+        description += line + "\n"
+    embed = discord.Embed(
+        title=f"참여 중인 서버 {len(guilds)}개",
+        description=description or "참여 중인 서버가 없습니다.",
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="메시지·명령어 수: 최근 24시간, 봇이 켜진 뒤부터 집계")
+    await message.reply(embed=embed, mention_author=False)
+
+
 @bot.command(name="도움말", aliases=["help"])
 async def help_command(ctx):
-    embed = discord.Embed(
-        title="마인크래프트 업타임 봇",
-        color=discord.Color.green(),
-    )
+    embed = discord.Embed(title="Maco", color=discord.Color.green())
     embed.add_field(
         name="!주소추가 <주소> [이름]",
-        value="서버를 추가합니다. (예: `!주소추가 hypixel.net 하이픽셀`)",
+        value="서버를 추가합니다.\n(예: `!주소추가 hypixel.net 하이픽셀`)",
         inline=False,
     )
     embed.add_field(name="!업타임", value="등록된 모든 서버의 상태를 봅니다.", inline=False)
     embed.add_field(name="!업타임 <이름>", value="서버 하나의 자세한 업타임을 봅니다.", inline=False)
     embed.add_field(name="!주소", value="등록된 서버 목록을 봅니다.", inline=False)
-    embed.add_field(name="!주소삭제 <이름>", value="서버를 삭제합니다. (서버 관리 권한 필요)", inline=False)
+    embed.add_field(name="!주소삭제 <이름>", value="서버를 삭제합니다.", inline=False)
     embed.add_field(
         name="!H전적 <닉네임> [bw|sw|duels]",
-        value="하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임별 전적을 봅니다.",
+        value="하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.",
         inline=False,
     )
     embed.add_field(
@@ -368,7 +426,6 @@ async def help_command(ctx):
         value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
-    embed.set_footer(text=f"확인 주기: {CHECK_INTERVAL_SECONDS}초")
     await ctx.reply(embed=embed, mention_author=False)
 
 
