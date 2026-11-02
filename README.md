@@ -10,11 +10,13 @@
 - `!주소삭제 하이픽셀` — 서버와 기록 삭제 (서버 관리 권한 필요)
 - `!H전적 hypixel` — 하이픽셀 전적 카드 (이미지). `bw`, `sw`, `duels`를 붙이면 게임별 전적
 - `!V전적 Hide on bush#KR1` — 발로란트 전적 카드 (이미지). 랭크 아이콘·RR, 최고 랭크, 최근 10경기 승률·K/D·헤드샷·ADR(데스매치 제외), 최근 5경기. 지역은 계정에서 자동으로 찾으며 직접 붙일 수도 있음 (`kr`·`ap`·`na`·`eu`·`latam`·`br`). 계정을 못 찾으면 헷갈리기 쉬운 글자(I/l/1, O/0)를 바꾼 비슷한 ID를 버튼으로 제안
+- `/개발자소통` — 개발자에게 메시지 보내기 (나만 보이는 입력 창: 종류·제목·내용·사진 3장). 개발자가 답장하면 DM으로 받고, DM의 [답장하기]로 다시 보낼 수 있음. 5분에 한 번
+- `!개발자소통` — 슬래시 명령어가 안 보이는 서버용. 봇이 DM으로 물어보고, DM에 쓴 내용과 사진을 전달
 - `!도움말` — 명령어 안내
 
 ## 봇 설정
 1. Discord Developer Portal에서 봇을 만들고 **Message Content Intent**를 켭니다.
-2. OAuth2 URL Generator에서 `bot` 스코프와 아래 권한을 선택해 초대합니다.
+2. OAuth2 URL Generator에서 `bot`, `applications.commands` 스코프와 아래 권한을 선택해 초대합니다. (`applications.commands`는 `/개발자소통` 같은 슬래시 명령어용이며, 예전 링크로 초대한 서버는 새 링크로 다시 초대하면 됩니다. 다시 초대해도 봇이 나가지 않습니다.)
    - View Channels, Send Messages, Embed Links, Attach Files, Read Message History (권한 값 `117760`)
    - 이미 초대한 봇은 서버 설정 → 역할에서 봇 역할에 **파일 첨부** 권한을 켜면 됩니다.
 
@@ -49,4 +51,4 @@ python bot.py
 - 카드 폰트는 [Monocraft](https://github.com/IdreesInc/Monocraft)와 [Galmuri](https://github.com/quiple/galmuri)(둘 다 SIL Open Font License 1.1)이며 라이선스는 `assets/fonts/`에 있습니다.
 
 #Invite it!
-https://discord.com/oauth2/authorize?client_id=1561618276763570186&permissions=8515702525262144&integration_type=0&scope=bot
+https://discord.com/oauth2/authorize?client_id=1561618276763570186&permissions=8515702525262144&integration_type=0&scope=bot%20applications.commands
