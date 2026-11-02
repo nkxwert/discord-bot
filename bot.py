@@ -4,6 +4,7 @@ import math
 import time
 import sqlite3
 import asyncio
+import io
 import ipaddress
 import traceback
 from datetime import datetime, timezone
@@ -531,6 +532,11 @@ async def help_command(ctx):
         value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
+    embed.add_field(
+        name="/개발자소통",
+        value="개발자에게 메시지를 보냅니다. 나만 보이는 입력 창이 열립니다.\n(슬래시 명령어가 안 보이면 `!개발자소통`)",
+        inline=False,
+    )
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -990,6 +996,270 @@ async def stats_command_error(ctx, error):
         await ctx.reply(f"{math.ceil(error.retry_after)}초 후에 다시 시도해 주세요.", mention_author=False)
     else:
         await report_error(ctx, error)
+
+
+# ---------------------------------------------------------------- 개발자 소통
+
+FEEDBACK_KINDS = ["버그 신고", "건의", "질문", "기타"]
+FEEDBACK_COOLDOWN_SECONDS = 300
+FEEDBACK_MAX_LENGTH = 1500
+FEEDBACK_MAX_PHOTOS = 3
+FEEDBACK_MAX_PHOTO_BYTES = 8 * 1024 * 1024
+FEEDBACK_WAIT_SECONDS = 300
+_feedback_last_sent = {}  # user id -> when their last message reached the developer
+_feedback_sessions = {}  # user id -> token of their current !개발자소통 DM prompt
+
+
+def feedback_wait_left(user_id):
+    """Seconds until this user may send another message (0 if they can send now)."""
+    return max(0, math.ceil(FEEDBACK_COOLDOWN_SECONDS - (time.time() - _feedback_last_sent.get(user_id, 0))))
+
+
+def describe_place(guild, channel):
+    return f"{guild.name} ({guild.id}) · #{channel}" if guild else "DM"
+
+
+async def collect_photos(attachments):
+    """(filename, bytes) for up to FEEDBACK_MAX_PHOTOS images. Discord's attachment links expire,
+    so the files are re-uploaded rather than linked."""
+    photos = []
+    for attachment in attachments:
+        if len(photos) >= FEEDBACK_MAX_PHOTOS:
+            break
+        if not (attachment.content_type or "").startswith("image/") or attachment.size > FEEDBACK_MAX_PHOTO_BYTES:
+            continue
+        try:
+            data = await attachment.read()
+        except discord.HTTPException as exc:
+            print(f"사진 받기 실패: {type(exc).__name__}: {exc}")
+            continue
+        extension = os.path.splitext(attachment.filename)[1].lower() or ".png"
+        photos.append((f"photo{len(photos) + 1}{extension}", data))
+    return photos
+
+
+async def deliver_to_admins(sender, title, body, place, photos=()):
+    """DM a user's message to every admin, with a 답장 button. Returns how many admins received it."""
+    embed = discord.Embed(
+        title=f"📨 {title}"[:256], description=body[:4000] or "(내용 없음)",
+        color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="보낸 사람", value=f"{sender} ({sender.id})", inline=False)
+    embed.add_field(name="보낸 곳", value=place[:1024], inline=False)
+    if photos:
+        embed.set_image(url=f"attachment://{photos[0][0]}")
+    embed.set_footer(text="답장 버튼을 누르면 이 사용자에게 DM으로 전달됩니다")
+    view = discord.ui.View(timeout=None)
+    view.add_item(AdminReplyButton(sender.id))
+    try:
+        admin_ids = await admin_user_ids()
+    except discord.HTTPException as exc:
+        print(f"관리자 확인 실패: {type(exc).__name__}: {exc}")
+        return 0
+    delivered = 0
+    for admin_id in admin_ids:
+        try:
+            admin = bot.get_user(admin_id) or await bot.fetch_user(admin_id)
+            # discord.File objects can only be sent once, so build them per admin.
+            files = [discord.File(io.BytesIO(data), filename=name) for name, data in photos]
+            await admin.send(embed=embed, files=files, view=view)
+            delivered += 1
+        except discord.HTTPException as exc:
+            print(f"개발자 소통 전달 실패 ({admin_id}): {type(exc).__name__}: {exc}")
+    return delivered
+
+
+async def finish_feedback(sender, title, body, place, photos):
+    """Deliver and start the sender's cooldown. Returns the message to show the sender."""
+    if await deliver_to_admins(sender, title, body, place, photos):
+        _feedback_last_sent[sender.id] = time.time()
+        return "개발자에게 전달했습니다. 답장이 오면 DM으로 알려 드릴게요."
+    return "전달하지 못했습니다. 잠시 후 다시 시도해 주세요."
+
+
+class SafeModal(discord.ui.Modal):
+    """Modal that tells the user and the admin when submitting fails, instead of failing silently."""
+
+    async def on_error(self, interaction, error):
+        trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        print(f"입력 창 처리 중 오류:\n{trace}")
+        notify_admin("입력 창 처리 중 오류", f"{type(error).__name__}: {error}",
+                     describe_interaction(interaction, f"입력 창: {self.title}"), trace)
+        send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+        await send("오류가 발생했습니다.", ephemeral=True)
+
+
+class FeedbackModal(SafeModal, title="개발자에게 보내기"):
+    def __init__(self):
+        super().__init__()
+        self.kind = discord.ui.Select(options=[discord.SelectOption(label=k, value=k) for k in FEEDBACK_KINDS])
+        self.subject = discord.ui.TextInput(max_length=100, placeholder="한 줄로 요약해 주세요")
+        self.body = discord.ui.TextInput(style=discord.TextStyle.paragraph, max_length=FEEDBACK_MAX_LENGTH)
+        self.photos = discord.ui.FileUpload(required=False, max_values=FEEDBACK_MAX_PHOTOS)
+        self.add_item(discord.ui.Label(text="종류", component=self.kind))
+        self.add_item(discord.ui.Label(text="제목", component=self.subject))
+        self.add_item(discord.ui.Label(text="내용", component=self.body))
+        self.add_item(discord.ui.Label(text="사진 (선택, 최대 3장)", component=self.photos))
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        kind = self.kind.values[0] if self.kind.values else "기타"
+        photos = await collect_photos(self.photos.values)
+        message = await finish_feedback(
+            interaction.user, f"[{kind}] {self.subject.value}", self.body.value,
+            describe_place(interaction.guild, interaction.channel), photos,
+        )
+        await interaction.followup.send(message, ephemeral=True)
+
+
+class ReplyModal(SafeModal):
+    """recipient_id set: an admin answering that user. None: a user answering the developer."""
+
+    def __init__(self, recipient_id=None):
+        super().__init__(title="사용자에게 답장" if recipient_id else "개발자에게 답장")
+        self.recipient_id = recipient_id
+        self.body = discord.ui.TextInput(style=discord.TextStyle.paragraph, max_length=FEEDBACK_MAX_LENGTH)
+        self.add_item(discord.ui.Label(text="내용", component=self.body))
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.recipient_id is None:
+            message = await finish_feedback(interaction.user, "[답장]", self.body.value, "DM 답장", ())
+        else:
+            embed = discord.Embed(title="💬 개발자 답장", description=self.body.value, color=discord.Color.green())
+            embed.set_footer(text="아래 버튼으로 다시 답장할 수 있습니다")
+            view = discord.ui.View(timeout=None)
+            view.add_item(UserAnswerButton())
+            try:
+                user = bot.get_user(self.recipient_id) or await bot.fetch_user(self.recipient_id)
+                await user.send(embed=embed, view=view)
+                message = f"{user}님에게 전달했습니다."
+            except discord.HTTPException:
+                message = "전달하지 못했습니다. 사용자가 DM을 막아 두었거나 봇과 같은 서버에 없을 수 있습니다."
+        await interaction.followup.send(message, ephemeral=True)
+
+
+# Buttons keep working after a restart: discord.py rebuilds them from their custom_id.
+class AdminReplyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"devmsg:reply:(?P<user_id>\d+)"):
+    def __init__(self, user_id):
+        super().__init__(discord.ui.Button(
+            label="답장", style=discord.ButtonStyle.primary, custom_id=f"devmsg:reply:{user_id}",
+        ))
+        self.user_id = user_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["user_id"]))
+
+    async def interaction_check(self, interaction):
+        return await bot.is_owner(interaction.user)
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(ReplyModal(self.user_id))
+
+
+class UserAnswerButton(discord.ui.DynamicItem[discord.ui.Button], template=r"devmsg:answer"):
+    def __init__(self):
+        super().__init__(discord.ui.Button(
+            label="답장하기", style=discord.ButtonStyle.secondary, custom_id="devmsg:answer",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls()
+
+    async def callback(self, interaction):
+        left = feedback_wait_left(interaction.user.id)
+        if left:
+            await interaction.response.send_message(f"{left}초 후에 다시 보낼 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ReplyModal())
+
+
+@bot.tree.command(name="개발자소통", description="개발자에게 메시지를 보냅니다 (나만 보이는 입력 창)")
+async def feedback_slash(interaction: discord.Interaction):
+    left = feedback_wait_left(interaction.user.id)
+    if left:
+        await interaction.response.send_message(f"{left}초 후에 다시 보낼 수 있습니다.", ephemeral=True)
+        return
+    await interaction.response.send_modal(FeedbackModal())
+
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    original = getattr(error, "original", error)
+    trace = "".join(traceback.format_exception(type(original), original, original.__traceback__))
+    print(f"슬래시 명령어 오류:\n{trace}")
+    notify_admin("슬래시 명령어 오류", f"{type(original).__name__}: {original}",
+                 describe_interaction(interaction, f"명령어: /{interaction.command.name if interaction.command else '?'}"), trace)
+    send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+    await send("오류가 발생했습니다.", ephemeral=True)
+
+
+@bot.command(name="개발자소통")
+async def feedback_prefix(ctx):
+    # The original DM-based flow, kept for servers where slash commands aren't available.
+    left = feedback_wait_left(ctx.author.id)
+    if left:
+        await ctx.reply(f"{left}초 후에 다시 보낼 수 있습니다.", mention_author=False)
+        return
+    try:
+        prompt = await ctx.author.send(
+            "개발자에게 보낼 내용을 입력해 주세요. 사진은 3장까지 함께 보낼 수 있습니다.\n"
+            "5분 안에 입력해 주세요. 취소하려면 `취소`라고 입력하세요."
+        )
+    except discord.HTTPException:
+        await ctx.reply(
+            "DM을 보낼 수 없습니다. 디스코드 설정 → 개인정보 보호에서 서버 멤버의 DM을 허용해 주세요.",
+            mention_author=False,
+        )
+        return
+    if ctx.guild:
+        await ctx.reply("DM을 확인해 주세요. (`/개발자소통`을 쓰면 나만 보이는 입력 창으로 보낼 수 있습니다)",
+                        mention_author=False)
+
+    token = object()  # a newer !개발자소통 replaces this prompt
+    _feedback_sessions[ctx.author.id] = token
+
+    def is_answer(message):
+        return (message.author.id == ctx.author.id and isinstance(message.channel, discord.DMChannel)
+                and _feedback_sessions.get(ctx.author.id) is token)
+
+    try:
+        answer = await bot.wait_for("message", check=is_answer, timeout=FEEDBACK_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        if _feedback_sessions.get(ctx.author.id) is token:
+            del _feedback_sessions[ctx.author.id]
+            await prompt.channel.send("시간이 지나 취소되었습니다. 다시 보내려면 `!개발자소통`을 입력해 주세요.")
+        return
+    del _feedback_sessions[ctx.author.id]
+
+    content = answer.content.strip()
+    if content == "취소":
+        await prompt.channel.send("취소했습니다.")
+        return
+    if not content and not answer.attachments:
+        await prompt.channel.send("내용이 없어서 취소했습니다.")
+        return
+    if len(content) > FEEDBACK_MAX_LENGTH:
+        await prompt.channel.send(f"{FEEDBACK_MAX_LENGTH}자 이하로 다시 보내 주세요. `!개발자소통`으로 다시 시작할 수 있습니다.")
+        return
+    photos = await collect_photos(answer.attachments)
+    message = await finish_feedback(
+        ctx.author, "[일반] !개발자소통", content or "(사진만 보냄)", describe_place(ctx.guild, ctx.channel), photos,
+    )
+    await prompt.channel.send(message)
+
+
+async def setup_hook():
+    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton)
+    try:
+        synced = await bot.tree.sync()
+        print(f"슬래시 명령어 {len(synced)}개를 등록했습니다.")
+    except discord.HTTPException as exc:
+        print(f"슬래시 명령어 등록 실패: {type(exc).__name__}: {exc}")
+
+bot.setup_hook = setup_hook
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
