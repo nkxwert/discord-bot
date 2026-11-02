@@ -43,6 +43,7 @@ python bot.py
 - 업타임은 봇이 수집한 표본 기준이라 봇이 꺼진 시간은 측정되지 않습니다.
 - 호스팅 IP가 차단되어 직접 조회가 실패하면 마지막 수단으로 외부 서비스(mcsrvstat.us)로 확인합니다. 도메인 주소만 전송하며 IP 주소는 절대 보내지 않습니다. 외부 조회 결과는 응답 시간이 없고 몇 분 캐시될 수 있습니다. `.env`의 `EXTERNAL_FALLBACK=false`로 끌 수 있습니다.
 - 확인 간격은 `.env`의 `CHECK_INTERVAL_SECONDS`로 조절합니다. (기본 10초, 최소 1초)
+- API 키 만료·요청 한도 초과·외부 서비스 장애나 예상치 못한 오류가 나면 봇 관리자(`.env`의 `BOT_OWNER_IDS`, 비우면 봇을 만든 계정)에게 DM으로 알립니다. 같은 오류는 10분에 한 번만 보냅니다. 봇과 같은 서버에 있어야 DM을 받을 수 있습니다.
 - 전적 결과는 API 한도를 아끼기 위해 5분간 캐시되며, 같은 사용자는 5초에 한 번 조회할 수 있습니다.
 - `!H전적`은 조회한 닉네임을 Mojang·Hypixel API로, 스킨 이미지를 위해 UUID를 crafatar.com(실패 시 mc-heads.net)으로 보냅니다. `!V전적`은 Riot ID를 HenrikDev API로 보내고, 랭크·요원 아이콘을 media.valorant-api.com에서 받습니다(사용자 정보는 보내지 않음).
 - 카드 폰트는 [Monocraft](https://github.com/IdreesInc/Monocraft)와 [Galmuri](https://github.com/quiple/galmuri)(둘 다 SIL Open Font License 1.1)이며 라이선스는 `assets/fonts/`에 있습니다.

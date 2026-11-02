@@ -40,6 +40,27 @@ class PlayerNotFound(StatsError):
     """The API answered 404 for the requested player."""
 
 
+class ServiceError(StatsError):
+    """A missing or expired API key, a rate limit or an outage: not the user's fault, so the bot admin
+    should be told. str() is the message for the user; detail says what actually went wrong."""
+
+    def __init__(self, message, detail):
+        super().__init__(message)
+        self.detail = detail
+
+
+def _api_cause(data):
+    """The error text an API put in its JSON body, if any (Hypixel: cause, HenrikDev: errors[].message)."""
+    if not isinstance(data, dict):
+        return ""
+    if data.get("cause"):
+        return str(data["cause"])
+    errors = data.get("errors")
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        return str(errors[0].get("message") or "")
+    return ""
+
+
 async def _cached(key, loader):
     now = time.time()
     hit = _cache.get(key)
@@ -65,8 +86,12 @@ async def _request(url, *, headers=None, params=None, raw=False):
                     return response.status, None
                 return response.status, await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        host = url.split("/")[2] if "://" in url else url
         print(f"외부 API 요청 실패 ({url.split('?')[0]}): {type(exc).__name__}: {exc}")
-        raise StatsError("외부 서비스에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
+        raise ServiceError(
+            "외부 서비스에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+            f"{host} 연결 실패: {type(exc).__name__}",
+        ) from exc
 
 
 async def _report(progress, step):
@@ -218,21 +243,37 @@ async def minecraft_profile(name):
     if status in (204, 404) or (status == 200 and not (data or {}).get("id")):
         raise StatsError(f"`{name}` 플레이어를 찾을 수 없습니다.")
     if status != 200:
-        raise StatsError("마인크래프트 계정 조회에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        raise ServiceError(
+            "마인크래프트 계정 조회에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            f"Mojang API HTTP {status} {_api_cause(data)}".strip(),
+        )
     return data["id"], data["name"]
 
 
 async def _hypixel(path, **params):
     key = os.getenv("HYPIXEL_API_KEY", "").strip()
     if not key:
-        raise StatsError("Hypixel API 키가 설정되지 않았습니다. `.env`의 `HYPIXEL_API_KEY`를 확인해 주세요.")
+        raise ServiceError(
+            "Hypixel API 키가 설정되지 않았습니다. 봇 관리자에게 알렸습니다.",
+            "HYPIXEL_API_KEY가 설정되지 않음",
+        )
     status, data = await _request(HYPIXEL_API_URL + path, headers={"API-Key": key}, params=params)
+    cause = _api_cause(data)
     if status == 403:
-        raise StatsError("Hypixel API 키가 올바르지 않거나 만료되었습니다.")
+        raise ServiceError(
+            "Hypixel API 키가 올바르지 않거나 만료되었습니다. 봇 관리자에게 알렸습니다.",
+            f"Hypixel API 403 (키 무효 또는 만료) {cause}".strip(),
+        )
     if status == 429:
-        raise StatsError("Hypixel API 요청 한도를 넘었습니다. 잠시 후 다시 시도해 주세요.")
+        raise ServiceError(
+            "Hypixel API 요청 한도를 넘었습니다. 잠시 후 다시 시도해 주세요.",
+            f"Hypixel API 429 (요청 한도 초과) {cause}".strip(),
+        )
     if status != 200 or not (data or {}).get("success"):
-        raise StatsError("Hypixel 조회에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        raise ServiceError(
+            "Hypixel 조회에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            f"Hypixel API /{path} HTTP {status} {cause}".strip(),
+        )
     return data
 
 
@@ -328,16 +369,30 @@ def parse_riot_id(text):
 async def _henrik(path):
     key = os.getenv("HENRIK_API_KEY", "").strip()
     if not key:
-        raise StatsError("HenrikDev API 키가 설정되지 않았습니다. `.env`의 `HENRIK_API_KEY`를 확인해 주세요.")
+        raise ServiceError(
+            "HenrikDev API 키가 설정되지 않았습니다. 봇 관리자에게 알렸습니다.",
+            "HENRIK_API_KEY가 설정되지 않음",
+        )
     status, data = await _request(HENRIK_API_URL + path, headers={"Authorization": key})
+    cause = _api_cause(data)
     if status == 404:
         raise PlayerNotFound("플레이어를 찾을 수 없습니다. Riot ID를 확인해 주세요.")
     if status in (401, 403):
-        raise StatsError("HenrikDev API 키가 올바르지 않습니다.")
+        raise ServiceError(
+            "HenrikDev API 키가 올바르지 않습니다. 봇 관리자에게 알렸습니다.",
+            f"HenrikDev API {status} (키 무효 또는 만료) {cause}".strip(),
+        )
     if status == 429:
-        raise StatsError("HenrikDev API 요청 한도를 넘었습니다. 잠시 후 다시 시도해 주세요.")
+        raise ServiceError(
+            "HenrikDev API 요청 한도를 넘었습니다. 잠시 후 다시 시도해 주세요.",
+            f"HenrikDev API 429 (요청 한도 초과) {cause}".strip(),
+        )
     if status != 200 or not isinstance(data, dict):
-        raise StatsError("발로란트 전적 조회에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        endpoint = path.split("/")[0] + "/" + path.split("/")[1] if "/" in path else path
+        raise ServiceError(
+            "발로란트 전적 조회에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            f"HenrikDev API {endpoint} HTTP {status} {cause}".strip(),
+        )
     return data.get("data")
 
 
@@ -432,21 +487,28 @@ def riot_id_variants(name, tag):
 
 
 async def similar_accounts(name, tag):
-    """Existing accounts one small slip away from name#tag.
+    """Existing accounts one small slip away from name#tag, as (accounts, failure).
 
-    Each result carries the Riot ID that found it (query_name/query_tag), which is what to look up again.
+    Variants are tried one at a time so a burst can't eat the API's rate limit. If a lookup fails for a
+    reason other than "not found" (rate limit, outage), the search stops and that error is returned as
+    failure, so callers don't claim "no similar account" when they simply couldn't check.
+    Each account carries the Riot ID that found it (query_name/query_tag), which is what to look up again.
     """
-    variants = riot_id_variants(name, tag)
-    results = await asyncio.gather(*(valorant_account(n, t) for n, t in variants), return_exceptions=True)
     found, seen = [], set()
-    for (query_name, query_tag), account in zip(variants, results):
-        if not isinstance(account, dict):
+    for query_name, query_tag in riot_id_variants(name, tag):
+        try:
+            account = await valorant_account(query_name, query_tag)
+        except PlayerNotFound:
             continue
+        except StatsError as exc:
+            return found, exc
         key = (account["name"].lower(), account["tag"].lower())
         if key not in seen:
             seen.add(key)
             found.append(dict(account, query_name=query_name, query_tag=query_tag))
-    return found[:MAX_SUGGESTIONS]
+            if len(found) >= MAX_SUGGESTIONS:
+                break
+    return found, None
 
 
 async def valorant_profile(name, tag, region=None, progress=None):

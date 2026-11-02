@@ -21,9 +21,21 @@ import stats
 
 load_dotenv()
 
+
+def env_int(name, default, minimum):
+    """Integer setting from .env; a typo falls back to the default instead of stopping the bot."""
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        print(f"{name} 값 '{raw}'이(가) 숫자가 아니라서 기본값 {default}을(를) 씁니다.")
+        value = default
+    return max(minimum, value)
+
+
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "uptime.db")
-CHECK_INTERVAL_SECONDS = max(1, int(os.getenv("CHECK_INTERVAL_SECONDS", "10")))
+CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 10, 1)
 HISTORY_DAYS = 30
 PRUNE_INTERVAL_SECONDS = 60
 MAX_SERVERS_PER_GUILD = 10
@@ -89,6 +101,79 @@ def record_traffic(kind, guild_id):
 def traffic_24h(kind, guild_id):
     hour = int(time.time() // 3600)
     return sum(count for h, count in traffic[kind].get(guild_id, {}).items() if h > hour - 24)
+
+
+# ---------------------------------------------------------------- admin error DMs
+
+ADMIN_NOTIFY_COOLDOWN = 600  # the same error is DMed at most once per 10 minutes
+_admin_notified = {}  # (title, detail) -> [last sent time, times suppressed since]
+_background_tasks = set()  # keep references so pending DM tasks aren't garbage-collected
+
+
+def notify_admin(title, detail, where="", trace=""):
+    """DM the bot admins about an error in the background. Never raises, never delays the caller."""
+    now = time.time()
+    key = (title, detail)
+    entry = _admin_notified.get(key)
+    if entry and now - entry[0] < ADMIN_NOTIFY_COOLDOWN:
+        entry[1] += 1
+        return
+    repeats = entry[1] if entry else 0
+    if len(_admin_notified) > 200:
+        for old in [k for k, (sent, _) in _admin_notified.items() if now - sent >= ADMIN_NOTIFY_COOLDOWN]:
+            del _admin_notified[old]
+    _admin_notified[key] = [now, 0]
+    task = asyncio.get_running_loop().create_task(_send_admin_dm(title, detail, where, trace, repeats))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def notify_service_error(exc, where=""):
+    if isinstance(exc, stats.ServiceError):
+        notify_admin("외부 API 문제", exc.detail, where)
+
+
+async def admin_user_ids():
+    """BOT_OWNER_IDS if set, otherwise the app's owner (or team admins/developers) from the Developer Portal."""
+    if not (bot.owner_id or bot.owner_ids):
+        await bot.is_owner(discord.Object(id=0))  # makes discord.py look up and remember the owner(s)
+    return set(bot.owner_ids) if bot.owner_ids else {bot.owner_id}
+
+
+async def _send_admin_dm(title, detail, where, trace, repeats):
+    await bot.wait_until_ready()
+    description = detail[:1500]
+    if trace:
+        description += "\n```\n" + trace[-2000:].replace("```", "'''") + "\n```"
+    embed = discord.Embed(
+        title=f"⚠️ {title}", description=description, color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if where:
+        embed.add_field(name="위치", value=where[:1024], inline=False)
+    if repeats:
+        embed.set_footer(text=f"지난 알림 이후 같은 오류가 {repeats}번 더 있었습니다")
+    try:
+        ids = await admin_user_ids()
+    except discord.HTTPException as exc:
+        print(f"관리자 확인 실패: {type(exc).__name__}: {exc}")
+        return
+    for user_id in ids:
+        try:
+            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+            await user.send(embed=embed)
+        except discord.HTTPException as exc:
+            print(f"관리자 DM 실패 ({user_id}): {type(exc).__name__}: {exc}")
+
+
+def describe_ctx(ctx):
+    place = f"{ctx.guild.name} ({ctx.guild.id})" if ctx.guild else "DM"
+    return f"명령어: {ctx.message.content[:200]}\n서버: {place}\n사용자: {ctx.author} ({ctx.author.id})"
+
+
+def describe_interaction(interaction, what):
+    place = f"{interaction.guild.name} ({interaction.guild.id})" if interaction.guild else "DM"
+    return f"{what}\n서버: {place}\n사용자: {interaction.user} ({interaction.user.id})"
 
 
 def connect_db():
@@ -236,6 +321,9 @@ async def query_external(address: str):
         result = (bool(data.get("online")), None, players.get("online"), players.get("max"))
     except Exception as exc:
         print(f"외부 조회 실패 ({address}): {type(exc).__name__}: {exc}")
+        # Keyed by error kind, not address, so an mcsrvstat outage is one DM rather than one per server.
+        kind = f"HTTP {exc.status}" if isinstance(exc, aiohttp.ClientResponseError) else type(exc).__name__
+        notify_admin("외부 상태 조회(mcsrvstat) 실패", kind, f"주소: {address}\n{type(exc).__name__}: {exc}")
     external_cache[address.lower()] = (now, result)
     return result
 
@@ -368,6 +456,22 @@ async def easter_egg(message):
 async def count_messages(message):
     if message.guild and message.author != bot.user:
         record_traffic("messages", message.guild.id)
+
+
+@bot.listen("on_guild_remove")
+async def forget_guild_traffic(guild):
+    for counts in traffic.values():
+        counts.pop(guild.id, None)
+
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    # Errors in event listeners (easter eggs, £servers, ...). Replacing discord.py's default handler,
+    # so print the traceback too.
+    trace = traceback.format_exc()
+    print(f"이벤트 처리 중 오류 ({event}):\n{trace}")
+    last_line = trace.strip().splitlines()[-1] if trace.strip() else "알 수 없는 오류"
+    notify_admin("이벤트 처리 중 오류", last_line, f"이벤트: {event}", trace)
 
 
 @bot.listen("on_command")
@@ -528,6 +632,10 @@ async def report_error(ctx, error):
     """Log an unexpected command error and tell the user, replacing the waiting notice if one is up."""
     original = getattr(error, "original", error)
     traceback.print_exception(type(original), original, original.__traceback__)
+    notify_admin(
+        "명령어 처리 중 오류", f"{type(original).__name__}: {original}", describe_ctx(ctx),
+        "".join(traceback.format_exception(type(original), original, original.__traceback__)),
+    )
     notice = getattr(ctx, "notice", None)
     if notice:
         try:
@@ -723,11 +831,12 @@ async def uptime(ctx, *, name: str = ""):
     await send_result(ctx, notice, embed=embed)
 
 
-async def lookup(awaitable):
-    """Turn a StatsError into a (None, message) pair so it can be shown to the user."""
+async def lookup(ctx, awaitable):
+    """Turn a StatsError into a (None, message) pair so it can be shown to the user; API problems also go to the admin."""
     try:
         return await awaitable, None
     except stats.StatsError as exc:
+        notify_service_error(exc, describe_ctx(ctx))
         return None, str(exc)
 
 
@@ -746,7 +855,7 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
 
     progress = Progress(HYPIXEL_STEPS)
     (profile, error), notice = await run_with_notice(
-        ctx, lookup(stats.hypixel_profile(name, progress.step)), progress
+        ctx, lookup(ctx, stats.hypixel_profile(name, progress.step)), progress
     )
     if error:
         await send_result(ctx, notice, content=error)
@@ -759,19 +868,27 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
     await send_result(ctx, notice, file=discord.File(image, filename=f"hypixel_{profile['name']}.png"))
 
 
-async def valorant_lookup(name, tag, region, suggest=True, progress=None):
-    """Returns (profile, error, suggestions); suggestions are similar existing accounts when name#tag is unknown."""
+async def valorant_lookup(name, tag, region, suggest=True, progress=None, where=""):
+    """Returns (profile, error, suggestions); suggestions are similar existing accounts when name#tag is unknown.
+    `where` describes the request for admin error DMs."""
     try:
         return await stats.valorant_profile(name, tag, region, progress.step if progress else None), None, []
     except stats.PlayerNotFound:
         error = f"`{name}#{tag}` 계정을 찾을 수 없습니다."
-        if suggest and progress:
-            await progress.switch("account", "similar", "비슷한 계정 찾는 중")
-        suggestions = await stats.similar_accounts(name, tag) if suggest else []
-        if not suggestions:
+        suggestions, failure = [], None
+        if suggest:
+            if progress:
+                await progress.switch("account", "similar", "비슷한 계정 찾는 중")
+            suggestions, failure = await stats.similar_accounts(name, tag)
+        if failure:
+            notify_service_error(failure, where)
+            if not suggestions:
+                error += f" 비슷한 계정은 확인하지 못했습니다: {failure}"
+        elif not suggestions:
             error += " 이름과 태그를 다시 확인해 주세요. (대문자 I와 소문자 l, 숫자 0과 영문 O를 헷갈리기 쉽습니다)"
         return None, error, suggestions
     except stats.StatsError as exc:
+        notify_service_error(exc, where)
         return None, str(exc), []
 
 
@@ -803,9 +920,11 @@ class RiotIdChoice(discord.ui.View):
             progress = Progress(VALORANT_STEPS)
             await interaction.response.edit_message(content=progress.render(), view=None)
             progress.attach(lambda text: interaction.edit_original_response(content=text))
+            where = describe_interaction(interaction, f"버튼: Riot ID 선택 ({account['query_name']}#{account['query_tag']})")
             try:
                 profile, error, _ = await valorant_lookup(
-                    account["query_name"], account["query_tag"], self.region, suggest=False, progress=progress
+                    account["query_name"], account["query_tag"], self.region,
+                    suggest=False, progress=progress, where=where,
                 )
                 if error:
                     await interaction.edit_original_response(content=error)
@@ -818,6 +937,7 @@ class RiotIdChoice(discord.ui.View):
             except Exception as exc:
                 # Without this the message would stay on "불러오는 중입니다..." forever.
                 print(f"전적 버튼 오류: {type(exc).__name__}: {exc}")
+                notify_admin("전적 버튼 처리 중 오류", f"{type(exc).__name__}: {exc}", where, traceback.format_exc())
                 await interaction.edit_original_response(content="오류가 발생했습니다.")
         return callback
 
@@ -849,7 +969,7 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
 
     progress = Progress(VALORANT_STEPS)
     (profile, error, suggestions), notice = await run_with_notice(
-        ctx, valorant_lookup(name, tag, region, progress=progress), progress
+        ctx, valorant_lookup(name, tag, region, progress=progress, where=describe_ctx(ctx)), progress
     )
     if suggestions:
         view = RiotIdChoice(ctx.author.id, suggestions, region)
@@ -879,6 +999,7 @@ async def monitor_servers():
         rows = all_servers()
     except sqlite3.Error as exc:
         print(f"백그라운드 확인 오류: {type(exc).__name__}: {exc}")
+        notify_admin("백그라운드 서버 확인 오류", f"{type(exc).__name__}: {exc}", "서버 목록 읽기", traceback.format_exc())
         return
     for row in rows:
         try:
@@ -886,6 +1007,10 @@ async def monitor_servers():
             save_sample(row["id"], row["guild_id"], online, latency)
         except Exception as exc:
             print(f"백그라운드 확인 오류 ({row['address']}): {type(exc).__name__}: {exc}")
+            notify_admin(
+                "백그라운드 서버 확인 오류", f"{type(exc).__name__}: {exc}", f"주소: {row['address']}",
+                traceback.format_exc(),
+            )
         await asyncio.sleep(0.2)
 
 
