@@ -8,13 +8,14 @@ from urllib.parse import quote
 
 import aiohttp
 
+import net
+
 CACHE_SECONDS = 300
 PARTIAL_CACHE_SECONDS = 30  # a Valorant result missing its matches is retried soon
 MATCHES_TIMEOUT_SECONDS = 20  # stored-matches is often slower than the other endpoints
 MATCHES_RETRY_TIMEOUT_SECONDS = 15
-MAX_CACHE_ENTRIES = 500
+MAX_CACHE_ENTRIES = 150  # profiles hold icon images; keep the cache small on a 128MB host
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
-USER_AGENT = "discord-minecraft-uptime-bot"
 MOJANG_PROFILE_URL = "https://api.mojang.com/users/profiles/minecraft/"
 HYPIXEL_API_URL = "https://api.hypixel.net/v2/"
 HENRIK_API_URL = "https://api.henrikdev.xyz/valorant/"
@@ -81,15 +82,13 @@ async def _cached(key, loader, ttl=None):
 async def _request(url, *, headers=None, params=None, raw=False, timeout=None):
     timeout = timeout or REQUEST_TIMEOUT
     try:
-        async with aiohttp.ClientSession(
-            timeout=timeout, headers={"User-Agent": USER_AGENT}
-        ) as session:
-            async with session.get(url, headers=headers, params=params) as response:
-                if raw:
-                    return response.status, await response.read()
-                if response.status == 204:
-                    return response.status, None
-                return response.status, await response.json(content_type=None)
+        # One shared session (net.py) instead of a new one per request.
+        async with net.session().get(url, headers=headers, params=params, timeout=timeout) as response:
+            if raw:
+                return response.status, await response.read()
+            if response.status == 204:
+                return response.status, None
+            return response.status, await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
         host = url.split("/")[2] if "://" in url else url
         if isinstance(exc, asyncio.TimeoutError):

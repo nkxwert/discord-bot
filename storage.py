@@ -3,8 +3,14 @@ plus optional video conversion with ffmpeg.
 
 With STORAGE_PUBLIC_URL (a public bucket) links are plain URLs. Without it the bucket stays private and
 links are presigned for up to 7 days, which matches how long files are kept. That works on accounts that
-can't make public buckets, e.g. Backblaze B2 without a payment method."""
+can't make public buckets, e.g. Backblaze B2 without a payment method.
+
+The S3 calls are signed here (AWS Signature V4) and sent with the bot's shared aiohttp session instead
+of boto3, which alone needs about 17MB of memory. Files are streamed through in small chunks and are
+never held in memory as a whole."""
 import asyncio
+import hashlib
+import hmac
 import mimetypes
 import os
 import re
@@ -12,12 +18,17 @@ import secrets
 import shutil
 import tempfile
 import time
-from urllib.parse import quote, unquote
+import xml.etree.ElementTree as ElementTree
+from datetime import datetime, timezone
+from urllib.parse import quote, unquote, urlsplit
 
+import aiohttp
 from dotenv import load_dotenv
+from yarl import URL
+
+import net
 
 load_dotenv()  # bot.py imports this module before it loads .env itself
-
 
 
 def _env(name, legacy=""):
@@ -35,8 +46,10 @@ BUCKET = _env("STORAGE_BUCKET", "R2_BUCKET")
 PUBLIC_URL = _env("STORAGE_PUBLIC_URL", "R2_PUBLIC_URL").rstrip("/")
 _b2_region = re.search(r"s3\.([a-z0-9-]+)\.backblazeb2\.com", ENDPOINT)
 REGION = _env("STORAGE_REGION") or (_b2_region.group(1) if _b2_region else "auto")
+HOST = urlsplit(ENDPOINT).netloc
 MAX_LINK_SECONDS = 7 * 24 * 60 * 60  # the longest a presigned (SigV4) link can last
 PAGE_LINK_SECONDS = 60 * 60
+CHUNK_SIZE = 256 * 1024
 
 UPLOAD_PAGE_KEY = "upload.html"  # the big-file upload page, served from the bucket itself
 UPLOAD_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "upload.html")
@@ -50,36 +63,126 @@ INLINE_TYPES = {
     "audio/mpeg", "audio/ogg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/aac", "audio/flac",
 }
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+# ffmpeg needs far more memory than a small bot host has, so conversion is opt-in.
+CONVERT_VIDEO = os.getenv("FILE_CONVERT_VIDEO", "false").strip().lower() in ("1", "true", "yes", "on")
 CONVERT_MAX_BYTES = 300 * 1024 * 1024
 CONVERT_TIMEOUT_SECONDS = 600
-
-_client = None
 
 
 class StorageError(Exception):
     """Message is safe to show to the user."""
 
 
+class S3Error(Exception):
+    def __init__(self, status, body=b""):
+        code = re.search(rb"<Code>([^<]+)</Code>", body or b"")
+        self.status = status
+        self.code = code.group(1).decode() if code else ""
+        super().__init__(f"HTTP {status} {self.code}".strip())
+
+
 def configured():
     return all((ENDPOINT, ACCESS_KEY_ID, SECRET_ACCESS_KEY, BUCKET))
 
 
-def client():
-    global _client
-    if _client is None:
-        import boto3  # imported lazily so the bot runs without boto3 when storage isn't set up
-        from botocore.config import Config
-        _client = boto3.client(
-            "s3",
-            endpoint_url=ENDPOINT,
-            aws_access_key_id=ACCESS_KEY_ID,
-            aws_secret_access_key=SECRET_ACCESS_KEY,
-            region_name=REGION,
-            # Path-style keeps the upload page and the upload on one host, so no CORS rule is needed.
-            config=Config(signature_version="s3v4", retries={"max_attempts": 3}, s3={"addressing_style": "path"}),
-        )
-    return _client
+# ---------------------------------------------------------------- AWS Signature V4
 
+def _hmac(key, text):
+    return hmac.new(key, text.encode(), hashlib.sha256).digest()
+
+
+def _signing_key(date):
+    key = _hmac(("AWS4" + SECRET_ACCESS_KEY).encode(), date)
+    key = _hmac(key, REGION)
+    key = _hmac(key, "s3")
+    return _hmac(key, "aws4_request")
+
+
+def _path(key=""):
+    """Path-style URI (bucket in the path), so the upload page and uploads share one host: no CORS needed."""
+    return f"/{quote(BUCKET, safe='')}" + (f"/{quote(key, safe='/')}" if key else "")
+
+
+def _query(params):
+    return "&".join(
+        f"{quote(str(k), safe='-_.~')}={quote(str(v), safe='-_.~')}" for k, v in sorted(params.items())
+    )
+
+
+def _signature(date, string_to_sign):
+    return hmac.new(_signing_key(date), string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+
+def _now():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return stamp, stamp[:8]
+
+
+def _signed_headers(method, path, params, headers, payload_hash):
+    stamp, date = _now()
+    headers = {k.lower(): str(v) for k, v in headers.items()}
+    headers.update({"host": HOST, "x-amz-date": stamp, "x-amz-content-sha256": payload_hash})
+    names = sorted(k for k in headers if k == "host" or k.startswith("x-amz-"))
+    canonical = "\n".join([
+        method, path, _query(params),
+        "".join(f"{k}:{' '.join(headers[k].split())}\n" for k in names),
+        ";".join(names), payload_hash,
+    ])
+    scope = f"{date}/{REGION}/s3/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    headers["authorization"] = (f"AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/{scope}, "
+                                f"SignedHeaders={';'.join(names)}, Signature={_signature(date, to_sign)}")
+    del headers["host"]  # aiohttp sends it from the URL
+    return headers
+
+
+def presign(method, key, seconds):
+    stamp, date = _now()
+    scope = f"{date}/{REGION}/s3/aws4_request"
+    params = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256", "X-Amz-Credential": f"{ACCESS_KEY_ID}/{scope}",
+        "X-Amz-Date": stamp, "X-Amz-Expires": str(int(seconds)), "X-Amz-SignedHeaders": "host",
+    }
+    path = _path(key)
+    canonical = "\n".join([method, path, _query(params), f"host:{HOST}\n", "host", "UNSIGNED-PAYLOAD"])
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    return f"{ENDPOINT}{path}?{_query(params)}&X-Amz-Signature={_signature(date, to_sign)}"
+
+
+async def _s3(method, key="", params=None, headers=None, data=b"", unsigned_payload=False,
+              ok=(200, 204), timeout=60):
+    """One signed request. Returns (status, headers, body); raises S3Error for other statuses."""
+    params = params or {}
+    payload_hash = "UNSIGNED-PAYLOAD" if unsigned_payload else hashlib.sha256(data or b"").hexdigest()
+    path = _path(key)
+    signed = _signed_headers(method, path, params, headers or {}, payload_hash)
+    url = ENDPOINT + path + (f"?{_query(params)}" if params else "")
+    async with net.session().request(
+        method, URL(url, encoded=True), headers=signed, data=data,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as response:
+        body = await response.read()
+        if response.status not in ok:
+            raise S3Error(response.status, body)
+        # CopyObject can answer 200 with an error in the body.
+        if method == "PUT" and b"<Error>" in body[:200]:
+            raise S3Error(500, body)
+        return response.status, response.headers, body
+
+
+def _xml_items(body, tag):
+    root = ElementTree.fromstring(body)
+    return [el for el in root.iter() if el.tag.rsplit("}", 1)[-1] == tag]
+
+
+def _child(element, tag):
+    for child in element:
+        if child.tag.rsplit("}", 1)[-1] == tag:
+            return child.text or ""
+    return ""
+
+
+# ---------------------------------------------------------------- names, links, types
 
 def clean_filename(name):
     """Keep the original name (and its extension, which Discord needs to play a video) minus path tricks."""
@@ -101,10 +204,11 @@ def link(key, seconds=MAX_LINK_SECONDS):
     """Link that opens the file: a plain URL for a public bucket, else presigned (at most 7 days)."""
     if PUBLIC_URL:
         return f"{PUBLIC_URL}/{quote(key)}"
-    return client().generate_presigned_url(
-        "get_object", Params={"Bucket": BUCKET, "Key": key},
-        ExpiresIn=max(60, min(int(seconds), MAX_LINK_SECONDS)),
-    )
+    return presign("GET", key, max(60, min(int(seconds), MAX_LINK_SECONDS)))
+
+
+def presigned_put(key):
+    return presign("PUT", key, PRESIGN_SECONDS)
 
 
 def guess_type(filename):
@@ -115,37 +219,15 @@ def stored_headers(filename, content_type=None):
     """Content-Type / Content-Disposition to store: inline for safe media, a forced download otherwise."""
     content_type = (content_type or guess_type(filename)).split(";")[0].strip().lower()
     if content_type in INLINE_TYPES:
-        return {"ContentType": content_type}
+        return {"Content-Type": content_type}
     return {
-        "ContentType": "application/octet-stream",
-        "ContentDisposition": f"attachment; filename*=UTF-8''{quote(clean_filename(filename))}",
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(clean_filename(filename))}",
     }
 
 
 def is_inline(content_type):
     return content_type in INLINE_TYPES
-
-
-async def put_file(key, data, filename, content_type=None):
-    headers = stored_headers(filename, content_type)
-    try:
-        await asyncio.to_thread(client().put_object, Bucket=BUCKET, Key=key, Body=data, **headers)
-    except Exception as exc:
-        raise StorageError("파일 저장소에 올리지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
-    return headers["ContentType"]
-
-
-async def head(key):
-    """(size, content_type, original filename or None) of an uploaded object, or None if it isn't there."""
-    try:
-        info = await asyncio.to_thread(client().head_object, Bucket=BUCKET, Key=key)
-    except Exception as exc:
-        if getattr(exc, "response", {}).get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
-            return None
-        raise StorageError("파일 저장소를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
-    match = re.search(r"filename\*=UTF-8''([^;]+)", info.get("ContentDisposition") or "")
-    filename = clean_filename(unquote(match.group(1))) if match else None
-    return info["ContentLength"], (info.get("ContentType") or "").split(";")[0].strip().lower(), filename
 
 
 def name_for_type(content_type, stem="file"):
@@ -154,153 +236,208 @@ def name_for_type(content_type, stem="file"):
     return f"{stem}{extension}"
 
 
+# ---------------------------------------------------------------- uploads
+
+async def _file_chunks(path):
+    with open(path, "rb") as f:
+        while chunk := await asyncio.to_thread(f.read, CHUNK_SIZE):
+            yield chunk
+
+
+async def put_bytes(key, data, filename, content_type=None, extra_headers=None):
+    """Small uploads (the upload page). Returns the stored Content-Type."""
+    headers = {**stored_headers(filename, content_type), **(extra_headers or {})}
+    try:
+        await _s3("PUT", key, headers=headers, data=data)
+    except Exception as exc:
+        raise StorageError("파일 저장소에 올리지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
+    return headers["Content-Type"]
+
+
+async def put_path(key, path, filename, content_type=None):
+    """Stream a local file up. Returns the stored Content-Type."""
+    headers = stored_headers(filename, content_type)
+    headers["Content-Length"] = str(os.path.getsize(path))
+    try:
+        await _s3("PUT", key, headers=headers, data=_file_chunks(path), unsigned_payload=True, timeout=3600)
+    except Exception as exc:
+        raise StorageError("파일 저장소에 올리지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
+    return headers["Content-Type"]
+
+
+async def put_from_url(key, url, size, filename, content_type=None):
+    """Stream a file (a Discord attachment) straight from its URL into storage, a chunk at a time,
+    so even a big file only uses a few hundred KB of memory. Returns the stored Content-Type."""
+    headers = stored_headers(filename, content_type)
+    headers["Content-Length"] = str(size)
+    try:
+        async with net.session().get(url, timeout=aiohttp.ClientTimeout(total=3600)) as source:
+            if source.status != 200:
+                raise StorageError("디스코드에서 파일을 받지 못했습니다. 다시 시도해 주세요.")
+            await _s3("PUT", key, headers=headers, data=source.content.iter_chunked(CHUNK_SIZE),
+                      unsigned_payload=True, timeout=3600)
+    except StorageError:
+        raise
+    except Exception as exc:
+        raise StorageError("파일 저장소에 올리지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
+    return headers["Content-Type"]
+
+
+async def download_to(key_or_url, path, *, is_url=False):
+    """Stream a stored object (or any URL) into a local file."""
+    url = key_or_url if is_url else link(key_or_url, 3600)
+    async with net.session().get(URL(url, encoded=True), timeout=aiohttp.ClientTimeout(total=3600)) as response:
+        if response.status != 200:
+            raise StorageError("파일을 받지 못했습니다.")
+        with open(path, "wb") as f:
+            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                await asyncio.to_thread(f.write, chunk)
+
+
+async def head(key):
+    """(size, content_type, original filename or None) of an uploaded object, or None if it isn't there."""
+    try:
+        _, headers, _ = await _s3("HEAD", key)
+    except S3Error as exc:
+        if exc.status == 404:
+            return None
+        raise StorageError("파일 저장소를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
+    except Exception as exc:
+        raise StorageError("파일 저장소를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
+    match = re.search(r"filename\*=UTF-8''([^;]+)", headers.get("Content-Disposition") or "")
+    filename = clean_filename(unquote(match.group(1))) if match else None
+    content_type = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    return int(headers.get("Content-Length") or 0), content_type, filename
+
+
+async def copy(source_key, key, filename, content_type):
+    """Server-side copy with the safe stored type (nothing passes through the bot)."""
+    headers = {
+        **stored_headers(filename, content_type),
+        "x-amz-copy-source": _path(source_key),
+        "x-amz-metadata-directive": "REPLACE",
+    }
+    await _s3("PUT", key, headers=headers)
+    return headers["Content-Type"]
+
+
 async def finish_browser_upload(temp_key, filename, content_type, size):
     """Move a browser upload from its temporary key to its final name with the safe stored type,
-    converting a video Discord can't play when possible. Returns (key, content_type, size, filename)."""
+    converting a video Discord can't play when enabled. Returns (key, content_type, size, filename)."""
     folder = temp_key.rsplit("/", 1)[0]
     try:
-        if is_video(filename) and can_convert() and size <= CONVERT_MAX_BYTES:
-            converted = await to_playable_mp4(await download(temp_key), filename)
+        if should_convert(filename, size):
+            converted = await convert_stored(temp_key, filename)
             if converted:
-                data, filename = converted
-                key = f"{folder}/{clean_filename(filename)}"
-                stored_type = await put_file(key, data, filename)
+                path, filename, size, cleanup = converted
+                try:
+                    key = f"{folder}/{clean_filename(filename)}"
+                    stored_type = await put_path(key, path, filename)
+                finally:
+                    cleanup()
                 await delete([temp_key])
-                return key, stored_type, len(data), filename
+                return key, stored_type, size, filename
         key = f"{folder}/{clean_filename(filename)}"
-        headers = stored_headers(filename, content_type)
-        await asyncio.to_thread(
-            client().copy_object, Bucket=BUCKET, Key=key, CopySource={"Bucket": BUCKET, "Key": temp_key},
-            MetadataDirective="REPLACE", **headers,
-        )
+        stored_type = await copy(temp_key, key, filename, content_type)
         await delete([temp_key])
-        return key, headers["ContentType"], size, filename
+        return key, stored_type, size, filename
     except StorageError:
         raise
     except Exception as exc:
         raise StorageError("파일을 정리하지 못했습니다. 잠시 후 다시 [업로드 완료]를 눌러 주세요.") from exc
 
 
-async def download(key):
-    result = await asyncio.to_thread(client().get_object, Bucket=BUCKET, Key=key)
-    return await asyncio.to_thread(result["Body"].read)
+# ---------------------------------------------------------------- deleting and listing
+
+async def _versions(key):
+    """Every version id of key (B2 keeps deleted files as hidden versions); None if not supported."""
+    try:
+        _, _, body = await _s3("GET", params={"versions": "", "prefix": key})
+    except Exception:
+        return None
+    found = []
+    for tag in ("Version", "DeleteMarker"):
+        for item in _xml_items(body, tag):
+            if _child(item, "Key") == key:
+                found.append(_child(item, "VersionId"))
+    return found
 
 
 async def delete(keys):
-    """Delete objects; returns True if storage accepted the request (missing objects count as deleted).
+    """Delete objects; returns True if storage accepted it (missing objects count as deleted).
     Backblaze B2 keeps a deleted file as a hidden older version that still uses space, so every version
     of each key is removed. Services without versions (e.g. R2) get a plain delete."""
-    keys = [k for k in keys if k]
-    if not keys:
-        return True
     try:
-        objects = await asyncio.to_thread(_all_versions, keys)
-        for i in range(0, len(objects), 1000):
-            await asyncio.to_thread(
-                client().delete_objects, Bucket=BUCKET, Delete={"Objects": objects[i:i + 1000], "Quiet": True},
-            )
+        for key in [k for k in keys if k]:
+            versions = await _versions(key)
+            for version in versions or [None]:
+                params = {"versionId": version} if version else {}
+                await _s3("DELETE", key, params=params, ok=(200, 204, 404))
     except Exception as exc:
         print(f"저장소 삭제 실패: {type(exc).__name__}: {exc}")
         return False
     return True
 
 
-def _all_versions(keys):
-    objects = []
-    try:
-        for key in keys:
-            listing = client().list_object_versions(Bucket=BUCKET, Prefix=key)
-            for entry in listing.get("Versions", []) + listing.get("DeleteMarkers", []):
-                if entry["Key"] == key:
-                    objects.append({"Key": key, "VersionId": entry["VersionId"]})
-    except Exception:
-        objects = []  # no version listing on this service
-    found = {o["Key"] for o in objects}
-    return objects + [{"Key": k} for k in keys if k not in found]
-
-
-def presigned_put(key):
-    return client().generate_presigned_url(
-        "put_object", Params={"Bucket": BUCKET, "Key": key}, ExpiresIn=PRESIGN_SECONDS,
-    )
-
-
-def describe():
-    """Where files go, for £DB: (host, bucket, link mode)."""
-    host = re.sub(r"^https?://", "", ENDPOINT).split("/")[0]
-    return host, BUCKET, "공개 주소" if PUBLIC_URL else "비공개 + 서명 링크(최대 7일)"
-
-
-def _ping():
-    start = time.perf_counter()
-    try:
-        client().head_bucket(Bucket=BUCKET)
-    except Exception:
-        # Some keys may not allow HeadBucket; listing one object proves the connection as well.
-        client().list_objects_v2(Bucket=BUCKET, MaxKeys=1)
-    return (time.perf_counter() - start) * 1000
-
-
-async def ping():
-    """(milliseconds, None) if the bucket answers, else (None, error text)."""
-    try:
-        return await asyncio.to_thread(_ping), None
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
-
-
-def _bucket_usage(max_pages):
-    count = size = 0
-    token = None
+async def _list(max_pages):
+    """(key, size, last_modified timestamp) under files/, and whether more pages were left."""
+    items, token = [], None
     for _ in range(max_pages):
-        params = {"Bucket": BUCKET, "Prefix": "files/", "MaxKeys": 1000}
+        params = {"list-type": "2", "prefix": "files/", "max-keys": "1000"}
         if token:
-            params["ContinuationToken"] = token
-        page = client().list_objects_v2(**params)
-        for item in page.get("Contents", []):
-            count += 1
-            size += item["Size"]
-        if not page.get("IsTruncated"):
-            return count, size, False
-        token = page.get("NextContinuationToken")
-    return count, size, True
+            params["continuation-token"] = token
+        _, _, body = await _s3("GET", params=params)
+        for item in _xml_items(body, "Contents"):
+            modified = datetime.fromisoformat(_child(item, "LastModified").replace("Z", "+00:00")).timestamp()
+            items.append((_child(item, "Key"), int(_child(item, "Size") or 0), modified))
+        root = ElementTree.fromstring(body)
+        truncated = _child(root, "IsTruncated") == "true"
+        if not truncated:
+            return items, False
+        token = _child(root, "NextContinuationToken")
+    return items, True
 
 
 async def bucket_usage(max_pages=10):
     """(object count, bytes, more_left) actually in the bucket under files/, or None on failure.
     Each page is one list request (B2 counts it against the daily free transactions), so it is capped."""
     try:
-        return await asyncio.to_thread(_bucket_usage, max_pages)
+        items, more = await _list(max_pages)
     except Exception as exc:
         print(f"저장소 사용량 확인 실패: {type(exc).__name__}: {exc}")
         return None
-
-
-def _orphan_keys(known, max_pages, min_age_seconds):
-    orphans, token = [], None
-    cutoff = time.time() - min_age_seconds
-    for _ in range(max_pages):
-        params = {"Bucket": BUCKET, "Prefix": "files/", "MaxKeys": 1000}
-        if token:
-            params["ContinuationToken"] = token
-        page = client().list_objects_v2(**params)
-        for item in page.get("Contents", []):
-            if item["Key"] not in known and item["LastModified"].timestamp() < cutoff:
-                orphans.append(item["Key"])
-        if not page.get("IsTruncated"):
-            break
-        token = page.get("NextContinuationToken")
-    return orphans
+    return len(items), sum(size for _, size, _ in items), more
 
 
 async def orphan_keys(known, max_pages=20, min_age_seconds=3600):
     """Keys under files/ that the bot's list doesn't know (older than an hour, so uploads in progress are
     left alone), or None if the bucket couldn't be listed."""
     try:
-        return await asyncio.to_thread(_orphan_keys, set(known), max_pages, min_age_seconds)
+        items, _ = await _list(max_pages)
     except Exception as exc:
         print(f"저장소 목록 확인 실패: {type(exc).__name__}: {exc}")
         return None
+    known, cutoff = set(known), time.time() - min_age_seconds
+    return [key for key, _, modified in items if key not in known and modified < cutoff]
+
+
+def describe():
+    """Where files go, for £DB: (host, bucket, link mode)."""
+    return HOST, BUCKET, "공개 주소" if PUBLIC_URL else "비공개 + 서명 링크(최대 7일)"
+
+
+async def ping():
+    """(milliseconds, None) if the bucket answers, else (None, error text)."""
+    start = time.perf_counter()
+    try:
+        try:
+            await _s3("HEAD", timeout=15)
+        except S3Error:
+            # Some keys may not allow HeadBucket; listing one object proves the connection as well.
+            await _s3("GET", params={"list-type": "2", "max-keys": "1"}, timeout=15)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+    return (time.perf_counter() - start) * 1000, None
 
 
 async def setup_bucket():
@@ -309,19 +446,20 @@ async def setup_bucket():
     try:
         with open(UPLOAD_PAGE_PATH, "rb") as f:
             page = f.read()
-        await asyncio.to_thread(
-            client().put_object, Bucket=BUCKET, Key=UPLOAD_PAGE_KEY, Body=page,
-            ContentType="text/html; charset=utf-8", CacheControl="no-cache",
-        )
+        await _s3("PUT", UPLOAD_PAGE_KEY, data=page,
+                  headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache"})
     except Exception as exc:
         print(f"업로드 페이지 올리기 실패: {type(exc).__name__}: {exc}")
     if not PUBLIC_URL:
         return  # page and upload share the storage host: same origin, no CORS needed
+    rule = (f"<CORSConfiguration><CORSRule><AllowedOrigin>{PUBLIC_URL}</AllowedOrigin>"
+            "<AllowedMethod>PUT</AllowedMethod><AllowedHeader>content-type</AllowedHeader>"
+            "<AllowedHeader>content-disposition</AllowedHeader><MaxAgeSeconds>3600</MaxAgeSeconds>"
+            "</CORSRule></CORSConfiguration>").encode()
     try:
-        await asyncio.to_thread(client().put_bucket_cors, Bucket=BUCKET, CORSConfiguration={"CORSRules": [{
-            "AllowedOrigins": [PUBLIC_URL], "AllowedMethods": ["PUT"], "AllowedHeaders": ["content-type", "content-disposition"],
-            "MaxAgeSeconds": 3600,
-        }]})
+        import base64
+        md5 = base64.b64encode(hashlib.md5(rule).digest()).decode()
+        await _s3("PUT", params={"cors": ""}, data=rule, headers={"Content-MD5": md5, "Content-Type": "application/xml"})
     except Exception as exc:
         print(f"저장소 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {type(exc).__name__}: {exc}")
 
@@ -331,14 +469,18 @@ def upload_page_link(key, retention="7일"):
     return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}|{quote(retention, safe='')}"
 
 
-# ---------------------------------------------------------------- video conversion (optional)
+# ---------------------------------------------------------------- video conversion (optional, off by default)
 
 def can_convert():
-    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+    return CONVERT_VIDEO and bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
 def is_video(filename):
     return os.path.splitext(filename)[1].lower() in VIDEO_EXTENSIONS
+
+
+def should_convert(filename, size):
+    return can_convert() and is_video(filename) and size <= CONVERT_MAX_BYTES
 
 
 async def _run(*args, timeout):
@@ -354,29 +496,49 @@ async def _run(*args, timeout):
     return out.decode(errors="replace") if process.returncode == 0 else None
 
 
-async def to_playable_mp4(data, filename):
-    """(data, filename) as an H.264/AAC MP4 that Discord plays, or None to keep the original.
-    Videos that already play (H.264 in MP4) are left alone."""
-    if not can_convert() or not is_video(filename) or len(data) > CONVERT_MAX_BYTES:
-        return None
-    with tempfile.TemporaryDirectory() as folder:
+async def _convert_file(source, filename, folder):
+    """Path of an H.264/AAC MP4 made from source, or None to keep the original (already plays, or failed)."""
+    codec = await _run("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+                       "-of", "default=nw=1:nk=1", source, timeout=30)
+    if codec is None:
+        return None  # not a video ffprobe understands
+    codec = codec.strip()
+    extension = os.path.splitext(filename)[1].lower()
+    if (codec == "h264" and extension in (".mp4", ".m4v")) or (codec in ("vp8", "vp9") and extension == ".webm"):
+        return None  # Discord already plays it
+    target = os.path.join(folder, "out.mp4")
+    done = await _run("ffmpeg", "-y", "-v", "error", "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
+                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
+                      "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", target,
+                      timeout=CONVERT_TIMEOUT_SECONDS)
+    return target if done is not None and os.path.exists(target) else None
+
+
+async def _convert(fetch, filename):
+    """fetch(path) saves the original to path. Returns (mp4 path, new filename, size, cleanup) or None.
+    Everything goes through temporary files, never memory."""
+    folder = tempfile.mkdtemp(prefix="maco-")
+
+    def cleanup():
+        shutil.rmtree(folder, ignore_errors=True)
+
+    try:
         source = os.path.join(folder, "in" + os.path.splitext(filename)[1].lower())
-        target = os.path.join(folder, "out.mp4")
-        with open(source, "wb") as f:
-            f.write(data)
-        codec = await _run("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
-                           "-of", "default=nw=1:nk=1", source, timeout=30)
-        if codec is None:
-            return None  # not a video ffprobe understands
-        codec = codec.strip()
-        if (codec == "h264" and source.endswith((".mp4", ".m4v"))) or (codec in ("vp8", "vp9") and source.endswith(".webm")):
-            return None  # Discord already plays it
-        done = await _run("ffmpeg", "-y", "-v", "error", "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
-                          "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
-                          "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", target,
-                          timeout=CONVERT_TIMEOUT_SECONDS)
-        if done is None or not os.path.exists(target):
+        await fetch(source)
+        target = await _convert_file(source, filename, folder)
+        if not target:
+            cleanup()
             return None
-        with open(target, "rb") as f:
-            converted = f.read()
-    return converted, os.path.splitext(clean_filename(filename))[0] + ".mp4"
+        os.remove(source)
+        return target, os.path.splitext(clean_filename(filename))[0] + ".mp4", os.path.getsize(target), cleanup
+    except Exception:
+        cleanup()
+        raise
+
+
+async def convert_url(url, filename):
+    return await _convert(lambda path: download_to(url, path, is_url=True), filename)
+
+
+async def convert_stored(key, filename):
+    return await _convert(lambda path: download_to(key, path), filename)
