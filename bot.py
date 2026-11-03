@@ -1261,11 +1261,29 @@ async def run_hypixel(ctx, name, game_key):
     await send_result(ctx, notice, file=discord.File(image, filename=f"hypixel_{profile['name']}.png"))
 
 
+MATCH_FAILURE_WINDOW = 600
+MATCH_FAILURE_ALERT = 3  # tell the admin once recent-match loading has failed this often within the window
+_match_failures = []
+
+
+def note_match_failure(error, where):
+    """One slow stored-matches call is HenrikDev having a moment; several in a row are worth a DM."""
+    now = time.time()
+    _match_failures[:] = [t for t in _match_failures if now - t < MATCH_FAILURE_WINDOW] + [now]
+    if len(_match_failures) >= MATCH_FAILURE_ALERT:
+        # Fixed text, so notify_admin's 10-minute duplicate filter applies.
+        notify_admin("외부 API 문제", f"최근 경기 불러오기가 10분 안에 {MATCH_FAILURE_ALERT}번 이상 실패 · {error.detail}",
+                     where)
+
+
 async def valorant_lookup(name, tag, region, suggest=True, progress=None, where=""):
     """Returns (profile, error, suggestions); suggestions are similar existing accounts when name#tag is unknown.
     `where` describes the request for admin error DMs."""
     try:
-        return await stats.valorant_profile(name, tag, region, progress.step if progress else None), None, []
+        profile = await stats.valorant_profile(name, tag, region, progress.step if progress else None)
+        if profile.get("matches_error"):
+            note_match_failure(profile["matches_error"], where)
+        return profile, None, []
     except stats.PlayerNotFound:
         error = f"`{name}#{tag}` 계정을 찾을 수 없습니다."
         suggestions, failure = [], None
