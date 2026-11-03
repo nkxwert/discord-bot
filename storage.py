@@ -1,4 +1,9 @@
-"""File storage on Cloudflare R2 (S3-compatible) for !올리기, plus optional video conversion with ffmpeg."""
+"""File storage for !올리기 on any S3-compatible service (Backblaze B2, Cloudflare R2, ...),
+plus optional video conversion with ffmpeg.
+
+With STORAGE_PUBLIC_URL (a public bucket) links are plain URLs. Without it the bucket stays private and
+links are presigned for up to 7 days, which matches how long files are kept. That works on accounts that
+can't make public buckets, e.g. Backblaze B2 without a payment method."""
 import asyncio
 import mimetypes
 import os
@@ -12,11 +17,25 @@ from dotenv import load_dotenv
 
 load_dotenv()  # bot.py imports this module before it loads .env itself
 
-ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
-ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
-SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
-BUCKET = os.getenv("R2_BUCKET", "").strip()
-PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "").strip().rstrip("/")
+
+
+def _env(name, legacy=""):
+    """STORAGE_* setting, falling back to the older R2_* name."""
+    return (os.getenv(name, "") or (os.getenv(legacy, "") if legacy else "")).strip()
+
+
+_r2_account = _env("R2_ACCOUNT_ID")
+ENDPOINT = _env("STORAGE_ENDPOINT").rstrip("/") or (
+    f"https://{_r2_account}.r2.cloudflarestorage.com" if _r2_account else ""
+)
+ACCESS_KEY_ID = _env("STORAGE_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID")
+SECRET_ACCESS_KEY = _env("STORAGE_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY")
+BUCKET = _env("STORAGE_BUCKET", "R2_BUCKET")
+PUBLIC_URL = _env("STORAGE_PUBLIC_URL", "R2_PUBLIC_URL").rstrip("/")
+_b2_region = re.search(r"s3\.([a-z0-9-]+)\.backblazeb2\.com", ENDPOINT)
+REGION = _env("STORAGE_REGION") or (_b2_region.group(1) if _b2_region else "auto")
+MAX_LINK_SECONDS = 7 * 24 * 60 * 60  # the longest a presigned (SigV4) link can last
+PAGE_LINK_SECONDS = 60 * 60
 
 UPLOAD_PAGE_KEY = "upload.html"  # the big-file upload page, served from the bucket itself
 UPLOAD_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "upload.html")
@@ -41,21 +60,22 @@ class StorageError(Exception):
 
 
 def configured():
-    return all((ACCOUNT_ID, ACCESS_KEY_ID, SECRET_ACCESS_KEY, BUCKET, PUBLIC_URL))
+    return all((ENDPOINT, ACCESS_KEY_ID, SECRET_ACCESS_KEY, BUCKET))
 
 
 def client():
     global _client
     if _client is None:
-        import boto3  # imported lazily so the bot runs without boto3 when R2 isn't set up
+        import boto3  # imported lazily so the bot runs without boto3 when storage isn't set up
         from botocore.config import Config
         _client = boto3.client(
             "s3",
-            endpoint_url=f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com",
+            endpoint_url=ENDPOINT,
             aws_access_key_id=ACCESS_KEY_ID,
             aws_secret_access_key=SECRET_ACCESS_KEY,
-            region_name="auto",
-            config=Config(signature_version="s3v4", retries={"max_attempts": 3}),
+            region_name=REGION,
+            # Path-style keeps the upload page and the upload on one host, so no CORS rule is needed.
+            config=Config(signature_version="s3v4", retries={"max_attempts": 3}, s3={"addressing_style": "path"}),
         )
     return _client
 
@@ -76,8 +96,14 @@ def new_key(guild_id, filename):
     return f"files/{guild_id or 'dm'}/{secrets.token_urlsafe(9)}/{clean_filename(filename)}"
 
 
-def public_url(key):
-    return f"{PUBLIC_URL}/{quote(key)}"
+def link(key, seconds=MAX_LINK_SECONDS):
+    """Link that opens the file: a plain URL for a public bucket, else presigned (at most 7 days)."""
+    if PUBLIC_URL:
+        return f"{PUBLIC_URL}/{quote(key)}"
+    return client().generate_presigned_url(
+        "get_object", Params={"Bucket": BUCKET, "Key": key},
+        ExpiresIn=max(60, min(int(seconds), MAX_LINK_SECONDS)),
+    )
 
 
 def guess_type(filename):
@@ -160,20 +186,36 @@ async def download(key):
 
 
 async def delete(keys):
-    """Delete objects; returns True if R2 accepted the request (missing objects count as deleted)."""
+    """Delete objects; returns True if storage accepted the request (missing objects count as deleted).
+    Backblaze B2 keeps a deleted file as a hidden older version that still uses space, so every version
+    of each key is removed. Services without versions (e.g. R2) get a plain delete."""
     keys = [k for k in keys if k]
     if not keys:
         return True
     try:
-        for i in range(0, len(keys), 1000):
+        objects = await asyncio.to_thread(_all_versions, keys)
+        for i in range(0, len(objects), 1000):
             await asyncio.to_thread(
-                client().delete_objects, Bucket=BUCKET,
-                Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]], "Quiet": True},
+                client().delete_objects, Bucket=BUCKET, Delete={"Objects": objects[i:i + 1000], "Quiet": True},
             )
     except Exception as exc:
-        print(f"R2 삭제 실패: {type(exc).__name__}: {exc}")
+        print(f"저장소 삭제 실패: {type(exc).__name__}: {exc}")
         return False
     return True
+
+
+def _all_versions(keys):
+    objects = []
+    try:
+        for key in keys:
+            listing = client().list_object_versions(Bucket=BUCKET, Prefix=key)
+            for entry in listing.get("Versions", []) + listing.get("DeleteMarkers", []):
+                if entry["Key"] == key:
+                    objects.append({"Key": key, "VersionId": entry["VersionId"]})
+    except Exception:
+        objects = []  # no version listing on this service
+    found = {o["Key"] for o in objects}
+    return objects + [{"Key": k} for k in keys if k not in found]
 
 
 def presigned_put(key):
@@ -183,8 +225,8 @@ def presigned_put(key):
 
 
 async def setup_bucket():
-    """Upload the big-file page and allow the browser to PUT from it (CORS). Failures are only logged:
-    the CORS rule can also be set by hand in the Cloudflare dashboard (see README)."""
+    """Upload the big-file page, and for a public bucket allow the browser to PUT from it (CORS).
+    Failures are only logged: the CORS rule can also be set by hand (see README)."""
     try:
         with open(UPLOAD_PAGE_PATH, "rb") as f:
             page = f.read()
@@ -194,17 +236,20 @@ async def setup_bucket():
         )
     except Exception as exc:
         print(f"업로드 페이지 올리기 실패: {type(exc).__name__}: {exc}")
+    if not PUBLIC_URL:
+        return  # page and upload share the storage host: same origin, no CORS needed
     try:
         await asyncio.to_thread(client().put_bucket_cors, Bucket=BUCKET, CORSConfiguration={"CORSRules": [{
             "AllowedOrigins": [PUBLIC_URL], "AllowedMethods": ["PUT"], "AllowedHeaders": ["content-type", "content-disposition"],
             "MaxAgeSeconds": 3600,
         }]})
     except Exception as exc:
-        print(f"R2 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {type(exc).__name__}: {exc}")
+        print(f"저장소 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {type(exc).__name__}: {exc}")
 
 
 def upload_page_link(key):
-    return f"{public_url(UPLOAD_PAGE_KEY)}#{quote(presigned_put(key), safe='')}"
+    # The PUT link rides in the #fragment, which browsers never send to the server.
+    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}"
 
 
 # ---------------------------------------------------------------- video conversion (optional)
