@@ -504,6 +504,91 @@ async def count_commands(ctx):
 
 
 @bot.listen("on_message")
+async def owner_db_status(message):
+    # Developer-only "£DB": health of the local database and the file storage. Others get no reaction.
+    if message.author.bot or message.content.strip().lower() != "£db":
+        return
+    if not await bot.is_owner(message.author):
+        return
+    async with message.channel.typing():
+        embed = await db_status_embed()
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def db_status_embed():
+    embed = discord.Embed(title="DB 상태", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+
+    # Local sqlite (servers, uptime samples, file list)
+    try:
+        start = time.perf_counter()
+        with connect_db() as conn:
+            conn.execute("SELECT 1").fetchone()
+            ping_ms = (time.perf_counter() - start) * 1000
+            servers = conn.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
+            samples = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+            ready, pending = (conn.execute(
+                "SELECT COALESCE(SUM(status = 'ready'), 0), COALESCE(SUM(status = 'pending'), 0) FROM files"
+            ).fetchone())
+            next_expiry = conn.execute("SELECT MIN(expires_at) FROM files WHERE status = 'ready'").fetchone()[0]
+            top = conn.execute(
+                "SELECT guild_id, COUNT(*), SUM(size) FROM files WHERE status = 'ready' "
+                "GROUP BY guild_id ORDER BY SUM(size) DESC LIMIT 5"
+            ).fetchall()
+        size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        embed.add_field(name="🗄️ 로컬 DB (sqlite)", inline=False, value=(
+            f"🟢 연결됨 · 응답 {ping_ms:.1f} ms · 파일 크기 {human_size(size)}\n"
+            f"등록 서버 {servers:,}개 · 업타임 기록 {samples:,}개 (30일 보관)"
+        ))
+    except sqlite3.Error as exc:
+        embed.add_field(name="🗄️ 로컬 DB (sqlite)", value=f"🔴 오류: {type(exc).__name__}: {exc}", inline=False)
+        embed.color = discord.Color.red()
+        return embed
+
+    # File storage (Backblaze B2 / R2 ...)
+    if not storage.configured():
+        embed.add_field(name="📦 파일 저장소", value="⚪ 설정되지 않음 (`STORAGE_*` 값 없음)", inline=False)
+        return embed
+    host, bucket, mode = storage.describe()
+    ping_ms, error = await storage.ping()
+    if error:
+        embed.color = discord.Color.red()
+        connection = f"🔴 연결 실패 · {error}"
+    else:
+        connection = f"🟢 연결됨 · 응답 {ping_ms:.0f} ms"
+    used, total = file_usage(), FILE_TOTAL_QUOTA
+    embed.add_field(name="📦 파일 저장소", inline=False, value=(
+        f"{connection}\n`{host}` · 버킷 `{bucket}` · {mode}\n"
+        f"자동 삭제 {'🟢 동작 중' if clean_files.is_running() else '🔴 멈춤'} · "
+        f"영상 변환(ffmpeg) {'있음' if storage.can_convert() else '없음'}"
+    ))
+    percent = used / total * 100 if total else 0
+    embed.add_field(name="💾 용량", inline=False, value=(
+        f"사용 {human_size(used)} / {human_size(total)} ({percent:.1f}%)\n"
+        f"남은 용량 **{human_size(max(0, total - used))}** · 서버당 한도 {human_size(FILE_GUILD_QUOTA)} · "
+        f"파일당 최대 {human_size(FILE_MAX_BYTES)}"
+    ))
+    files_text = f"올라간 파일 **{ready:,}개** · 업로드 진행 중 {pending:,}개"
+    if next_expiry:
+        files_text += f"\n다음 자동 삭제 <t:{int(next_expiry)}:R>"
+    if not error:
+        actual = await storage.bucket_usage()
+        if actual:
+            count, actual_size, more = actual
+            files_text += (f"\n저장소 실제: {count:,}{'+' if more else ''}개 · {human_size(actual_size)}"
+                           f"{'+' if more else ''}")
+    embed.add_field(name="📁 파일", value=files_text, inline=False)
+    if top:
+        lines = []
+        for guild_id, count, total_size in top:
+            guild = bot.get_guild(guild_id) if guild_id else None
+            name = discord.utils.escape_markdown(guild.name) if guild else f"서버 {guild_id}"
+            lines.append(f"{name} · {count}개 · {human_size(total_size)}")
+        embed.add_field(name="많이 쓰는 서버", value="\n".join(lines), inline=False)
+    embed.set_footer(text="저장소 실제 값은 목록 요청으로 확인 (B2 무료 하루 2,500회에 포함)")
+    return embed
+
+
+@bot.listen("on_message")
 async def owner_servers(message):
     # Developer-only "£servers": lists the servers the bot is in. Anyone else gets no reaction at all.
     if message.author.bot or message.content.strip().lower() != "£servers":
