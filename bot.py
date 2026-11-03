@@ -512,6 +512,11 @@ async def owner_servers(message):
 
 @bot.command(name="도움말", aliases=["help"])
 async def help_command(ctx):
+    await ctx.reply(embed=command_list_embed(), mention_author=False)
+
+
+def command_list_embed():
+    """Every ! command; used by !도움말 and the /도움말 명령어 보기 button."""
     embed = discord.Embed(title="Maco", color=discord.Color.green())
     embed.add_field(
         name="!주소추가 <주소> [이름]",
@@ -539,7 +544,7 @@ async def help_command(ctx):
         value="개발자에게 메시지를 보냅니다.\n(`/도움말`의 ✉️ DM to Dev. 버튼으로도 보낼 수 있습니다)",
         inline=False,
     )
-    await ctx.reply(embed=embed, mention_author=False)
+    return embed
 
 
 @bot.command(name="주소추가")
@@ -1333,6 +1338,8 @@ class HelpView(discord.ui.View):
 
     def embed(self):
         color = discord.Color.green()
+        if self.page == "commands":
+            return command_list_embed()
         if self.page == "home":
             embed = discord.Embed(description=self.notice, color=color)
             if os.path.exists(HELP_BANNER_PATH):
@@ -1362,6 +1369,10 @@ class HelpView(discord.ui.View):
             for key, (emoji, title, _) in HELP_CATEGORIES.items():
                 self.add_button(title, emoji, discord.ButtonStyle.primary, self.open_category(key))
             self.add_button("DM to Dev.", "✉️", discord.ButtonStyle.primary, self.dm_to_dev)
+            self.add_button("명령어 보기", "📋", discord.ButtonStyle.primary, self.show_commands)
+            return
+        if self.page == "commands":
+            self.add_button("◀ 처음으로", None, discord.ButtonStyle.secondary, self.go_home)
             return
         for key in HELP_CATEGORIES[self.page][2]:
             style = discord.ButtonStyle.success if key == self.selected else discord.ButtonStyle.secondary
@@ -1428,6 +1439,9 @@ class HelpView(discord.ui.View):
             await self.show(interaction, notice=f"{left}초 후에 다시 보낼 수 있습니다.")
             return
         await interaction.response.send_modal(HelpFeedbackModal(self))
+
+    async def show_commands(self, interaction):
+        await self.show(interaction, page="commands")
 
     async def go_home(self, interaction):
         await self.show(interaction, page="home")
