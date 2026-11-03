@@ -252,6 +252,21 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_guild ON files(guild_id, status)")
+        # Small key/value settings changed with owner commands (e.g. £DB 기간).
+        conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.commit()
+
+
+def get_setting(key, default=None):
+    with connect_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with connect_db() as conn:
+        conn.execute("INSERT INTO settings(key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
         conn.commit()
 
 
@@ -503,16 +518,227 @@ async def count_commands(ctx):
         record_traffic("commands", ctx.guild.id)
 
 
+# ---------------------------------------------------------------- 관리자 명령어 (£)
+
+OWNER_COMMANDS = [
+    ("£도움말", "이 목록을 봅니다."),
+    ("£servers", "참여 중인 서버와 최근 24시간 메시지·명령어 수를 봅니다."),
+    ("£DB", "로컬 DB와 파일 저장소 상태(응답 시간, 용량, 파일 수 등)를 봅니다."),
+    ("£DB 파일 [서버ID]", "올라간 파일을 번호와 함께 봅니다. 서버ID를 붙이면 그 서버만 봅니다."),
+    ("£DB 삭제 <번호...>", "번호로 파일을 지웁니다. 여러 개는 띄어서 적습니다. (예: `£DB 삭제 12 15`)"),
+    ("£DB 서버삭제 <서버ID>", "그 서버에 올라간 파일을 전부 지웁니다. 확인 버튼을 한 번 더 누릅니다."),
+    ("£DB 기간 [기간]", "자동 삭제 기간을 보거나 바꿉니다. 새로 올리는 파일부터 적용됩니다. (예: `£DB 기간 3일`, `£DB 기간 12시간`)"),
+    ("£DB 정리", "기간이 지난 파일을 바로 지우고, 목록에 없이 저장소에만 남은 파일도 정리합니다."),
+]
+
+
 @bot.listen("on_message")
-async def owner_db_status(message):
-    # Developer-only "£DB": health of the local database and the file storage. Others get no reaction.
-    if message.author.bot or message.content.strip().lower() != "£db":
+async def owner_commands(message):
+    # Developer-only "£..." commands. Anyone else gets no reaction at all.
+    content = message.content.strip()
+    if message.author.bot or not content.startswith("£"):
         return
-    if not await bot.is_owner(message.author):
+    words = content[1:].split()
+    if not words:
         return
-    async with message.channel.typing():
-        embed = await db_status_embed()
+    command, args = words[0].lower(), words[1:]
+    handlers = {"도움말": owner_help, "help": owner_help, "servers": owner_servers, "db": owner_db}
+    if command not in handlers or not await bot.is_owner(message.author):
+        return
+    await handlers[command](message, args)
+
+
+async def owner_help(message, args):
+    embed = discord.Embed(title="관리자 명령어", color=discord.Color.blurple(),
+                          description="봇 관리자만 쓸 수 있고, 다른 사람이 치면 아무 반응이 없습니다.")
+    for name, text in OWNER_COMMANDS:
+        embed.add_field(name=name, value=text, inline=False)
     await message.reply(embed=embed, mention_author=False)
+
+
+async def owner_db(message, args):
+    sub = args[0] if args else ""
+    rest = args[1:]
+    if not sub:
+        async with message.channel.typing():
+            embed = await db_status_embed()
+        await message.reply(embed=embed, mention_author=False)
+        return
+    handlers = {"파일": owner_db_files, "삭제": owner_db_delete, "서버삭제": owner_db_delete_guild,
+                "기간": owner_db_retention, "정리": owner_db_cleanup}
+    handler = handlers.get(sub)
+    if handler is None:
+        await message.reply("알 수 없는 명령어입니다. `£도움말`을 확인해 주세요.", mention_author=False)
+        return
+    if sub != "기간" and not storage.configured():
+        await message.reply(FILE_NOT_CONFIGURED, mention_author=False)
+        return
+    await handler(message, rest)
+
+
+def guild_label(guild_id):
+    guild = bot.get_guild(guild_id) if guild_id else None
+    return discord.utils.escape_markdown(guild.name) if guild else f"서버 {guild_id}"
+
+
+async def owner_db_files(message, args):
+    with connect_db() as conn:
+        if args and args[0].isdigit():
+            rows = conn.execute("SELECT * FROM files WHERE guild_id = ? ORDER BY uploaded_at DESC",
+                                (int(args[0]),)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM files ORDER BY uploaded_at DESC").fetchall()
+    if not rows:
+        await message.reply("올라간 파일이 없습니다.", mention_author=False)
+        return
+    lines = []
+    for row in rows:
+        state = "업로드 중" if row["status"] == "pending" else f"<t:{int(row['expires_at'])}:R> 삭제"
+        lines.append(f"`#{row['id']}` **{discord.utils.escape_markdown(row['name'] or '(이름 없음)')}** · "
+                     f"{guild_label(row['guild_id'])} · {human_size(row['size'])} · {state}")
+    text = ""
+    for i, line in enumerate(lines):
+        if len(text) + len(line) > 3900:
+            text += f"… 외 {len(lines) - i}개"
+            break
+        text += line + "\n"
+    embed = discord.Embed(title=f"파일 {len(rows)}개", description=text, color=discord.Color.blurple())
+    embed.set_footer(text="£DB 삭제 <번호>로 지우기")
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def owner_db_delete(message, args):
+    ids = [int(a.lstrip("#")) for a in args if a.lstrip("#").isdigit()]
+    if not ids:
+        await message.reply("사용법: `£DB 삭제 <번호...>` (번호는 `£DB 파일`에서 확인)", mention_author=False)
+        return
+    with connect_db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT * FROM files WHERE id IN ({','.join('?' * len(ids))})", ids)]
+    found = {r["id"] for r in rows}
+    deleted, failed = [], []
+    for row in rows:
+        (deleted if await remove_file(row) else failed).append(f"`#{row['id']}` {row['name'] or '(이름 없음)'}")
+    lines = []
+    if deleted:
+        lines.append("삭제했습니다: " + ", ".join(deleted))
+    if failed:
+        lines.append("지우지 못했습니다 (저장소 오류): " + ", ".join(failed))
+    missing = [f"`#{i}`" for i in ids if i not in found]
+    if missing:
+        lines.append("없는 번호: " + ", ".join(missing))
+    await message.reply("\n".join(lines)[:2000], mention_author=False)
+
+
+class ConfirmView(discord.ui.View):
+    """[삭제] / [취소] that only the person who asked can press."""
+
+    def __init__(self, user_id, on_confirm):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.on_confirm = on_confirm
+        self.message = None
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="삭제", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        self.stop()
+        await interaction.response.edit_message(content="지우는 중...", view=None)
+        await interaction.edit_original_response(content=await self.on_confirm())
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        self.stop()
+        await interaction.response.edit_message(content="취소했습니다.", view=None)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(content="시간이 지나 취소되었습니다.", view=None)
+            except discord.HTTPException:
+                pass
+
+
+async def owner_db_delete_guild(message, args):
+    if not args or not args[0].isdigit():
+        await message.reply("사용법: `£DB 서버삭제 <서버ID>`", mention_author=False)
+        return
+    guild_id = int(args[0])
+    with connect_db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM files WHERE guild_id = ?", (guild_id,))]
+    if not rows:
+        await message.reply(f"{guild_label(guild_id)}에 올라간 파일이 없습니다.", mention_author=False)
+        return
+
+    async def delete_all():
+        if not await storage.delete([r["key"] for r in rows]):
+            return "지우지 못했습니다. 저장소 연결을 확인해 주세요. (`£DB`)"
+        with connect_db() as conn:
+            conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
+            conn.commit()
+        return f"{guild_label(guild_id)}의 파일 {len(rows)}개를 삭제했습니다."
+
+    view = ConfirmView(message.author.id, delete_all)
+    total = sum(r["size"] for r in rows)
+    view.message = await message.reply(
+        f"**{guild_label(guild_id)}**의 파일 **{len(rows)}개** ({human_size(total)})를 전부 지울까요? 되돌릴 수 없습니다.",
+        view=view, mention_author=False,
+    )
+
+
+def parse_duration(text):
+    """'3일', '12시간', '1일 6시간', '90분', '2d', '36h' -> seconds, or None."""
+    units = {"일": 86400, "d": 86400, "day": 86400, "days": 86400, "시간": 3600, "h": 3600, "hour": 3600,
+             "hours": 3600, "분": 60, "m": 60, "min": 60}
+    matches = re.findall(r"(\d+)\s*(일|days?|d|시간|hours?|h|분|min|m)", text.lower())
+    if not matches or re.sub(r"(\d+)\s*(일|days?|d|시간|hours?|h|분|min|m)|\s", "", text.lower()):
+        return None
+    return sum(int(n) * units[u] for n, u in matches)
+
+
+async def owner_db_retention(message, args):
+    current = retention_text()
+    limit = human_duration(file_retention_max())
+    if not args:
+        await message.reply(f"자동 삭제 기간: **{current}** (설정할 수 있는 범위: 1시간 ~ {limit})\n"
+                            "바꾸려면 `£DB 기간 3일`처럼 입력해 주세요.", mention_author=False)
+        return
+    seconds = parse_duration(" ".join(args))
+    if seconds is None:
+        await message.reply("기간을 알아보지 못했습니다. 예: `£DB 기간 3일`, `£DB 기간 12시간`, `£DB 기간 1일 6시간`",
+                            mention_author=False)
+        return
+    if not FILE_RETENTION_MIN <= seconds <= file_retention_max():
+        reason = " 비공개 저장소의 링크는 최대 7일까지만 쓸 수 있습니다." if not storage.PUBLIC_URL else ""
+        await message.reply(f"1시간 ~ {limit} 사이로 정해 주세요.{reason}", mention_author=False)
+        return
+    set_setting("file_retention_seconds", seconds)
+    await message.reply(f"자동 삭제 기간을 **{current} → {human_duration(seconds)}**(으)로 바꿨습니다. "
+                        "새로 올리는 파일부터 적용되며, 이미 올라간 파일은 원래 기간대로 지워집니다.",
+                        mention_author=False)
+
+
+async def owner_db_cleanup(message, args):
+    async with message.channel.typing():
+        with connect_db() as conn:
+            expired = conn.execute("SELECT COUNT(*) FROM files WHERE expires_at < ?", (time.time(),)).fetchone()[0]
+        await clean_files.coro()
+        with connect_db() as conn:
+            known = {r["key"] for r in conn.execute("SELECT key FROM files")}
+        orphans = await storage.orphan_keys(known)
+    if orphans is None:
+        await message.reply(f"기간이 지난 파일 {expired}개를 정리했습니다. 저장소 목록은 확인하지 못했습니다.",
+                            mention_author=False)
+        return
+    removed = len(orphans) if orphans and await storage.delete(orphans) else 0
+    await message.reply(
+        f"기간이 지난 파일 **{expired}개**를 정리했습니다.\n"
+        f"목록에 없이 저장소에만 남아 있던 파일 **{removed}개**를 지웠습니다."
+        + ("\n⚠️ 일부를 지우지 못했습니다." if orphans and not removed else ""),
+        mention_author=False,
+    )
 
 
 async def db_status_embed():
@@ -567,7 +793,7 @@ async def db_status_embed():
         f"남은 용량 **{human_size(max(0, total - used))}** · 서버당 한도 {human_size(FILE_GUILD_QUOTA)} · "
         f"파일당 최대 {human_size(FILE_MAX_BYTES)}"
     ))
-    files_text = f"올라간 파일 **{ready:,}개** · 업로드 진행 중 {pending:,}개"
+    files_text = f"올라간 파일 **{ready:,}개** · 업로드 진행 중 {pending:,}개 · 자동 삭제 기간 {retention_text()}"
     if next_expiry:
         files_text += f"\n다음 자동 삭제 <t:{int(next_expiry)}:R>"
     if not error:
@@ -584,17 +810,12 @@ async def db_status_embed():
             name = discord.utils.escape_markdown(guild.name) if guild else f"서버 {guild_id}"
             lines.append(f"{name} · {count}개 · {human_size(total_size)}")
         embed.add_field(name="많이 쓰는 서버", value="\n".join(lines), inline=False)
-    embed.set_footer(text="저장소 실제 값은 목록 요청으로 확인 (B2 무료 하루 2,500회에 포함)")
+    embed.set_footer(text="£도움말로 관리자 명령어 보기 · 저장소 실제 값은 목록 요청으로 확인 (B2 무료 하루 2,500회에 포함)")
     return embed
 
 
-@bot.listen("on_message")
-async def owner_servers(message):
-    # Developer-only "£servers": lists the servers the bot is in. Anyone else gets no reaction at all.
-    if message.author.bot or message.content.strip().lower() != "£servers":
-        return
-    if not await bot.is_owner(message.author):
-        return
+async def owner_servers(message, args):
+    # £servers: lists the servers the bot is in.
     guilds = sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)
     lines = [
         f"**{discord.utils.escape_markdown(g.name)}** · 멤버 "
@@ -645,7 +866,7 @@ def command_list_embed():
         inline=False,
     )
     embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 링크를 보냅니다. 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
-                    "7일 후 자동 삭제됩니다.", inline=False)
+                    f"{retention_text()} 후 자동 삭제됩니다.", inline=False)
     embed.add_field(name="!파일 [이름]", value="올린 파일 목록을 봅니다. 이름을 붙이면 그 파일 링크를 보냅니다.", inline=False)
     embed.add_field(name="!파일삭제 <이름>", value="파일을 지웁니다. (올린 사람 또는 서버 관리 권한)", inline=False)
     embed.add_field(name="!운세", value="오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다.", inline=False)
@@ -1419,14 +1640,45 @@ async def feedback_prefix(ctx):
 
 # ---------------------------------------------------------------- 파일 (S3 호환 저장소: Backblaze B2, Cloudflare R2 등)
 
-FILE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+FILE_RETENTION_DEFAULT = 7 * 24 * 60 * 60
+FILE_RETENTION_MIN = 60 * 60
 FILE_PENDING_SECONDS = 60 * 60  # an unfinished browser upload is cleaned up after this
 FILE_GUILD_QUOTA = env_int("FILE_GUILD_QUOTA_MB", 10240, 1) * 1024 * 1024
 FILE_TOTAL_QUOTA = env_int("FILE_TOTAL_QUOTA_MB", 10240, 1) * 1024 * 1024  # B2 / R2 free tiers are 10GB
 FILE_MAX_BYTES = env_int("FILE_MAX_MB", 500, 1) * 1024 * 1024
 FILE_MAX_PER_MESSAGE = 5
 FILE_COOLDOWN_SECONDS = 10
-FILE_NOTICE = "📦 올린 파일은 봇의 파일 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다. 링크가 있으면 누구나 볼 수 있습니다."
+
+
+def file_retention_max():
+    # On a private bucket links are presigned, and those last at most 7 days.
+    return 30 * 24 * 60 * 60 if storage.PUBLIC_URL else storage.MAX_LINK_SECONDS
+
+
+def file_retention():
+    """How long new uploads are kept (£DB 기간 changes it)."""
+    try:
+        seconds = int(get_setting("file_retention_seconds", FILE_RETENTION_DEFAULT))
+    except (ValueError, sqlite3.Error):
+        seconds = FILE_RETENTION_DEFAULT
+    return max(FILE_RETENTION_MIN, min(seconds, file_retention_max()))
+
+
+def human_duration(seconds):
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = [f"{days}일" if days else "", f"{hours}시간" if hours else "", f"{minutes}분" if minutes else ""]
+    return " ".join(p for p in parts if p) or "0분"
+
+
+def retention_text():
+    return human_duration(file_retention())
+
+
+def file_notice():
+    return (f"📦 올린 파일은 봇의 파일 저장소에 올라가며 **{retention_text()} 후 자동으로 삭제**됩니다. "
+            "링크가 있으면 누구나 볼 수 있습니다.")
 FILE_NOT_CONFIGURED = "파일 저장소가 설정되지 않았습니다. 봇 관리자에게 문의해 주세요."
 
 
@@ -1451,7 +1703,7 @@ def check_file_quota(guild_id, size):
     if file_usage(guild_id) + size > FILE_GUILD_QUOTA:
         raise storage.StorageError(
             f"이 서버의 저장 공간({human_size(FILE_GUILD_QUOTA)})이 부족합니다. "
-            "`!파일삭제`로 정리하거나 7일 뒤 자동 삭제를 기다려 주세요."
+            "`!파일삭제`로 정리하거나 자동 삭제를 기다려 주세요."
         )
     if file_usage() + size > FILE_TOTAL_QUOTA:
         notify_admin("파일 저장 공간 가득 참", f"전체 한도 {human_size(FILE_TOTAL_QUOTA)}에 도달했습니다.")
@@ -1485,7 +1737,7 @@ def file_display_name(name, filename):
 
 def save_file_row(guild_id, channel_id, user_id, name, key, content_type, size, status="ready"):
     now = time.time()
-    expires = now + (FILE_RETENTION_SECONDS if status == "ready" else FILE_PENDING_SECONDS)
+    expires = now + (file_retention() if status == "ready" else FILE_PENDING_SECONDS)
     with connect_db() as conn:
         cursor = conn.execute(
             "INSERT INTO files(guild_id, channel_id, name, key, url, content_type, size, uploaded_by, "
@@ -1525,7 +1777,7 @@ def file_messages(rows, errors=()):
     (presigned links are long, so five files may not fit in one message)."""
     parts = [file_line(r) for r in rows] + [f"⚠️ {e}"[:1900] for e in errors]
     if rows:
-        parts.append(FILE_NOTICE)
+        parts.append(file_notice())
     messages = [""]
     for part in parts:
         if messages[-1] and len(messages[-1]) + 2 + len(part) > 2000:
@@ -1570,14 +1822,14 @@ def start_browser_upload(guild_id, channel_id, user_id, name=""):
     """A pending upload and the page link where the user picks the file (for files over Discord's limit)."""
     key = storage.new_key(guild_id, "upload")
     row = save_file_row(guild_id, channel_id, user_id, name.strip()[:MAX_NAME_LENGTH], key, "", 0, status="pending")
-    return row, storage.upload_page_link(key)
+    return row, storage.upload_page_link(key, retention_text())
 
 
 def browser_upload_text(link):
     return (
         f"**[파일 올리는 페이지 열기]({link})**\n"
         f"페이지에서 파일을 올린 뒤 아래 **[업로드 완료]**를 눌러 주세요. "
-        f"링크는 10분 동안 쓸 수 있고, 파일당 최대 {human_size(FILE_MAX_BYTES)}입니다.\n{FILE_NOTICE}"
+        f"링크는 10분 동안 쓸 수 있고, 파일당 최대 {human_size(FILE_MAX_BYTES)}입니다.\n{file_notice()}"
     )
 
 
@@ -1650,7 +1902,7 @@ class UploadDoneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mac
             conn.execute(
                 "UPDATE files SET name = ?, key = ?, url = ?, content_type = ?, size = ?, uploaded_at = ?, "
                 "expires_at = ?, status = 'ready' WHERE id = ?",
-                (name, key, "", stored_type, size, now, now + FILE_RETENTION_SECONDS, row["id"]),
+                (name, key, "", stored_type, size, now, now + file_retention(), row["id"]),
             )
             conn.commit()
             done = dict(conn.execute("SELECT * FROM files WHERE id = ?", (row["id"],)).fetchone())
@@ -1765,7 +2017,7 @@ async def files_command(ctx, *, name: str = ""):
         await ctx.reply("올린 파일이 없습니다. 파일을 첨부해서 `!올리기`를 해 보세요.", mention_author=False)
         return
     embed = discord.Embed(description=text, color=discord.Color.green())
-    embed.set_footer(text="!파일 <이름>으로 링크 보기 · 7일 후 자동 삭제")
+    embed.set_footer(text=f"!파일 <이름>으로 링크 보기 · {retention_text()} 후 자동 삭제")
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -1841,9 +2093,9 @@ HELP_COMMANDS = {
     "hypixel": ("Hypixel 전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
                 "예: `!H전적 hypixel bw`"),
     "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부\n파일을 올리고 링크를 보냅니다. 사진·영상은 채팅창에서 바로 보입니다.\n"
-               "올린 파일은 봇의 파일 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
+               "올린 파일은 봇의 파일 저장소에 올라가며 **{보관} 후 자동으로 삭제**됩니다."),
     "bigupload": ("큰 파일", "!올리기", "`!올리기` (첨부 없이)\n디스코드에 첨부하기 어려운 큰 파일을 웹페이지에서 올립니다.\n"
-                  "올린 파일은 봇의 파일 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
+                  "올린 파일은 봇의 파일 저장소에 올라가며 **{보관} 후 자동으로 삭제**됩니다."),
     "files": ("목록", "!파일", "`!파일 [이름]`\n이 서버에 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일 링크를 보냅니다."),
     "filedelete": ("삭제", "!파일삭제", "`!파일삭제 <이름>`\n파일을 지웁니다. 올린 사람이나 서버 관리 권한이 있는 사람만 지울 수 있습니다."),
     "fortune": ("운세", "!운세", "`!운세`\n오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다."),
@@ -1968,7 +2220,8 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
 
     emoji, title, keys = HELP_CATEGORIES[page]
     if selected:
-        _, command, text = HELP_COMMANDS[selected]
+        _, command, _ = HELP_COMMANDS[selected]
+        text = help_text(selected)
         title = f"{emoji} {title} · {command}"
     else:
         title, text = f"{emoji} {title}", "버튼을 누르면 바로 사용할 수 있습니다."
@@ -1982,6 +2235,10 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
     for item in extra_items:
         view.add_item(item)
     return {"embed": discord.Embed(title=title, description=text[:4096], color=color), "view": view}
+
+
+def help_text(key):
+    return HELP_COMMANDS[key][2].replace("{보관}", retention_text())
 
 
 def help_page_of(key):
@@ -2128,9 +2385,9 @@ class HelpModal(SafeModal):
     key = ""
 
     def __init__(self):
-        label, _, text = HELP_COMMANDS[self.key]
+        label = HELP_COMMANDS[self.key][0]
         super().__init__(title=label)
-        self.add_item(discord.ui.TextDisplay(text))
+        self.add_item(discord.ui.TextDisplay(help_text(self.key)))
 
     async def reject(self, interaction, notice):
         """Show why the input can't be used on the help message, without posting anything."""
