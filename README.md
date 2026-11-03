@@ -11,7 +11,7 @@
 - `!H전적 hypixel` — 하이픽셀 전적 카드 (이미지). `bw`, `sw`, `duels`를 붙이면 게임별 전적
 - `!V전적 Hide on bush#KR1` — 발로란트 전적 카드 (이미지). 랭크 아이콘·RR, 최고 랭크, 최근 10경기 승률·K/D·헤드샷·ADR(데스매치 제외), 최근 5경기. 지역은 계정에서 자동으로 찾으며 직접 붙일 수도 있음 (`kr`·`ap`·`na`·`eu`·`latam`·`br`). 계정을 못 찾으면 헷갈리기 쉬운 글자(I/l/1, O/0)를 바꾼 비슷한 ID를 버튼으로 제안
 - `!개발자소통` — 개발자에게 메시지 보내기. 봇이 DM으로 물어보고, DM에 쓴 내용과 사진을 전달 (`/도움말`의 ✉️ DM to Dev.를 누르면 나만 보이는 입력 창: 종류·제목·내용·사진 3장). 개발자가 답장하면 DM으로 받고, DM의 [답장하기]로 다시 보낼 수 있음. 5분에 한 번
-- `!올리기 [이름]` + 파일 첨부 — 파일을 Cloudflare R2에 올리고 링크를 보냄 (사진·영상은 채팅창에서 바로 보임, 한 번에 5개까지). 첨부 없이 쓰면 큰 파일(기본 500MB까지)용 업로드 페이지 링크를 DM으로 보내고, 다 올린 뒤 [업로드 완료]를 누르면 채널에 링크를 올림. 누구나 사용, 10초에 한 번
+- `!올리기 [이름]` + 파일 첨부 — 파일을 저장소(Backblaze B2 등)에 올리고 링크를 보냄 (사진·영상은 채팅창에서 바로 보임, 한 번에 5개까지). 첨부 없이 쓰면 큰 파일(기본 500MB까지)용 업로드 페이지 링크를 DM으로 보내고, 다 올린 뒤 [업로드 완료]를 누르면 채널에 링크를 올림. 누구나 사용, 10초에 한 번
 - `!파일 [이름]` — 이 서버에 올린 파일 목록 / 이름을 붙이면 그 파일 링크
 - `!파일삭제 <이름>` — 올린 사람 또는 서버 관리 권한이 있는 사람 (봇 관리자는 어디서나)
 - 올린 파일은 **7일 후 자동 삭제**되며, 올릴 때마다 안내함
@@ -31,15 +31,23 @@
 - `HENRIK_API_KEY`: HenrikDev 디스코드에 들어간 뒤 https://api.henrikdev.xyz/dashboard/ 에서 Basic 키를 발급합니다.
 - 키는 `.env`(또는 호스팅의 환경변수)에만 넣고 GitHub에 올리지 마세요. 키가 없으면 해당 명령어만 안내 문구를 보여 줍니다.
 
-## 파일 저장소 (Cloudflare R2)
-1. Cloudflare 대시보드 → R2에서 버킷을 만듭니다. (무료 10GB, 결제 수단 등록 필요)
-2. 버킷 → 설정 → **공개 접근**을 켭니다. 처음에는 `r2.dev` 주소를 써도 되지만 속도 제한이 있으니, 나중에 Cloudflare에 연결된 도메인을 붙이는 것이 좋습니다. 이 주소를 `R2_PUBLIC_URL`에 넣습니다. (예: `https://pub-xxxx.r2.dev`)
-3. R2 → **API 토큰 관리**에서 이 버킷에 대한 "객체 읽기 및 쓰기" 토큰을 만들고, 계정 ID·액세스 키 ID·비밀 액세스 키를 `.env`의 `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`에, 버킷 이름을 `R2_BUCKET`에 넣습니다.
-4. 봇이 켜질 때 큰 파일 업로드 페이지(`assets/upload.html`)를 버킷에 올리고 CORS를 설정합니다. 로그에 "R2 CORS 설정 실패"가 나오면 버킷 → 설정 → CORS 정책에 직접 넣어 주세요.
-   ```json
-   [{"AllowedOrigins": ["R2_PUBLIC_URL과 같은 주소"], "AllowedMethods": ["PUT"], "AllowedHeaders": ["content-type", "content-disposition"], "MaxAgeSeconds": 3600}]
+## 파일 저장소 (Backblaze B2 추천, 카드 없이 무료 10GB)
+S3 호환 저장소라면 어디든 쓸 수 있습니다. 아래는 Backblaze B2 기준입니다.
+1. https://www.backblaze.com 에서 **B2 Cloud Storage**로 가입합니다. 가입 버튼 아래의 지역을 **US West**로 고릅니다. (나중에 바꿀 수 없음)
+2. **Buckets → Create a Bucket**에서 버킷을 만듭니다. **Files in Bucket are: Private**(비공개)로 두면 됩니다. 봇이 7일짜리 서명된 링크를 만들어 보내므로 공개 버킷이 필요 없습니다. (B2는 공개 버킷에 결제 이력을 요구합니다)
+3. 버킷의 **Lifecycle Settings**를 **Keep only the last version of the file**로 바꿉니다. B2는 지운 파일을 숨김 버전으로 남겨 두기 때문입니다. (봇도 지울 때 숨김 버전까지 지웁니다)
+4. 버킷 정보의 **Endpoint**(예: `s3.us-west-004.backblazeb2.com`)를 확인합니다.
+5. **Application Keys → Add a New Application Key**에서 이 버킷만, **Read and Write** 권한으로 키를 만듭니다. `keyID`와 `applicationKey`는 한 번만 보여 주니 바로 복사합니다.
+6. `.env`에 넣고 봇을 재시작합니다.
    ```
-5. (권장) 버킷 → 설정 → **객체 수명 주기 규칙**에서 `files/` 접두사 객체를 8일 후 삭제하도록 추가하면, 봇이 꺼져 있어도 오래된 파일이 지워집니다.
+   STORAGE_ENDPOINT=https://s3.us-west-004.backblazeb2.com
+   STORAGE_ACCESS_KEY_ID=keyID
+   STORAGE_SECRET_ACCESS_KEY=applicationKey
+   STORAGE_BUCKET=버킷이름
+   ```
+- 봇이 켜질 때 큰 파일 업로드 페이지(`assets/upload.html`)를 버킷에 올립니다. 비공개 버킷에서는 페이지와 업로드가 같은 주소라 CORS 설정이 필요 없습니다.
+- B2 무료 범위: 저장 10GB, 다운로드는 저장량의 3배까지, 하루 다운로드 요청 2,500회 등. 카드가 없으면 넘었을 때 요금 대신 막힙니다.
+- 다른 저장소: 공개 버킷을 쓰려면 `STORAGE_PUBLIC_URL`에 공개 주소를 넣습니다(이때 CORS가 필요하며 봇이 설정을 시도합니다). Cloudflare R2는 예전 설정(`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_URL`)도 그대로 동작합니다.
 - 사진·영상·음악은 바로 보이게, 그 밖의 파일(HTML 등)은 열리지 않고 다운로드만 되게 저장합니다.
 - 호스팅에 `ffmpeg`가 있으면 아이폰 영상(MOV·HEVC) 등 디스코드에서 재생되지 않는 영상을 MP4(H.264)로 바꿔서 올립니다. 없으면 원본 그대로 올립니다.
 - 한도: 서버당 `FILE_GUILD_QUOTA_MB`, 전체 `FILE_TOTAL_QUOTA_MB`(기본 각 10GB), 파일당 `FILE_MAX_MB`(기본 500MB). 디스코드 첨부는 서버 부스트에 따라 더 작은 제한이 있어 큰 파일은 업로드 페이지를 씁니다.

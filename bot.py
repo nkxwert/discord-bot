@@ -234,7 +234,7 @@ def init_db():
                 )
             conn.execute("DROP TABLE shared_servers")
         conn.execute("DELETE FROM samples WHERE server_id IS NULL")
-        # Files uploaded with !올리기 (stored on R2). status: 'pending' while a browser upload is unfinished.
+        # Files uploaded with !올리기 (kept in the S3-compatible storage). status: 'pending' while a browser upload is unfinished.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1332,16 +1332,16 @@ async def feedback_prefix(ctx):
     await prompt.channel.send(message)
 
 
-# ---------------------------------------------------------------- 파일 (Cloudflare R2)
+# ---------------------------------------------------------------- 파일 (S3 호환 저장소: Backblaze B2, Cloudflare R2 등)
 
 FILE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 FILE_PENDING_SECONDS = 60 * 60  # an unfinished browser upload is cleaned up after this
 FILE_GUILD_QUOTA = env_int("FILE_GUILD_QUOTA_MB", 10240, 1) * 1024 * 1024
-FILE_TOTAL_QUOTA = env_int("FILE_TOTAL_QUOTA_MB", 10240, 1) * 1024 * 1024  # R2's free tier is 10GB
+FILE_TOTAL_QUOTA = env_int("FILE_TOTAL_QUOTA_MB", 10240, 1) * 1024 * 1024  # B2 / R2 free tiers are 10GB
 FILE_MAX_BYTES = env_int("FILE_MAX_MB", 500, 1) * 1024 * 1024
 FILE_MAX_PER_MESSAGE = 5
 FILE_COOLDOWN_SECONDS = 10
-FILE_NOTICE = "📦 올린 파일은 Cloudflare R2 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다. 링크가 있으면 누구나 볼 수 있습니다."
+FILE_NOTICE = "📦 올린 파일은 봇의 파일 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다. 링크가 있으면 누구나 볼 수 있습니다."
 FILE_NOT_CONFIGURED = "파일 저장소가 설정되지 않았습니다. 봇 관리자에게 문의해 주세요."
 
 
@@ -1405,7 +1405,7 @@ def save_file_row(guild_id, channel_id, user_id, name, key, content_type, size, 
         cursor = conn.execute(
             "INSERT INTO files(guild_id, channel_id, name, key, url, content_type, size, uploaded_by, "
             "uploaded_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (guild_id, channel_id, name, key, storage.public_url(key), content_type, size, user_id, now, expires, status),
+            (guild_id, channel_id, name, key, "", content_type, size, user_id, now, expires, status),
         )
         conn.commit()
         return dict(conn.execute("SELECT * FROM files WHERE id = ?", (cursor.lastrowid,)).fetchone())
@@ -1427,14 +1427,30 @@ async def store_file(guild_id, channel_id, user_id, filename, data, name=""):
 
 def file_line(row):
     # The link sits on its own line so Discord shows the picture / plays the video right in the chat.
-    return f"**{row['name']}** · {human_size(row['size'])} · <t:{int(row['expires_at'])}:R> 자동 삭제\n{row['url']}"
+    return f"**{row['name']}** · {human_size(row['size'])} · <t:{int(row['expires_at'])}:R> 자동 삭제\n{file_link(row)}"
+
+
+def file_link(row):
+    """Made fresh each time: on a private bucket it is a presigned link that lasts until the file expires."""
+    return storage.link(row["key"], row["expires_at"] - time.time())
+
+
+def file_messages(rows, errors=()):
+    """The upload result split into messages of at most 2000 characters, never cutting a link
+    (presigned links are long, so five files may not fit in one message)."""
+    parts = [file_line(r) for r in rows] + [f"⚠️ {e}"[:1900] for e in errors]
+    if rows:
+        parts.append(FILE_NOTICE)
+    messages = [""]
+    for part in parts:
+        if messages[-1] and len(messages[-1]) + 2 + len(part) > 2000:
+            messages.append("")
+        messages[-1] = f"{messages[-1]}\n\n{part}" if messages[-1] else part
+    return messages
 
 
 def file_message(rows, errors=()):
-    parts = [file_line(r) for r in rows] + [f"⚠️ {e}" for e in errors]
-    if rows:
-        parts.append(FILE_NOTICE)
-    return "\n\n".join(parts)[:2000]
+    return "\n\n".join(file_messages(rows, errors))
 
 
 async def upload_attachments(ctx, attachments, name=""):
@@ -1459,7 +1475,10 @@ async def upload_attachments(ctx, attachments, name=""):
 
     progress = Progress([("upload", "파일 올리는 중")])
     (rows, errors), notice = await run_with_notice(ctx, work(), progress)
-    await send_result(ctx, notice, content=file_message(rows, errors))
+    first, *rest = file_messages(rows, errors)
+    await send_result(ctx, notice, content=first)
+    for message in rest:
+        await ctx.reply(message, mention_author=False)
 
 
 def start_browser_upload(guild_id, channel_id, user_id, name=""):
@@ -1546,7 +1565,7 @@ class UploadDoneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mac
             conn.execute(
                 "UPDATE files SET name = ?, key = ?, url = ?, content_type = ?, size = ?, uploaded_at = ?, "
                 "expires_at = ?, status = 'ready' WHERE id = ?",
-                (name, key, storage.public_url(key), stored_type, size, now, now + FILE_RETENTION_SECONDS, row["id"]),
+                (name, key, "", stored_type, size, now, now + FILE_RETENTION_SECONDS, row["id"]),
             )
             conn.commit()
             done = dict(conn.execute("SELECT * FROM files WHERE id = ?", (row["id"],)).fetchone())
@@ -1584,7 +1603,7 @@ async def can_manage_file(member, guild, row):
 
 
 async def remove_file(row):
-    """Delete from R2 and the list; False if R2 refused (the row is kept so cleanup retries)."""
+    """Delete from storage and the list; False if storage refused (the row is kept so cleanup retries)."""
     if not await storage.delete([row["key"]]):
         return False
     with connect_db() as conn:
@@ -1697,7 +1716,7 @@ async def upload_command_error(ctx, error):
 
 @tasks.loop(minutes=10)
 async def clean_files():
-    """Delete files older than 7 days (and unfinished browser uploads) from R2 and the list."""
+    """Delete files older than 7 days (and unfinished browser uploads) from storage and the list."""
     try:
         with connect_db() as conn:
             rows = [dict(r) for r in conn.execute("SELECT id, key FROM files WHERE expires_at < ?", (time.time(),))]
@@ -1737,9 +1756,9 @@ HELP_COMMANDS = {
     "hypixel": ("Hypixel 전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
                 "예: `!H전적 hypixel bw`"),
     "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부\n파일을 올리고 링크를 보냅니다. 사진·영상은 채팅창에서 바로 보입니다.\n"
-               "올린 파일은 Cloudflare R2 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
+               "올린 파일은 봇의 파일 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
     "bigupload": ("큰 파일", "!올리기", "`!올리기` (첨부 없이)\n디스코드에 첨부하기 어려운 큰 파일을 웹페이지에서 올립니다.\n"
-                  "올린 파일은 Cloudflare R2 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
+                  "올린 파일은 봇의 파일 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
     "files": ("목록", "!파일", "`!파일 [이름]`\n이 서버에 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일 링크를 보냅니다."),
     "filedelete": ("삭제", "!파일삭제", "`!파일삭제 <이름>`\n파일을 지웁니다. 올린 사람이나 서버 관리 권한이 있는 사람만 지울 수 있습니다."),
     "fortune": ("운세", "!운세", "`!운세`\n오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다."),
