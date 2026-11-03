@@ -228,7 +228,7 @@ def presigned_put(key):
 def describe():
     """Where files go, for £DB: (host, bucket, link mode)."""
     host = re.sub(r"^https?://", "", ENDPOINT).split("/")[0]
-    return host, BUCKET, "공개 주소" if PUBLIC_URL else "비공개 + 7일 서명 링크"
+    return host, BUCKET, "공개 주소" if PUBLIC_URL else "비공개 + 서명 링크(최대 7일)"
 
 
 def _ping():
@@ -276,6 +276,33 @@ async def bucket_usage(max_pages=10):
         return None
 
 
+def _orphan_keys(known, max_pages, min_age_seconds):
+    orphans, token = [], None
+    cutoff = time.time() - min_age_seconds
+    for _ in range(max_pages):
+        params = {"Bucket": BUCKET, "Prefix": "files/", "MaxKeys": 1000}
+        if token:
+            params["ContinuationToken"] = token
+        page = client().list_objects_v2(**params)
+        for item in page.get("Contents", []):
+            if item["Key"] not in known and item["LastModified"].timestamp() < cutoff:
+                orphans.append(item["Key"])
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+    return orphans
+
+
+async def orphan_keys(known, max_pages=20, min_age_seconds=3600):
+    """Keys under files/ that the bot's list doesn't know (older than an hour, so uploads in progress are
+    left alone), or None if the bucket couldn't be listed."""
+    try:
+        return await asyncio.to_thread(_orphan_keys, set(known), max_pages, min_age_seconds)
+    except Exception as exc:
+        print(f"저장소 목록 확인 실패: {type(exc).__name__}: {exc}")
+        return None
+
+
 async def setup_bucket():
     """Upload the big-file page, and for a public bucket allow the browser to PUT from it (CORS).
     Failures are only logged: the CORS rule can also be set by hand (see README)."""
@@ -299,9 +326,9 @@ async def setup_bucket():
         print(f"저장소 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {type(exc).__name__}: {exc}")
 
 
-def upload_page_link(key):
-    # The PUT link rides in the #fragment, which browsers never send to the server.
-    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}"
+def upload_page_link(key, retention="7일"):
+    # The PUT link (and the retention shown on the page) ride in the #fragment, never sent to the server.
+    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}|{quote(retention, safe='')}"
 
 
 # ---------------------------------------------------------------- video conversion (optional)
