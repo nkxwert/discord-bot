@@ -1288,8 +1288,11 @@ HELP_COMMANDS = {
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
 HELP_TIMEOUT_SECONDS = 300
-HELP_BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "images", "help_banner.jpg")
-HELP_BANNER_NAME = "maco.jpg"
+# Linked rather than uploaded: uploading the picture with every response could take longer than the 3 seconds
+# Discord allows, giving "응답하지 않았어요". The file lives in this repo (assets/images/help_banner.jpg).
+HELP_BANNER_URL = os.getenv(
+    "HELP_BANNER_URL", "https://raw.githubusercontent.com/nkxwert/discord-bot/main/assets/images/help_banner.jpg"
+).strip()
 # Icons left of the stats buttons: help command key -> image, uploaded once as the app's own emojis
 # (usable in every server without being added there). Filled by load_help_emojis() at startup.
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
@@ -1361,8 +1364,8 @@ class HelpView(discord.ui.View):
             return command_list_embed()
         if self.page == "home":
             embed = discord.Embed(description=self.notice, color=color)
-            if os.path.exists(HELP_BANNER_PATH):
-                embed.set_image(url=f"attachment://{HELP_BANNER_NAME}")
+            if HELP_BANNER_URL:
+                embed.set_image(url=HELP_BANNER_URL)
             else:
                 embed.title = "Maco"
             return embed
@@ -1376,11 +1379,6 @@ class HelpView(discord.ui.View):
             if extra:
                 text += f"\n\n{extra}"
         return discord.Embed(title=title, description=text[:4096], color=color)
-
-    def files(self):
-        if self.page == "home" and os.path.exists(HELP_BANNER_PATH):
-            return [discord.File(HELP_BANNER_PATH, filename=HELP_BANNER_NAME)]
-        return []
 
     def build(self):
         self.clear_items()
@@ -1404,9 +1402,7 @@ class HelpView(discord.ui.View):
         self.add_item(button)
 
     async def send(self, interaction):
-        files = self.files()
-        extra = {"file": files[0]} if files else {}
-        await interaction.response.send_message(embed=self.embed(), view=self, ephemeral=True, **extra)
+        await interaction.response.send_message(embed=self.embed(), view=self, ephemeral=True)
 
     async def interaction_check(self, interaction):
         self.last_interaction = interaction
@@ -1420,7 +1416,7 @@ class HelpView(discord.ui.View):
             self.selected = state["selected"]
         self.notice, self.details = notice, details
         self.build()
-        changes = {"embed": self.embed(), "view": self, "attachments": self.files()}
+        changes = {"embed": self.embed(), "view": self}
         if interaction.response.is_done():
             await interaction.edit_original_response(**changes)
         else:
