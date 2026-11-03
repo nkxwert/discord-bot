@@ -49,7 +49,7 @@ REGION = _env("STORAGE_REGION") or (_b2_region.group(1) if _b2_region else "auto
 HOST = urlsplit(ENDPOINT).netloc
 MAX_LINK_SECONDS = 7 * 24 * 60 * 60  # the longest a presigned (SigV4) link can last
 PAGE_LINK_SECONDS = 60 * 60
-CHUNK_SIZE = 256 * 1024
+CHUNK_SIZE = 64 * 1024
 
 UPLOAD_PAGE_KEY = "upload.html"  # the big-file upload page, served from the bucket itself
 UPLOAD_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "upload.html")

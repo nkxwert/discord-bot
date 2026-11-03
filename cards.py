@@ -30,12 +30,18 @@ AQUA = MC_RGB["b"]
 RED = MC_RGB["c"]
 
 _fonts = {}
+MAX_FONTS = 24  # each loaded size costs ~200KB; keep the most recently used ones
 
 
 def font(size, family="mc"):
-    if (family, size) not in _fonts:
-        _fonts[family, size] = ImageFont.truetype(str(FONT_PATHS[family]), size)
-    return _fonts[family, size]
+    key = (family, size)
+    face = _fonts.pop(key, None)
+    if face is None:
+        face = ImageFont.truetype(str(FONT_PATHS[family]), size)
+        if len(_fonts) >= MAX_FONTS:
+            del _fonts[next(iter(_fonts))]  # least recently used
+    _fonts[key] = face  # re-insert: dicts keep order, so the end is the most recent
+    return face
 
 
 def color_segments(text, default):
