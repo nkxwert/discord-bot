@@ -53,16 +53,13 @@
     document.getElementById("pick").textContent = file ? file.name : "눌러서 파일 고르기";
     send.disabled = !file || !target.startsWith("https://");
   });
-  send.addEventListener("click", () => {
-    const file = fileInput.files[0];
-    if (!file) return;
-    send.disabled = true;
-    fileInput.disabled = true;
-    bar.style.display = "block";
+  function upload(file, withName) {
     const request = new XMLHttpRequest();
     request.open("PUT", target);
     request.setRequestHeader("Content-Type", file.type || "application/octet-stream");
-    request.setRequestHeader("Content-Disposition", "attachment; filename*=UTF-8''" + encodeURIComponent(file.name));
+    if (withName) {
+      request.setRequestHeader("Content-Disposition", "attachment; filename*=UTF-8''" + encodeURIComponent(file.name));
+    }
     request.upload.onprogress = (e) => {
       if (e.lengthComputable) {
         const percent = Math.round(e.loaded / e.total * 100);
@@ -73,13 +70,30 @@
     request.onload = () => {
       if (request.status >= 200 && request.status < 300) {
         bar.firstElementChild.style.width = "100%";
-        say("다 올렸습니다! 디스코드로 돌아가서 [업로드 완료]를 눌러 주세요.");
-      } else {
-        say("올리지 못했습니다. 링크가 만료되었을 수 있습니다(10분). 디스코드에서 다시 받아 주세요.", true);
+        say("다 올렸습니다! 잠시 후 디스코드 채널에 자동으로 올라갑니다. 1분이 지나도 안 올라가면 [업로드 완료]를 눌러 주세요.");
+        return;
       }
+      // Some storage services reject the file-name header; try once more without it.
+      if (withName && (request.status === 400 || request.status === 403)) {
+        bar.firstElementChild.style.width = "0";
+        upload(file, false);
+        return;
+      }
+      const code = (/<Code>([^<]+)<\/Code>/.exec(request.responseText || "") || [])[1];
+      const reason = code === "AccessDenied" || code === "SignatureDoesNotMatch" || code === "RequestExpired"
+        ? "링크가 만료되었거나 올바르지 않습니다(10분)." : "저장소가 업로드를 거절했습니다.";
+      say(reason + " 디스코드에서 링크를 다시 받아 주세요. (오류: HTTP " + request.status + (code ? " " + code : "") + ")", true);
     };
     request.onerror = () => say("올리지 못했습니다. 인터넷 연결을 확인하고 디스코드에서 링크를 다시 받아 주세요.", true);
     request.send(file);
+  }
+  send.addEventListener("click", () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    send.disabled = true;
+    fileInput.disabled = true;
+    bar.style.display = "block";
+    upload(file, true);
   });
 </script>
 </body>
