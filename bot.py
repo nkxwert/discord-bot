@@ -1287,7 +1287,6 @@ HELP_COMMANDS = {
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
-HELP_TIMEOUT_SECONDS = 300
 # Linked rather than uploaded: uploading the picture with every response could take longer than the 3 seconds
 # Discord allows, giving "응답하지 않았어요". The file lives in this repo (assets/images/help_banner.jpg).
 HELP_BANNER_URL = os.getenv(
@@ -1344,170 +1343,146 @@ def stats_wait_left(command, ctx):
     return math.ceil(retry_after) if retry_after else 0
 
 
-class HelpView(discord.ui.View):
-    """The private /도움말 message: categories -> command buttons that run the command.
+def help_message(page="home", selected=None, notice=None, details=None):
+    """Embed and buttons for one page of the private /도움말 message.
     Everything private (lists, notices) is shown by editing this one message; only results meant
     for the channel (uptime, stats cards, ...) become separate public messages."""
+    color = discord.Color.green()
+    view = discord.ui.View(timeout=None)
 
-    def __init__(self, interaction):
-        super().__init__(timeout=HELP_TIMEOUT_SECONDS)
-        self.last_interaction = interaction  # edits the message when the buttons time out
-        self.page = "home"
-        self.selected = None
-        self.notice = None  # one-off line such as "서버 관리 권한이 필요합니다."
-        self.details = None  # extra private content, such as the 주소 list
-        self.build()
+    def button(action, label, emoji=None, style=discord.ButtonStyle.primary, row=0):
+        view.add_item(HelpButton(action, label, emoji, style, row))
 
-    def embed(self):
-        color = discord.Color.green()
-        if self.page == "commands":
-            return command_list_embed()
-        if self.page == "home":
-            embed = discord.Embed(description=self.notice, color=color)
-            if HELP_BANNER_URL:
-                embed.set_image(url=HELP_BANNER_URL)
-            else:
-                embed.title = "Maco"
-            return embed
-        emoji, title, _ = HELP_CATEGORIES[self.page]
-        if self.selected:
-            _, command, text = HELP_COMMANDS[self.selected]
-            title = f"{emoji} {title} · {command}"
+    if page == "commands":
+        embed = command_list_embed()
+        button("home", "◀ 처음으로", style=discord.ButtonStyle.secondary)
+        return {"embed": embed, "view": view}
+    if page == "home":
+        embed = discord.Embed(description=notice, color=color)
+        if HELP_BANNER_URL:
+            embed.set_image(url=HELP_BANNER_URL)
         else:
-            title, text = f"{emoji} {title}", "버튼을 누르면 바로 사용할 수 있습니다."
-        for extra in (self.details, self.notice):
-            if extra:
-                text += f"\n\n{extra}"
-        return discord.Embed(title=title, description=text[:4096], color=color)
+            embed.title = "Maco"
+        for key, (emoji, title, _) in HELP_CATEGORIES.items():
+            button(f"page_{key}", title, emoji)
+        button("dm", "DM to Dev.", "✉️")
+        button("commands", "명령어 보기", "📋")
+        return {"embed": embed, "view": view}
 
-    def build(self):
-        self.clear_items()
-        if self.page == "home":
-            for key, (emoji, title, _) in HELP_CATEGORIES.items():
-                self.add_button(title, emoji, discord.ButtonStyle.primary, self.open_category(key))
-            self.add_button("DM to Dev.", "✉️", discord.ButtonStyle.primary, self.dm_to_dev)
-            self.add_button("명령어 보기", "📋", discord.ButtonStyle.primary, self.show_commands)
+    emoji, title, keys = HELP_CATEGORIES[page]
+    if selected:
+        _, command, text = HELP_COMMANDS[selected]
+        title = f"{emoji} {title} · {command}"
+    else:
+        title, text = f"{emoji} {title}", "버튼을 누르면 바로 사용할 수 있습니다."
+    for extra in (details, notice):
+        if extra:
+            text += f"\n\n{extra}"
+    for key in keys:
+        style = discord.ButtonStyle.success if key == selected else discord.ButtonStyle.secondary
+        button(f"run_{key}", HELP_COMMANDS[key][0], help_emojis.get(key), style)
+    button("home", "◀ 처음으로", style=discord.ButtonStyle.secondary, row=1)
+    return {"embed": discord.Embed(title=title, description=text[:4096], color=color), "view": view}
+
+
+def help_page_of(key):
+    return next(page for page, (_, _, keys) in HELP_CATEGORIES.items() if key in keys)
+
+
+async def show_help(interaction, **page):
+    """Redraw the /도움말 message the interaction came from (a button, or a form opened from one)."""
+    changes = help_message(**page)
+    if interaction.response.is_done():
+        await interaction.edit_original_response(**changes)
+    else:
+        await interaction.response.edit_message(**changes)
+
+
+# A DynamicItem keeps working after a restart (and on any copy of the bot): the custom_id says what the
+# button does, so nothing has to be remembered in memory. That was the cause of "응답하지 않았어요".
+class HelpButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:help:(?P<action>\w+)"):
+    def __init__(self, action, label="?", emoji=None, style=discord.ButtonStyle.secondary, row=0):
+        super().__init__(discord.ui.Button(
+            label=label, emoji=emoji, style=style, row=row, custom_id=f"maco:help:{action}",
+        ))
+        self.action = action
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["action"])
+
+    async def callback(self, interaction):
+        handler = HELP_ACTIONS.get(self.action)
+        if handler is None:
             return
-        if self.page == "commands":
-            self.add_button("◀ 처음으로", None, discord.ButtonStyle.secondary, self.go_home)
-            return
-        for key in HELP_CATEGORIES[self.page][2]:
-            style = discord.ButtonStyle.success if key == self.selected else discord.ButtonStyle.secondary
-            self.add_button(HELP_COMMANDS[key][0], help_emojis.get(key), style, getattr(self, f"run_{key}"))
-        self.add_button("◀ 처음으로", None, discord.ButtonStyle.secondary, self.go_home, row=1)
-
-    def add_button(self, label, emoji, style, callback, row=0):
-        button = discord.ui.Button(label=label, emoji=emoji, style=style, row=row)
-        button.callback = callback
-        self.add_item(button)
-
-    async def send(self, interaction):
-        await interaction.response.send_message(embed=self.embed(), view=self, ephemeral=True)
-
-    async def interaction_check(self, interaction):
-        self.last_interaction = interaction
-        return True
-
-    async def show(self, interaction, notice=None, details=None, **state):
-        """Redraw this message in place. `page` opens a category, `selected` marks a command."""
-        if "page" in state:
-            self.page, self.selected = state["page"], None
-        if "selected" in state:
-            self.selected = state["selected"]
-        self.notice, self.details = notice, details
-        self.build()
-        changes = {"embed": self.embed(), "view": self}
-        if interaction.response.is_done():
-            await interaction.edit_original_response(**changes)
-        else:
-            await interaction.response.edit_message(**changes)
-
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
         try:
-            await self.last_interaction.edit_original_response(view=self)
-        except discord.HTTPException:
-            pass  # the message was dismissed, or the interaction token expired
+            await handler(interaction)
+        except Exception as exc:
+            trace = traceback.format_exc()
+            print(f"도움말 버튼 오류 ({self.action}):\n{trace}")
+            notify_admin("도움말 버튼 오류", f"{type(exc).__name__}: {exc}",
+                         describe_interaction(interaction, f"버튼: {self.action}"), trace)
+            send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            try:
+                await send("오류가 발생했습니다.", ephemeral=True)
+            except discord.HTTPException:
+                pass
 
-    async def on_error(self, interaction, error, item):
-        trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-        print(f"도움말 버튼 오류:\n{trace}")
-        notify_admin("도움말 버튼 오류", f"{type(error).__name__}: {error}",
-                     describe_interaction(interaction, f"버튼: {getattr(item, 'label', '?')}"), trace)
-        send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-        await send("오류가 발생했습니다.", ephemeral=True)
 
-    # ---- home page
+async def help_open_page(interaction, page):
+    if page == "uptime" and interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    await show_help(interaction, page=page)
 
-    def open_category(self, key):
-        async def callback(interaction):
-            if key == "uptime" and interaction.guild is None:
-                await self.show(interaction, notice=SERVER_ONLY_MESSAGE)
-                return
-            await self.show(interaction, page=key)
-        return callback
 
-    async def dm_to_dev(self, interaction):
-        left = feedback_wait_left(interaction.user.id)
-        if left:
-            await self.show(interaction, notice=f"{left}초 후에 다시 보낼 수 있습니다.")
-            return
-        await interaction.response.send_modal(HelpFeedbackModal(self))
+async def help_dm_to_dev(interaction):
+    left = feedback_wait_left(interaction.user.id)
+    if left:
+        await show_help(interaction, notice=f"{left}초 후에 다시 보낼 수 있습니다.")
+        return
+    await interaction.response.send_modal(HelpFeedbackModal())
 
-    async def show_commands(self, interaction):
-        await self.show(interaction, page="commands")
 
-    async def go_home(self, interaction):
-        await self.show(interaction, page="home")
+async def help_run_uptime(interaction):
+    if not guild_servers(interaction.guild.id):
+        await show_help(interaction, page="uptime", selected="uptime", notice=NO_SERVER_MESSAGE)
+        return
+    await show_help(interaction, page="uptime", selected="uptime")
+    ctx = HelpContext(interaction, "업타임")
+    await run_from_help(ctx, uptime.callback(ctx))
 
-    # ---- command buttons
 
-    async def run_add(self, interaction):
-        await interaction.response.send_modal(AddServerModal(self))
+async def help_run_list(interaction):
+    servers = guild_servers(interaction.guild.id)
+    if not servers:
+        await show_help(interaction, page="uptime", selected="list", notice=NO_SERVER_MESSAGE)
+        return
+    lines = "\n".join(f"• **{s['name']}** — `{s['address']}`" for s in servers)
+    await show_help(interaction, page="uptime", selected="list", details=f"**등록된 서버**\n{lines}")
 
-    async def run_uptime(self, interaction):
-        if not guild_servers(interaction.guild.id):
-            await self.show(interaction, selected="uptime", notice=NO_SERVER_MESSAGE)
-            return
-        await self.show(interaction, selected="uptime")
-        ctx = HelpContext(interaction, "업타임")
-        await run_from_help(ctx, uptime.callback(ctx))
 
-    async def run_list(self, interaction):
-        servers = guild_servers(interaction.guild.id)
-        if not servers:
-            await self.show(interaction, selected="list", notice=NO_SERVER_MESSAGE)
-            return
-        lines = "\n".join(f"• **{s['name']}** — `{s['address']}`" for s in servers)
-        await self.show(interaction, selected="list", details=f"**등록된 서버**\n{lines}")
+async def help_run_delete(interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await show_help(interaction, page="uptime", selected="delete", notice="서버 관리 권한이 필요합니다.")
+        return
+    servers = guild_servers(interaction.guild.id)
+    if not servers:
+        await show_help(interaction, page="uptime", selected="delete", notice=NO_SERVER_MESSAGE)
+        return
+    await interaction.response.send_modal(DeleteServerModal(servers))
 
-    async def run_delete(self, interaction):
-        if not interaction.user.guild_permissions.manage_guild:
-            await self.show(interaction, selected="delete", notice="서버 관리 권한이 필요합니다.")
-            return
-        servers = guild_servers(interaction.guild.id)
-        if not servers:
-            await self.show(interaction, selected="delete", notice=NO_SERVER_MESSAGE)
-            return
-        await interaction.response.send_modal(DeleteServerModal(self, servers))
 
-    async def run_hypixel(self, interaction):
-        await interaction.response.send_modal(HypixelModal(self))
-
-    async def run_valorant(self, interaction):
-        await interaction.response.send_modal(ValorantModal(self))
+def help_open_form(modal_class):
+    async def handler(interaction):
+        await interaction.response.send_modal(modal_class())
+    return handler
 
 
 class HelpFeedbackModal(FeedbackModal):
     """The developer form opened from /도움말; the outcome replaces the help message instead of a new one."""
 
-    def __init__(self, help_view):
-        super().__init__()
-        self.help_view = help_view
-
     async def on_submit(self, interaction):
-        self.help_view.last_interaction = interaction
         await interaction.response.defer()  # photos can take a while; keeps the help message as it is
         kind = self.kind.values[0] if self.kind.values else "기타"
         photos = await collect_photos(self.photos.values)
@@ -1515,34 +1490,34 @@ class HelpFeedbackModal(FeedbackModal):
             interaction.user, f"[{kind}] {self.subject.value}", self.body.value,
             describe_place(interaction.guild, interaction.channel), photos,
         )
-        await self.help_view.show(interaction, notice=message)
+        await show_help(interaction, notice=message)
 
 
 class HelpModal(SafeModal):
     """Input form opened from a /도움말 button, with the command's description at the top."""
 
-    def __init__(self, help_view, key):
-        label, _, text = HELP_COMMANDS[key]
+    key = ""
+
+    def __init__(self):
+        label, _, text = HELP_COMMANDS[self.key]
         super().__init__(title=label)
-        self.help_view = help_view
-        self.key = key
         self.add_item(discord.ui.TextDisplay(text))
 
     async def reject(self, interaction, notice):
         """Show why the input can't be used on the help message, without posting anything."""
-        self.help_view.last_interaction = interaction
-        await self.help_view.show(interaction, selected=self.key, notice=notice)
+        await show_help(interaction, page=help_page_of(self.key), selected=self.key, notice=notice)
 
     async def finish(self, interaction):
         """Show this command's description on the help message, then the result follows publicly."""
-        self.help_view.last_interaction = interaction
-        await self.help_view.show(interaction, selected=self.key)
+        await show_help(interaction, page=help_page_of(self.key), selected=self.key)
         return HelpContext(interaction, HELP_COMMANDS[self.key][0])
 
 
 class AddServerModal(HelpModal):
-    def __init__(self, help_view):
-        super().__init__(help_view, "add")
+    key = "add"
+
+    def __init__(self):
+        super().__init__()
         self.address = discord.ui.TextInput(max_length=253, placeholder="hypixel.net")
         self.server_name = discord.ui.TextInput(required=False, max_length=MAX_NAME_LENGTH, placeholder="하이픽셀 (비우면 주소)")
         self.add_item(discord.ui.Label(text="주소", component=self.address))
@@ -1559,8 +1534,10 @@ class AddServerModal(HelpModal):
 
 
 class DeleteServerModal(HelpModal):
-    def __init__(self, help_view, servers):
-        super().__init__(help_view, "delete")
+    key = "delete"
+
+    def __init__(self, servers):
+        super().__init__()
         self.server = discord.ui.Select(options=[
             discord.SelectOption(label=s["name"][:100], description=s["address"][:100], value=str(s["id"]))
             for s in servers
@@ -1582,10 +1559,11 @@ class DeleteServerModal(HelpModal):
 
 
 class HypixelModal(HelpModal):
+    key = "hypixel"
     GAMES = [("전체", "all"), ("베드워즈 (bw)", "bedwars"), ("스카이워즈 (sw)", "skywars"), ("듀얼 (duels)", "duels")]
 
-    def __init__(self, help_view):
-        super().__init__(help_view, "hypixel")
+    def __init__(self):
+        super().__init__()
         self.player = discord.ui.TextInput(max_length=16, placeholder="hypixel")
         self.game = discord.ui.Select(options=[
             discord.SelectOption(label=label, value=value, default=value == "all") for label, value in self.GAMES
@@ -1605,8 +1583,10 @@ class HypixelModal(HelpModal):
 
 
 class ValorantModal(HelpModal):
-    def __init__(self, help_view):
-        super().__init__(help_view, "valorant")
+    key = "valorant"
+
+    def __init__(self):
+        super().__init__()
         self.riot_id = discord.ui.TextInput(max_length=40, placeholder="snowe #UIpop")
         self.add_item(discord.ui.Label(text="이름#태그 (지역은 선택)", component=self.riot_id))
 
@@ -1625,13 +1605,28 @@ class ValorantModal(HelpModal):
         await run_from_help(ctx, run_valorant(ctx, name, tag, region))
 
 
+HELP_ACTIONS = {
+    "home": lambda interaction: show_help(interaction),
+    "commands": lambda interaction: show_help(interaction, page="commands"),
+    "page_uptime": lambda interaction: help_open_page(interaction, "uptime"),
+    "page_stats": lambda interaction: help_open_page(interaction, "stats"),
+    "dm": help_dm_to_dev,
+    "run_add": help_open_form(AddServerModal),
+    "run_uptime": help_run_uptime,
+    "run_list": help_run_list,
+    "run_delete": help_run_delete,
+    "run_hypixel": help_open_form(HypixelModal),
+    "run_valorant": help_open_form(ValorantModal),
+}
+
+
 @bot.tree.command(name="도움말", description="버튼으로 명령어를 보고 바로 사용합니다")
 async def help_slash(interaction: discord.Interaction):
-    await HelpView(interaction).send(interaction)
+    await interaction.response.send_message(ephemeral=True, **help_message())
 
 
 async def setup_hook():
-    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton)
+    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton)
     await load_help_emojis()
     try:
         synced = await bot.tree.sync()
