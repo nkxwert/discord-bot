@@ -808,29 +808,45 @@ async def owner_db_cleanup(message, args):
 
 
 def memory_usage():
-    """(current, peak) memory of this process in bytes, or None where /proc isn't available."""
+    """(current or None, peak or None) memory of this process in bytes. Some hosts' /proc lacks the
+    peak line (or /proc entirely), so each value falls back on its own."""
+    current = peak = None
     try:
-        values = {}
         with open("/proc/self/status") as f:
             for line in f:
-                if line.startswith(("VmRSS:", "VmHWM:")):
-                    values[line.split(":")[0]] = int(line.split()[1]) * 1024
-        return values["VmRSS"], values["VmHWM"]
-    except (OSError, KeyError, ValueError):
-        return None
+                if line.startswith("VmRSS:"):
+                    current = int(line.split()[1]) * 1024
+                elif line.startswith("VmHWM:"):
+                    peak = int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    if current is None:
+        try:
+            with open("/proc/self/statm") as f:
+                current = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError, AttributeError):
+            pass
+    if peak is None:
+        try:
+            import resource
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # KB on Linux
+        except (ImportError, OSError):
+            pass
+    return current, peak
 
 
 async def db_status_embed():
     embed = discord.Embed(title="DB 상태", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
-    memory = memory_usage()
-    if memory:
-        limit = env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024
-        embed.add_field(name="🧠 메모리", inline=False, value=(
-            f"지금 **{human_size(memory[0])}** / {human_size(limit)} ({memory[0] / limit * 100:.0f}%) · "
-            f"켜진 뒤 최대 {human_size(memory[1])}"
-        ))
-        if memory[0] > limit * 0.9:
-            embed.color = discord.Color.orange()
+    current, peak = memory_usage()
+    limit = env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024
+    parts = []
+    if current is not None:
+        parts.append(f"지금 **{human_size(current)}** / {human_size(limit)} ({current / limit * 100:.0f}%)")
+    if peak is not None:
+        parts.append(f"켜진 뒤 최대 {human_size(peak)}")
+    embed.add_field(name="🧠 메모리", inline=False, value=" · ".join(parts) or "이 호스팅에서는 확인할 수 없습니다")
+    if current is not None and current > limit * 0.9:
+        embed.color = discord.Color.orange()
 
     # Local sqlite (servers, uptime samples, file list)
     try:
