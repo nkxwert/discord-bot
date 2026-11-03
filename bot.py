@@ -553,27 +553,36 @@ async def add_server(ctx, address: str = "", *, name: str = ""):
         return
 
     try:
+        address, name = check_new_server(ctx.guild.id, address, name)
+    except ValueError as exc:
+        await ctx.reply(str(exc), mention_author=False)
+        return
+    await register_server(ctx, address, name)
+
+
+def check_new_server(guild_id, address, name):
+    """Validated (address, name) for a new server, or ValueError with the message to show."""
+    try:
         address = validate_address(address)
     except ValueError as exc:
-        await ctx.reply(f"주소 형식 오류: {exc}", mention_author=False)
-        return
+        raise ValueError(f"주소 형식 오류: {exc}") from None
 
-    name = name or address
+    name = name.strip() or address
     if len(name) > MAX_NAME_LENGTH:
-        await ctx.reply(f"이름은 {MAX_NAME_LENGTH}자 이하로 입력해 주세요.", mention_author=False)
-        return
+        raise ValueError(f"이름은 {MAX_NAME_LENGTH}자 이하로 입력해 주세요.")
 
-    servers = guild_servers(ctx.guild.id)
+    servers = guild_servers(guild_id)
     if len(servers) >= MAX_SERVERS_PER_GUILD:
-        await ctx.reply(f"서버는 최대 {MAX_SERVERS_PER_GUILD}개까지 등록할 수 있습니다.", mention_author=False)
-        return
+        raise ValueError(f"서버는 최대 {MAX_SERVERS_PER_GUILD}개까지 등록할 수 있습니다.")
     if any(
         s["name"].lower() == name.lower() or s["address"].lower() == address.lower()
         for s in servers
     ):
-        await ctx.reply("이미 등록된 이름 또는 주소입니다.", mention_author=False)
-        return
+        raise ValueError("이미 등록된 이름 또는 주소입니다.")
+    return address, name
 
+
+async def register_server(ctx, address, name):
     # Register even if temporarily offline, but tell the user the initial probe result.
     result, notice = await run_with_notice(ctx, query_server(address))
     online, latency, players_online, players_max, external = result
@@ -619,11 +628,15 @@ async def delete_address(ctx, *, name: str = ""):
     if not server:
         await ctx.reply(f"`{name}` 서버가 없습니다. `!주소`로 목록을 확인해 주세요.", mention_author=False)
         return
-    with connect_db() as conn:
-        conn.execute("DELETE FROM servers WHERE id = ?", (server["id"],))
-        conn.execute("DELETE FROM samples WHERE server_id = ?", (server["id"],))
-        conn.commit()
+    remove_server(server["id"])
     await ctx.reply(f"**{server['name']}** 서버와 업타임 기록을 삭제했습니다.", mention_author=False)
+
+
+def remove_server(server_id):
+    with connect_db() as conn:
+        conn.execute("DELETE FROM servers WHERE id = ?", (server_id,))
+        conn.execute("DELETE FROM samples WHERE server_id = ?", (server_id,))
+        conn.commit()
 
 
 @delete_address.error
@@ -860,7 +873,10 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
         ctx.command.reset_cooldown(ctx)
         await ctx.reply("게임은 `bw`(베드워즈), `sw`(스카이워즈), `duels`(듀얼) 중에서 골라 주세요.", mention_author=False)
         return
+    await run_hypixel(ctx, name, game_key)
 
+
+async def run_hypixel(ctx, name, game_key):
     progress = Progress(HYPIXEL_STEPS)
     (profile, error), notice = await run_with_notice(
         ctx, lookup(ctx, stats.hypixel_profile(name, progress.step)), progress
@@ -974,7 +990,10 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
         ctx.command.reset_cooldown(ctx)
         await ctx.reply(str(exc), mention_author=False)
         return
+    await run_valorant(ctx, name, tag, region)
 
+
+async def run_valorant(ctx, name, tag, region):
     progress = Progress(VALORANT_STEPS)
     (profile, error, suggestions), notice = await run_with_notice(
         ctx, valorant_lookup(name, tag, region, progress=progress, where=describe_ctx(ctx)), progress
@@ -1251,6 +1270,290 @@ async def feedback_prefix(ctx):
         ctx.author, "[일반] !개발자소통", content or "(사진만 보냄)", describe_place(ctx.guild, ctx.channel), photos,
     )
     await prompt.channel.send(message)
+
+
+# ---------------------------------------------------------------- /도움말 (buttons)
+
+HELP_CATEGORIES = {
+    "uptime": ("🖥️", "서버 업타임", ["add", "uptime", "list", "delete"]),
+    "stats": ("📊", "전적", ["hypixel", "valorant"]),
+}
+# key -> (button label, command name, description shown on the help page and at the top of its input form)
+HELP_COMMANDS = {
+    "add": ("주소추가", "!주소추가", "`!주소추가 <주소> [이름]`\n서버를 추가합니다.\n예: `!주소추가 hypixel.net 하이픽셀`"),
+    "uptime": ("업타임", "!업타임", "`!업타임 [이름]`\n등록된 모든 서버의 상태를 봅니다. 이름을 붙이면 서버 하나의 자세한 업타임을 봅니다.\n"
+               "예: `!업타임 하이픽셀`"),
+    "list": ("주소", "!주소", "`!주소`\n등록된 서버 목록을 봅니다."),
+    "delete": ("주소삭제", "!주소삭제", "`!주소삭제 <이름>`\n서버와 업타임 기록을 삭제합니다. 서버 관리 권한이 필요합니다.\n"
+               "예: `!주소삭제 하이픽셀`"),
+    "hypixel": ("H전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
+                "예: `!H전적 hypixel bw`"),
+    "valorant": ("V전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
+                 "예: `!V전적 snowe #UIpop`"),
+}
+HELP_TIMEOUT_SECONDS = 300
+
+
+class HelpContext:
+    """Just enough of commands.Context for the ! command code to run from a /도움말 button.
+    Replies are public follow-up messages, so the result is visible in the channel like a ! command."""
+
+    def __init__(self, interaction, what):
+        self.interaction = interaction
+        self.guild = interaction.guild
+        self.author = interaction.user
+        self.channel = interaction.channel
+        self.message = type("HelpMessage", (), {"content": f"/도움말 → {what}"})()  # for describe_ctx
+        self.notice = None
+
+    async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
+        extra = {k: v for k, v in {"content": content, "embed": embed, "file": file, "view": view}.items() if v is not None}
+        return await self.interaction.followup.send(wait=True, **extra)
+
+
+async def run_from_help(ctx, awaitable):
+    try:
+        await awaitable
+    except Exception as exc:
+        await report_error(ctx, exc)
+
+
+def stats_wait_left(command, ctx):
+    """Spend the ! command's cooldown (shared with the button) and return the seconds left if it was in use."""
+    retry_after = command._buckets.update_rate_limit(ctx)
+    return math.ceil(retry_after) if retry_after else 0
+
+
+class HelpView(discord.ui.View):
+    """The private /도움말 message: categories -> command buttons that run the command."""
+
+    def __init__(self, interaction):
+        super().__init__(timeout=HELP_TIMEOUT_SECONDS)
+        self.last_interaction = interaction  # edits the message when the buttons time out
+        self.page = "home"
+        self.selected = None
+        self.build()
+
+    def embed(self):
+        if self.page == "home":
+            return discord.Embed(title="Maco", color=discord.Color.green())
+        emoji, title, _ = HELP_CATEGORIES[self.page]
+        if self.selected:
+            _, command, text = HELP_COMMANDS[self.selected]
+            return discord.Embed(title=f"{emoji} {title} · {command}", description=text, color=discord.Color.green())
+        return discord.Embed(title=f"{emoji} {title}", description="버튼을 누르면 바로 사용할 수 있습니다.",
+                             color=discord.Color.green())
+
+    def build(self):
+        self.clear_items()
+        if self.page == "home":
+            for key, (emoji, title, _) in HELP_CATEGORIES.items():
+                self.add_button(title, emoji, discord.ButtonStyle.primary, self.open_category(key))
+            self.add_button("DM to Dev.", "✉️", discord.ButtonStyle.primary, self.dm_to_dev)
+            return
+        for key in HELP_CATEGORIES[self.page][2]:
+            style = discord.ButtonStyle.success if key == self.selected else discord.ButtonStyle.secondary
+            self.add_button(HELP_COMMANDS[key][0], None, style, getattr(self, f"run_{key}"))
+        self.add_button("◀ 처음으로", None, discord.ButtonStyle.secondary, self.go_home, row=1)
+
+    def add_button(self, label, emoji, style, callback, row=0):
+        button = discord.ui.Button(label=label, emoji=emoji, style=style, row=row)
+        button.callback = callback
+        self.add_item(button)
+
+    async def interaction_check(self, interaction):
+        self.last_interaction = interaction
+        return True
+
+    async def show(self, interaction, page=None, selected=None):
+        """Switch the help message to another page in place."""
+        self.page = page or self.page
+        self.selected = selected
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.last_interaction.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass  # the message was dismissed, or the interaction token expired
+
+    async def on_error(self, interaction, error, item):
+        trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        print(f"도움말 버튼 오류:\n{trace}")
+        notify_admin("도움말 버튼 오류", f"{type(error).__name__}: {error}",
+                     describe_interaction(interaction, f"버튼: {getattr(item, 'label', '?')}"), trace)
+        send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+        await send("오류가 발생했습니다.", ephemeral=True)
+
+    # ---- home page
+
+    def open_category(self, key):
+        async def callback(interaction):
+            if key == "uptime" and interaction.guild is None:
+                await interaction.response.send_message(SERVER_ONLY_MESSAGE, ephemeral=True)
+                return
+            await self.show(interaction, page=key)
+        return callback
+
+    async def dm_to_dev(self, interaction):
+        left = feedback_wait_left(interaction.user.id)
+        if left:
+            await interaction.response.send_message(f"{left}초 후에 다시 보낼 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.send_modal(FeedbackModal())
+
+    async def go_home(self, interaction):
+        await self.show(interaction, page="home")
+
+    # ---- command buttons
+
+    async def run_add(self, interaction):
+        await interaction.response.send_modal(AddServerModal(self))
+
+    async def run_uptime(self, interaction):
+        await self.show(interaction, selected="uptime")
+        if not guild_servers(interaction.guild.id):
+            await interaction.followup.send(NO_SERVER_MESSAGE, ephemeral=True)
+            return
+        ctx = HelpContext(interaction, "업타임")
+        await run_from_help(ctx, uptime.callback(ctx))
+
+    async def run_list(self, interaction):
+        await self.show(interaction, selected="list")
+        servers = guild_servers(interaction.guild.id)
+        if not servers:
+            await interaction.followup.send(NO_SERVER_MESSAGE, ephemeral=True)
+            return
+        lines = [f"• **{s['name']}** — `{s['address']}`" for s in servers]
+        embed = discord.Embed(title="등록된 서버", description="\n".join(lines), color=discord.Color.green())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def run_delete(self, interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+            return
+        servers = guild_servers(interaction.guild.id)
+        if not servers:
+            await interaction.response.send_message(NO_SERVER_MESSAGE, ephemeral=True)
+            return
+        await interaction.response.send_modal(DeleteServerModal(self, servers))
+
+    async def run_hypixel(self, interaction):
+        await interaction.response.send_modal(HypixelModal(self))
+
+    async def run_valorant(self, interaction):
+        await interaction.response.send_modal(ValorantModal(self))
+
+
+class HelpModal(SafeModal):
+    """Input form opened from a /도움말 button, with the command's description at the top."""
+
+    def __init__(self, help_view, key):
+        label, _, text = HELP_COMMANDS[key]
+        super().__init__(title=label)
+        self.help_view = help_view
+        self.key = key
+        self.add_item(discord.ui.TextDisplay(text))
+
+    async def finish(self, interaction):
+        """Show this command's description on the help message, then the result follows publicly."""
+        self.help_view.last_interaction = interaction
+        await self.help_view.show(interaction, selected=self.key)
+        return HelpContext(interaction, HELP_COMMANDS[self.key][0])
+
+
+class AddServerModal(HelpModal):
+    def __init__(self, help_view):
+        super().__init__(help_view, "add")
+        self.address = discord.ui.TextInput(max_length=253, placeholder="hypixel.net")
+        self.server_name = discord.ui.TextInput(required=False, max_length=MAX_NAME_LENGTH, placeholder="하이픽셀 (비우면 주소)")
+        self.add_item(discord.ui.Label(text="주소", component=self.address))
+        self.add_item(discord.ui.Label(text="이름 (선택)", component=self.server_name))
+
+    async def on_submit(self, interaction):
+        try:
+            address, name = check_new_server(interaction.guild.id, self.address.value, self.server_name.value)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        ctx = await self.finish(interaction)
+        await run_from_help(ctx, register_server(ctx, address, name))
+
+
+class DeleteServerModal(HelpModal):
+    def __init__(self, help_view, servers):
+        super().__init__(help_view, "delete")
+        self.server = discord.ui.Select(options=[
+            discord.SelectOption(label=s["name"][:100], description=s["address"][:100], value=str(s["id"]))
+            for s in servers
+        ])
+        self.add_item(discord.ui.Label(text="삭제할 서버", component=self.server))
+
+    async def on_submit(self, interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+            return
+        chosen = self.server.values[0] if self.server.values else None
+        server = next((s for s in guild_servers(interaction.guild.id) if str(s["id"]) == chosen), None)
+        if not server:
+            await interaction.response.send_message("이미 삭제된 서버입니다.", ephemeral=True)
+            return
+        remove_server(server["id"])
+        ctx = await self.finish(interaction)
+        await ctx.reply(f"**{server['name']}** 서버와 업타임 기록을 삭제했습니다.")
+
+
+class HypixelModal(HelpModal):
+    GAMES = [("전체", "all"), ("베드워즈 (bw)", "bedwars"), ("스카이워즈 (sw)", "skywars"), ("듀얼 (duels)", "duels")]
+
+    def __init__(self, help_view):
+        super().__init__(help_view, "hypixel")
+        self.player = discord.ui.TextInput(max_length=16, placeholder="hypixel")
+        self.game = discord.ui.Select(options=[
+            discord.SelectOption(label=label, value=value, default=value == "all") for label, value in self.GAMES
+        ])
+        self.add_item(discord.ui.Label(text="닉네임", component=self.player))
+        self.add_item(discord.ui.Label(text="유형", component=self.game))
+
+    async def on_submit(self, interaction):
+        ctx = HelpContext(interaction, "H전적")
+        left = stats_wait_left(hypixel_stats, ctx)
+        if left:
+            await interaction.response.send_message(f"{left}초 후에 다시 시도해 주세요.", ephemeral=True)
+            return
+        game = self.game.values[0] if self.game.values else "all"
+        ctx = await self.finish(interaction)
+        await run_from_help(ctx, run_hypixel(ctx, self.player.value.strip(), None if game == "all" else game))
+
+
+class ValorantModal(HelpModal):
+    def __init__(self, help_view):
+        super().__init__(help_view, "valorant")
+        self.riot_id = discord.ui.TextInput(max_length=40, placeholder="snowe #UIpop")
+        self.add_item(discord.ui.Label(text="이름#태그", component=self.riot_id))
+
+    async def on_submit(self, interaction):
+        try:
+            name, tag, region = stats.parse_riot_id(self.riot_id.value)
+        except stats.StatsError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        ctx = HelpContext(interaction, "V전적")
+        left = stats_wait_left(valorant_stats, ctx)
+        if left:
+            await interaction.response.send_message(f"{left}초 후에 다시 시도해 주세요.", ephemeral=True)
+            return
+        ctx = await self.finish(interaction)
+        await run_from_help(ctx, run_valorant(ctx, name, tag, region))
+
+
+@bot.tree.command(name="도움말", description="버튼으로 명령어를 보고 바로 사용합니다 (나만 보임)")
+async def help_slash(interaction: discord.Interaction):
+    view = HelpView(interaction)
+    await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
 
 async def setup_hook():
