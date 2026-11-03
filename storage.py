@@ -76,9 +76,11 @@ class StorageError(Exception):
 class S3Error(Exception):
     def __init__(self, status, body=b""):
         code = re.search(rb"<Code>([^<]+)</Code>", body or b"")
+        message = re.search(rb"<Message>([^<]*)</Message>", body or b"")
         self.status = status
         self.code = code.group(1).decode() if code else ""
-        super().__init__(f"HTTP {status} {self.code}".strip())
+        self.message = message.group(1).decode(errors="replace") if message else ""
+        super().__init__(f"HTTP {status} {self.code} {self.message}".strip())
 
 
 def configured():
@@ -448,8 +450,71 @@ async def ping():
     return (time.perf_counter() - start) * 1000, None
 
 
+def upload_origins():
+    """Web origins the upload page runs on: the storage host itself (private bucket), and the public URL."""
+    origins = [f"{urlsplit(ENDPOINT).scheme}://{HOST}"]
+    if PUBLIC_URL:
+        origins.append(f"{urlsplit(PUBLIC_URL).scheme}://{urlsplit(PUBLIC_URL).netloc}")
+    return list(dict.fromkeys(origins))
+
+
+async def set_cors():
+    """Allow the upload page to PUT. Browsers send an Origin header even to the same host, and B2 then
+    checks CORS rules, so this is needed for private buckets too. Returns None or the error text."""
+    rule = "<CORSConfiguration><CORSRule>" + "".join(f"<AllowedOrigin>{o}</AllowedOrigin>" for o in upload_origins()) + (
+        "<AllowedMethod>PUT</AllowedMethod><AllowedMethod>GET</AllowedMethod><AllowedMethod>HEAD</AllowedMethod>"
+        "<AllowedHeader>*</AllowedHeader><MaxAgeSeconds>3600</MaxAgeSeconds></CORSRule></CORSConfiguration>")
+    rule = rule.encode()
+    try:
+        import base64
+        md5 = base64.b64encode(hashlib.md5(rule).digest()).decode()
+        await _s3("PUT", params={"cors": ""}, data=rule, headers={"Content-MD5": md5, "Content-Type": "application/xml"})
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+async def _try(label, method, url, headers=None, data=b""):
+    try:
+        async with net.session().request(method, URL(url, encoded=True), headers=headers or {}, data=data,
+                                         timeout=aiohttp.ClientTimeout(total=20)) as response:
+            body = await response.read()
+            if response.status in (200, 204):
+                return label, True, f"HTTP {response.status}"
+            error = S3Error(response.status, body)
+            return label, False, str(error)
+    except Exception as exc:
+        return label, False, f"{type(exc).__name__}: {exc}"
+
+
+async def self_test():
+    """Try what the bot and the upload page do, against the real storage (for £DB 테스트).
+    Returns [(label, ok, detail)]; test objects are removed afterwards."""
+    results = []
+    key = f"files/selftest/{secrets.token_urlsafe(6)}/test.txt"
+    try:
+        await _s3("PUT", key, data=b"maco self-test", headers={"Content-Type": "text/plain"})
+        results.append(("봇 업로드 (서명 헤더)", True, "OK"))
+    except Exception as exc:
+        results.append(("봇 업로드 (서명 헤더)", False, str(exc)))
+    results.append(await _try("서명 링크로 열기 (GET)", "GET", link(key, 300)))
+    origin = upload_origins()[0]
+    browser = {"Content-Type": "text/plain", "Origin": origin}
+    results.append(await _try("웹 업로드 (Origin 없음)", "PUT", presigned_put(key + ".a"),
+                              {"Content-Type": "text/plain"}, b"a"))
+    results.append(await _try("웹 업로드 (브라우저처럼 Origin 포함)", "PUT", presigned_put(key + ".b"), browser, b"b"))
+    results.append(await _try("웹 업로드 + 파일 이름 헤더", "PUT", presigned_put(key + ".c"),
+                              {**browser, "Content-Disposition": "attachment; filename*=UTF-8''test.txt"}, b"c"))
+    cors_error = await set_cors()
+    results.append(("CORS 규칙 설정", cors_error is None, cors_error or f"허용: {', '.join(upload_origins())}"))
+    if cors_error is None:
+        results.append(await _try("CORS 설정 후 웹 업로드 (Origin 포함)", "PUT", presigned_put(key + ".d"), browser, b"d"))
+    await delete([key] + [key + s for s in (".a", ".b", ".c", ".d")])
+    return results
+
+
 async def setup_bucket():
-    """Upload the big-file page, and for a public bucket allow the browser to PUT from it (CORS).
+    """Upload the big-file page and allow the browser to PUT from it (CORS).
     Failures are only logged: the CORS rule can also be set by hand (see README)."""
     try:
         with open(UPLOAD_PAGE_PATH, "rb") as f:
@@ -458,18 +523,9 @@ async def setup_bucket():
                   headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache"})
     except Exception as exc:
         print(f"업로드 페이지 올리기 실패: {type(exc).__name__}: {exc}")
-    if not PUBLIC_URL:
-        return  # page and upload share the storage host: same origin, no CORS needed
-    rule = (f"<CORSConfiguration><CORSRule><AllowedOrigin>{PUBLIC_URL}</AllowedOrigin>"
-            "<AllowedMethod>PUT</AllowedMethod><AllowedHeader>content-type</AllowedHeader>"
-            "<AllowedHeader>content-disposition</AllowedHeader><MaxAgeSeconds>3600</MaxAgeSeconds>"
-            "</CORSRule></CORSConfiguration>").encode()
-    try:
-        import base64
-        md5 = base64.b64encode(hashlib.md5(rule).digest()).decode()
-        await _s3("PUT", params={"cors": ""}, data=rule, headers={"Content-MD5": md5, "Content-Type": "application/xml"})
-    except Exception as exc:
-        print(f"저장소 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {type(exc).__name__}: {exc}")
+    error = await set_cors()
+    if error:
+        print(f"저장소 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {error}")
 
 
 def upload_page_link(key, retention="7일"):
