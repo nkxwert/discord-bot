@@ -8,6 +8,7 @@ import asyncio
 import io
 import ipaddress
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -18,11 +19,25 @@ from mcstatus import JavaServer
 from dotenv import load_dotenv
 
 import cards
+import net
 import easter_eggs
 import stats
 import storage
 
 load_dotenv()
+
+
+def limit_malloc_arenas():
+    """glibc gives every thread its own memory arena; on a 128MB host that fragmentation adds up.
+    Two arenas are plenty for this bot (same as MALLOC_ARENA_MAX=2)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").mallopt(-8, 2)  # M_ARENA_MAX
+    except (OSError, AttributeError):
+        pass  # not glibc (Windows, macOS, musl): nothing to do
+
+
+limit_malloc_arenas()
 
 
 def env_int(name, default, minimum):
@@ -84,6 +99,7 @@ bot = commands.Bot(
     intents=intents,
     help_command=None,
     case_insensitive=True,
+    max_messages=None,  # the bot never looks up old messages; the default keeps 1,000 in memory
     allowed_mentions=discord.AllowedMentions.none(),
     # Owner-only commands (£servers). Empty means "the account that owns the app in the Developer Portal".
     owner_ids=OWNER_IDS or None,
@@ -348,11 +364,9 @@ async def query_external(address: str):
     result = (False, None, None, None)
     try:
         timeout = aiohttp.ClientTimeout(total=EXTERNAL_TIMEOUT_SECONDS)
-        headers = {"User-Agent": "discord-minecraft-uptime-bot"}
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(EXTERNAL_API_URL + quote(address, safe=":")) as response:
-                response.raise_for_status()
-                data = await response.json()
+        async with net.session().get(EXTERNAL_API_URL + quote(address, safe=":"), timeout=timeout) as response:
+            response.raise_for_status()
+            data = await response.json()
         players = data.get("players") or {}
         result = (bool(data.get("online")), None, players.get("online"), players.get("max"))
     except Exception as exc:
@@ -741,8 +755,30 @@ async def owner_db_cleanup(message, args):
     )
 
 
+def memory_usage():
+    """(current, peak) memory of this process in bytes, or None where /proc isn't available."""
+    try:
+        values = {}
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmHWM:")):
+                    values[line.split(":")[0]] = int(line.split()[1]) * 1024
+        return values["VmRSS"], values["VmHWM"]
+    except (OSError, KeyError, ValueError):
+        return None
+
+
 async def db_status_embed():
     embed = discord.Embed(title="DB 상태", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+    memory = memory_usage()
+    if memory:
+        limit = env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024
+        embed.add_field(name="🧠 메모리", inline=False, value=(
+            f"지금 **{human_size(memory[0])}** / {human_size(limit)} ({memory[0] / limit * 100:.0f}%) · "
+            f"켜진 뒤 최대 {human_size(memory[1])}"
+        ))
+        if memory[0] > limit * 0.9:
+            embed.color = discord.Color.orange()
 
     # Local sqlite (servers, uptime samples, file list)
     try:
@@ -1766,16 +1802,36 @@ def save_file_row(guild_id, channel_id, user_id, name, key, content_type, size, 
         return dict(conn.execute("SELECT * FROM files WHERE id = ?", (cursor.lastrowid,)).fetchone())
 
 
+async def store_attachment(guild_id, channel_id, user_id, attachment, name=""):
+    """Stream one Discord attachment into storage and record it. The file never sits in memory as a whole
+    (the bot host has 128MB). Videos are converted only when FILE_CONVERT_VIDEO is on."""
+    filename, size = attachment.filename, attachment.size
+    if size > FILE_MAX_BYTES:
+        raise storage.StorageError(f"파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
+    converted = await storage.convert_url(attachment.url, filename) if storage.should_convert(filename, size) else None
+    if converted:
+        path, filename, size, cleanup = converted
+        try:
+            check_file_quota(guild_id, size)
+            key = storage.new_key(guild_id, filename)
+            content_type = await storage.put_path(key, path, filename)
+        finally:
+            cleanup()
+    else:
+        check_file_quota(guild_id, size)
+        key = storage.new_key(guild_id, filename)
+        content_type = await storage.put_from_url(key, attachment.url, size, filename)
+    name = unique_file_name(guild_id, file_display_name(name, filename))
+    return save_file_row(guild_id, channel_id, user_id, name, key, content_type, size)
+
+
 async def store_file(guild_id, channel_id, user_id, filename, data, name=""):
-    """Upload one file (converting a video Discord can't play when ffmpeg is there) and record it."""
+    """Upload small in-memory data and record it (used by tests and tools; users go through attachments)."""
     if len(data) > FILE_MAX_BYTES:
         raise storage.StorageError(f"파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
-    converted = await storage.to_playable_mp4(data, filename)
-    if converted:
-        data, filename = converted
     check_file_quota(guild_id, len(data))
     key = storage.new_key(guild_id, filename)
-    content_type = await storage.put_file(key, data, filename)
+    content_type = await storage.put_bytes(key, data, filename)
     name = unique_file_name(guild_id, file_display_name(name, filename))
     return save_file_row(guild_id, channel_id, user_id, name, key, content_type, len(data))
 
@@ -1817,9 +1873,8 @@ async def upload_attachments(ctx, attachments, name=""):
                 errors.append(f"`{attachment.filename}`: 파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
                 continue
             try:
-                data = await attachment.read()
-                rows.append(await store_file(ctx.guild.id, ctx.channel.id, ctx.author.id, attachment.filename, data,
-                                             name if len(attachments) == 1 else ""))
+                rows.append(await store_attachment(ctx.guild.id, ctx.channel.id, ctx.author.id, attachment,
+                                                   name if len(attachments) == 1 else ""))
             except storage.StorageError as exc:
                 if exc.__cause__:
                     notify_admin("파일 저장소 오류", f"{type(exc.__cause__).__name__}: {exc.__cause__}", describe_ctx(ctx))
@@ -2589,6 +2644,8 @@ async def help_slash(interaction: discord.Interaction):
 
 
 async def setup_hook():
+    # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton)
     await load_help_emojis()
     if storage.configured():
