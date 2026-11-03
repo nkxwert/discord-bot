@@ -539,6 +539,7 @@ def command_list_embed():
         inline=False,
     )
     embed.add_field(name="!운세", value="오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다.", inline=False)
+    embed.add_field(name="!일침", value="정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
     embed.add_field(name="​", value="─" * 24, inline=False)
     embed.add_field(
@@ -549,23 +550,34 @@ def command_list_embed():
     return embed
 
 
-FORTUNES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fortunes.txt")
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+# key -> (sentence file, line used when the file is missing or empty)
+RANDOM_LINES = {
+    "fortune": ("fortunes.txt", "오늘은 운세가 쉬어 가는 날입니다."),
+    "ilchim": ("ilchim.txt", "오늘은 일침이 쉬어 가는 날입니다."),
+}
 
 
-def random_fortune():
-    """A random line of fortunes.txt, read on every call so edits apply without a restart."""
+def random_line(key):
+    """A random line of the key's text file, read on every call so edits apply without a restart."""
+    filename, fallback = RANDOM_LINES[key]
     try:
-        with open(FORTUNES_PATH, encoding="utf-8-sig") as f:
+        with open(os.path.join(BOT_DIR, filename), encoding="utf-8-sig") as f:
             lines = [line.strip() for line in f if line.strip() and not line.lstrip().startswith("#")]
     except OSError as exc:
-        print(f"운세 파일 읽기 실패: {type(exc).__name__}: {exc}")
+        print(f"{filename} 읽기 실패: {type(exc).__name__}: {exc}")
         lines = []
-    return random.choice(lines) if lines else "오늘은 운세가 쉬어 가는 날입니다."
+    return random.choice(lines) if lines else fallback
 
 
 @bot.command(name="운세")
 async def fortune(ctx):
-    await ctx.reply(random_fortune(), mention_author=False)
+    await ctx.reply(random_line("fortune"), mention_author=False)
+
+
+@bot.command(name="일침")
+async def ilchim(ctx):
+    await ctx.reply(random_line("ilchim"), mention_author=False)
 
 
 @bot.command(name="주소추가")
@@ -1294,7 +1306,7 @@ async def feedback_prefix(ctx):
 HELP_CATEGORIES = {
     "uptime": ("🖥️", "서버 업타임", ["add", "uptime", "list", "delete"]),
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
-    "etc": ("🎲", "기타", ["fortune"]),
+    "etc": ("🎲", "기타", ["fortune", "ilchim"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -1307,6 +1319,7 @@ HELP_COMMANDS = {
     "hypixel": ("Hypixel 전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
                 "예: `!H전적 hypixel bw`"),
     "fortune": ("운세", "!운세", "`!운세`\n오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다."),
+    "ilchim": ("일침", "!일침", "`!일침`\n정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다."),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -1320,7 +1333,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮"}  # plain emoji for command buttons without an uploaded icon
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢"}  # plain emoji for command buttons without an uploaded icon
 
 
 async def load_help_emojis():
@@ -1497,9 +1510,11 @@ async def help_run_delete(interaction):
     await interaction.response.send_modal(DeleteServerModal(servers))
 
 
-async def help_run_fortune(interaction):
-    await show_help(interaction, page="etc", selected="fortune")
-    await interaction.followup.send(random_fortune())
+def help_run_random_line(key):
+    async def handler(interaction):
+        await show_help(interaction, page="etc", selected=key)
+        await interaction.followup.send(random_line(key))
+    return handler
 
 
 def help_open_form(modal_class):
@@ -1640,7 +1655,8 @@ HELP_ACTIONS = {
     "page_uptime": lambda interaction: help_open_page(interaction, "uptime"),
     "page_stats": lambda interaction: help_open_page(interaction, "stats"),
     "page_etc": lambda interaction: help_open_page(interaction, "etc"),
-    "run_fortune": help_run_fortune,
+    "run_fortune": help_run_random_line("fortune"),
+    "run_ilchim": help_run_random_line("ilchim"),
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,
