@@ -9,6 +9,7 @@ import io
 import ipaddress
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -28,11 +29,16 @@ load_dotenv()
 
 
 def limit_malloc_arenas():
-    """glibc gives every thread its own memory arena; on a 128MB host that fragmentation adds up.
-    Two arenas are plenty for this bot (same as MALLOC_ARENA_MAX=2)."""
+    """Tune glibc's allocator for a 128MB host: two arenas instead of one per thread (MALLOC_ARENA_MAX=2),
+    and freed large buffers handed back to the system."""
     try:
         import ctypes
-        ctypes.CDLL("libc.so.6").mallopt(-8, 2)  # M_ARENA_MAX
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-8, 2)  # M_ARENA_MAX
+        # A fixed threshold stops glibc from raising it after big buffers are freed, which otherwise
+        # keeps tens of MB of freed upload/card buffers in the process instead of returning them.
+        libc.mallopt(-3, 128 * 1024)  # M_MMAP_THRESHOLD: blocks this big get their own mapping
+        libc.mallopt(-1, 256 * 1024)  # M_TRIM_THRESHOLD: give free heap memory back above this
     except (OSError, AttributeError):
         pass  # not glibc (Windows, macOS, musl): nothing to do
 
@@ -195,10 +201,18 @@ def describe_interaction(interaction, what):
     return f"{what}\n서버: {place}\n사용자: {interaction.user} ({interaction.user.id})"
 
 
+@contextmanager
 def connect_db():
+    """`with connect_db() as conn:` commits (or rolls back on error) and then closes the connection.
+    A plain sqlite3 connection used in a with-block is never closed, and on this host each one left
+    behind tens of KB: about 29MB per 500 queries, which pushed the bot towards its 128MB limit."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():

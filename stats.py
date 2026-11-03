@@ -75,6 +75,9 @@ async def _cached(key, loader, ttl=None):
     if len(_cache) >= MAX_CACHE_ENTRIES:
         for old_key in [k for k, (expires, _) in _cache.items() if now >= expires]:
             del _cache[old_key]
+        # Still full of fresh entries: drop the ones closest to expiring so the cap really holds.
+        for old_key in sorted(_cache, key=lambda k: _cache[k][0])[:len(_cache) - MAX_CACHE_ENTRIES + 1]:
+            del _cache[old_key]
     _cache[key] = (now + (ttl(value) if ttl else CACHE_SECONDS), value)
     return value
 
