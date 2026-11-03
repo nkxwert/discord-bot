@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 import cards
 import easter_eggs
 import stats
+import storage
 
 load_dotenv()
 
@@ -233,6 +234,24 @@ def init_db():
                 )
             conn.execute("DROP TABLE shared_servers")
         conn.execute("DELETE FROM samples WHERE server_id IS NULL")
+        # Files uploaded with !올리기 (stored on R2). status: 'pending' while a browser upload is unfinished.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                channel_id INTEGER,
+                name TEXT NOT NULL,
+                key TEXT NOT NULL,
+                url TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                uploaded_by INTEGER NOT NULL,
+                uploaded_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                status TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_guild ON files(guild_id, status)")
         conn.commit()
 
 
@@ -414,6 +433,8 @@ def percent_text(percentage):
 @bot.event
 async def on_ready():
     init_db()
+    if storage.configured() and not clean_files.is_running():
+        clean_files.start()
     if not monitor_servers.is_running():
         monitor_servers.start()
     print(f"로그인 완료: {bot.user} (ID: {bot.user.id})")
@@ -538,6 +559,10 @@ def command_list_embed():
         value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
+    embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 링크를 보냅니다. 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
+                    "7일 후 자동 삭제됩니다.", inline=False)
+    embed.add_field(name="!파일 [이름]", value="올린 파일 목록을 봅니다. 이름을 붙이면 그 파일 링크를 보냅니다.", inline=False)
+    embed.add_field(name="!파일삭제 <이름>", value="파일을 지웁니다. (올린 사람 또는 서버 관리 권한)", inline=False)
     embed.add_field(name="!운세", value="오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     embed.add_field(name="!일침", value="정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
@@ -1301,11 +1326,396 @@ async def feedback_prefix(ctx):
     await prompt.channel.send(message)
 
 
+# ---------------------------------------------------------------- 파일 (Cloudflare R2)
+
+FILE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+FILE_PENDING_SECONDS = 60 * 60  # an unfinished browser upload is cleaned up after this
+FILE_GUILD_QUOTA = env_int("FILE_GUILD_QUOTA_MB", 10240, 1) * 1024 * 1024
+FILE_TOTAL_QUOTA = env_int("FILE_TOTAL_QUOTA_MB", 10240, 1) * 1024 * 1024  # R2's free tier is 10GB
+FILE_MAX_BYTES = env_int("FILE_MAX_MB", 500, 1) * 1024 * 1024
+FILE_MAX_PER_MESSAGE = 5
+FILE_COOLDOWN_SECONDS = 10
+FILE_NOTICE = "📦 올린 파일은 Cloudflare R2 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다. 링크가 있으면 누구나 볼 수 있습니다."
+FILE_NOT_CONFIGURED = "파일 저장소가 설정되지 않았습니다. 봇 관리자에게 문의해 주세요."
+
+
+def human_size(size):
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+
+
+def file_usage(guild_id=None):
+    with connect_db() as conn:
+        if guild_id is None:
+            row = conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE status = 'ready'").fetchone()
+        else:
+            row = conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE status = 'ready' AND guild_id = ?",
+                               (guild_id,)).fetchone()
+    return row[0]
+
+
+def check_file_quota(guild_id, size):
+    if file_usage(guild_id) + size > FILE_GUILD_QUOTA:
+        raise storage.StorageError(
+            f"이 서버의 저장 공간({human_size(FILE_GUILD_QUOTA)})이 부족합니다. "
+            "`!파일삭제`로 정리하거나 7일 뒤 자동 삭제를 기다려 주세요."
+        )
+    if file_usage() + size > FILE_TOTAL_QUOTA:
+        notify_admin("파일 저장 공간 가득 참", f"전체 한도 {human_size(FILE_TOTAL_QUOTA)}에 도달했습니다.")
+        raise storage.StorageError("봇 전체 저장 공간이 가득 찼습니다. 오래된 파일이 자동 삭제된 뒤 다시 시도해 주세요.")
+
+
+def guild_files(guild_id):
+    with connect_db() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM files WHERE guild_id = ? AND status = 'ready' ORDER BY uploaded_at DESC", (guild_id,),
+        )]
+
+
+def find_file(guild_id, name):
+    key = name.strip().lower()
+    return next((f for f in guild_files(guild_id) if f["name"].lower() == key), None)
+
+
+def unique_file_name(guild_id, name):
+    taken = {f["name"].lower() for f in guild_files(guild_id)}
+    candidate, number = name, 2
+    while candidate.lower() in taken:
+        candidate = f"{name} ({number})"
+        number += 1
+    return candidate
+
+
+def file_display_name(name, filename):
+    return (name.strip() or os.path.splitext(filename)[0] or "파일")[:MAX_NAME_LENGTH]
+
+
+def save_file_row(guild_id, channel_id, user_id, name, key, content_type, size, status="ready"):
+    now = time.time()
+    expires = now + (FILE_RETENTION_SECONDS if status == "ready" else FILE_PENDING_SECONDS)
+    with connect_db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO files(guild_id, channel_id, name, key, url, content_type, size, uploaded_by, "
+            "uploaded_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, name, key, storage.public_url(key), content_type, size, user_id, now, expires, status),
+        )
+        conn.commit()
+        return dict(conn.execute("SELECT * FROM files WHERE id = ?", (cursor.lastrowid,)).fetchone())
+
+
+async def store_file(guild_id, channel_id, user_id, filename, data, name=""):
+    """Upload one file (converting a video Discord can't play when ffmpeg is there) and record it."""
+    if len(data) > FILE_MAX_BYTES:
+        raise storage.StorageError(f"파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
+    converted = await storage.to_playable_mp4(data, filename)
+    if converted:
+        data, filename = converted
+    check_file_quota(guild_id, len(data))
+    key = storage.new_key(guild_id, filename)
+    content_type = await storage.put_file(key, data, filename)
+    name = unique_file_name(guild_id, file_display_name(name, filename))
+    return save_file_row(guild_id, channel_id, user_id, name, key, content_type, len(data))
+
+
+def file_line(row):
+    # The link sits on its own line so Discord shows the picture / plays the video right in the chat.
+    return f"**{row['name']}** · {human_size(row['size'])} · <t:{int(row['expires_at'])}:R> 자동 삭제\n{row['url']}"
+
+
+def file_message(rows, errors=()):
+    parts = [file_line(r) for r in rows] + [f"⚠️ {e}" for e in errors]
+    if rows:
+        parts.append(FILE_NOTICE)
+    return "\n\n".join(parts)[:2000]
+
+
+async def upload_attachments(ctx, attachments, name=""):
+    """Store the attachments and post the links publicly (editing the waiting notice if one appeared)."""
+    async def work():
+        rows, errors = [], []
+        for attachment in attachments[:FILE_MAX_PER_MESSAGE]:
+            if attachment.size > FILE_MAX_BYTES:
+                errors.append(f"`{attachment.filename}`: 파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
+                continue
+            try:
+                data = await attachment.read()
+                rows.append(await store_file(ctx.guild.id, ctx.channel.id, ctx.author.id, attachment.filename, data,
+                                             name if len(attachments) == 1 else ""))
+            except storage.StorageError as exc:
+                if exc.__cause__:
+                    notify_admin("파일 저장소 오류", f"{type(exc.__cause__).__name__}: {exc.__cause__}", describe_ctx(ctx))
+                errors.append(f"`{attachment.filename}`: {exc}")
+            except discord.HTTPException:
+                errors.append(f"`{attachment.filename}`: 디스코드에서 파일을 받지 못했습니다.")
+        return rows, errors
+
+    progress = Progress([("upload", "파일 올리는 중")])
+    (rows, errors), notice = await run_with_notice(ctx, work(), progress)
+    await send_result(ctx, notice, content=file_message(rows, errors))
+
+
+def start_browser_upload(guild_id, channel_id, user_id, name=""):
+    """A pending upload and the page link where the user picks the file (for files over Discord's limit)."""
+    key = storage.new_key(guild_id, "upload")
+    row = save_file_row(guild_id, channel_id, user_id, name.strip()[:MAX_NAME_LENGTH], key, "", 0, status="pending")
+    return row, storage.upload_page_link(key)
+
+
+def browser_upload_text(link):
+    return (
+        f"**[파일 올리는 페이지 열기]({link})**\n"
+        f"페이지에서 파일을 올린 뒤 아래 **[업로드 완료]**를 눌러 주세요. "
+        f"링크는 10분 동안 쓸 수 있고, 파일당 최대 {human_size(FILE_MAX_BYTES)}입니다.\n{FILE_NOTICE}"
+    )
+
+
+def browser_upload_view(row_id):
+    view = discord.ui.View(timeout=None)
+    view.add_item(UploadDoneButton(row_id))
+    return view
+
+
+class UploadDoneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:upload:(?P<row_id>\d+)"):
+    """[업로드 완료] under a browser-upload link; works after a restart too."""
+
+    def __init__(self, row_id):
+        super().__init__(discord.ui.Button(
+            label="업로드 완료", emoji="✅", style=discord.ButtonStyle.success, custom_id=f"maco:upload:{row_id}",
+        ))
+        self.row_id = row_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["row_id"]))
+
+    async def callback(self, interaction):
+        with connect_db() as conn:
+            row = conn.execute("SELECT * FROM files WHERE id = ?", (self.row_id,)).fetchone()
+        row = dict(row) if row else None
+        if not row or row["status"] != "pending" or row["expires_at"] < time.time():
+            await interaction.response.send_message("이미 처리됐거나 만료된 업로드입니다. 다시 `!올리기`를 해 주세요.",
+                                                    ephemeral=True)
+            return
+        if row["uploaded_by"] != interaction.user.id:
+            await interaction.response.send_message("업로드를 시작한 사람만 누를 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            text = await self.finish(interaction, row)
+        except storage.StorageError as exc:
+            if exc.__cause__:
+                notify_admin("파일 저장소 오류", f"{type(exc.__cause__).__name__}: {exc.__cause__}",
+                             describe_interaction(interaction, "버튼: 업로드 완료"))
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        except Exception as exc:
+            trace = traceback.format_exc()
+            print(f"업로드 완료 처리 오류:\n{trace}")
+            notify_admin("업로드 완료 처리 오류", f"{type(exc).__name__}: {exc}",
+                         describe_interaction(interaction, "버튼: 업로드 완료"), trace)
+            await interaction.followup.send("오류가 발생했습니다.", ephemeral=True)
+            return
+        if text:
+            await interaction.followup.send(text, ephemeral=True)
+
+    async def finish(self, interaction, row):
+        info = await storage.head(row["key"])
+        if info is None:
+            return "아직 올라간 파일이 없습니다. 페이지에서 파일을 다 올린 뒤 눌러 주세요."
+        size, content_type, filename = info
+        if size > FILE_MAX_BYTES:
+            await storage.delete([row["key"]])
+            self.drop(row)
+            await interaction.edit_original_response(content=f"파일이 너무 커서 지웠습니다. (최대 {human_size(FILE_MAX_BYTES)})",
+                                                     view=None)
+            return None
+        check_file_quota(row["guild_id"], size)
+        filename = filename or storage.name_for_type(content_type)
+        key, stored_type, size, filename = await storage.finish_browser_upload(row["key"], filename, content_type, size)
+        name = unique_file_name(row["guild_id"], file_display_name(row["name"], filename))
+        now = time.time()
+        with connect_db() as conn:
+            conn.execute(
+                "UPDATE files SET name = ?, key = ?, url = ?, content_type = ?, size = ?, uploaded_at = ?, "
+                "expires_at = ?, status = 'ready' WHERE id = ?",
+                (name, key, storage.public_url(key), stored_type, size, now, now + FILE_RETENTION_SECONDS, row["id"]),
+            )
+            conn.commit()
+            done = dict(conn.execute("SELECT * FROM files WHERE id = ?", (row["id"],)).fetchone())
+        await interaction.edit_original_response(content=f"✅ **{name}** 올리기를 마쳤습니다.", view=None)
+        # Post the link where the upload was started, like a !올리기 with an attachment.
+        channel = bot.get_channel(row["channel_id"])
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(row["channel_id"])
+            except discord.HTTPException:
+                channel = None
+        message = f"<@{row['uploaded_by']}>님이 올린 파일\n\n" + file_message([done])
+        if channel is not None and interaction.channel and channel.id != interaction.channel.id:
+            try:
+                await channel.send(message)
+                return None
+            except discord.HTTPException:
+                pass
+        await interaction.followup.send(message)
+        return None
+
+    @staticmethod
+    def drop(row):
+        with connect_db() as conn:
+            conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
+            conn.commit()
+
+
+async def can_manage_file(member, guild, row):
+    if row["uploaded_by"] == member.id or await bot.is_owner(member):
+        return True
+    return guild is not None and getattr(member, "guild_permissions", None) and member.guild_permissions.manage_guild
+
+
+async def remove_file(row):
+    """Delete from R2 and the list; False if R2 refused (the row is kept so cleanup retries)."""
+    if not await storage.delete([row["key"]]):
+        return False
+    with connect_db() as conn:
+        conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
+        conn.commit()
+    return True
+
+
+def file_list_text(guild_id):
+    files = guild_files(guild_id)
+    if not files:
+        return None
+    lines = [
+        f"• **{discord.utils.escape_markdown(f['name'])}** · {human_size(f['size'])} · <@{f['uploaded_by']}> · "
+        f"<t:{int(f['expires_at'])}:R> 삭제"
+        for f in files
+    ]
+    text = ""
+    for i, line in enumerate(lines):
+        if len(text) + len(line) > 3500:
+            text += f"… 외 {len(lines) - i}개"
+            break
+        text += line + "\n"
+    return f"**올린 파일 {len(files)}개** · {human_size(file_usage(guild_id))} / {human_size(FILE_GUILD_QUOTA)}\n{text}"
+
+
+def files_disabled_reason(guild):
+    if not storage.configured():
+        return FILE_NOT_CONFIGURED
+    if guild is None:
+        return SERVER_ONLY_MESSAGE
+    return None
+
+
+@bot.command(name="올리기")
+@commands.cooldown(1, FILE_COOLDOWN_SECONDS, commands.BucketType.user)
+async def upload_command(ctx, *, name: str = ""):
+    reason = files_disabled_reason(ctx.guild)
+    if reason:
+        ctx.command.reset_cooldown(ctx)
+        await ctx.reply(reason, mention_author=False)
+        return
+    if ctx.message.attachments:
+        await upload_attachments(ctx, ctx.message.attachments, name)
+        return
+    # No attachment: big files go through the browser page, sent by DM so nobody else can use the link.
+    row, link = start_browser_upload(ctx.guild.id, ctx.channel.id, ctx.author.id, name)
+    try:
+        await ctx.author.send(browser_upload_text(link), view=browser_upload_view(row["id"]))
+    except discord.HTTPException:
+        UploadDoneButton.drop(row)
+        await ctx.reply("DM을 보낼 수 없습니다. 파일을 메시지에 첨부해서 `!올리기`를 하거나, "
+                        "디스코드 설정 → 개인정보 보호에서 서버 멤버의 DM을 허용해 주세요.", mention_author=False)
+        return
+    await ctx.reply("DM으로 파일 올리는 링크를 보냈습니다. (작은 파일은 메시지에 첨부해서 `!올리기`)",
+                    mention_author=False)
+
+
+@bot.command(name="파일")
+async def files_command(ctx, *, name: str = ""):
+    reason = files_disabled_reason(ctx.guild)
+    if reason:
+        await ctx.reply(reason, mention_author=False)
+        return
+    if name:
+        row = find_file(ctx.guild.id, name)
+        if not row:
+            await ctx.reply(f"`{name}` 파일이 없습니다. `!파일`로 목록을 확인해 주세요.", mention_author=False)
+            return
+        await ctx.reply(file_line(row), mention_author=False)
+        return
+    text = file_list_text(ctx.guild.id)
+    if not text:
+        await ctx.reply("올린 파일이 없습니다. 파일을 첨부해서 `!올리기`를 해 보세요.", mention_author=False)
+        return
+    embed = discord.Embed(description=text, color=discord.Color.green())
+    embed.set_footer(text="!파일 <이름>으로 링크 보기 · 7일 후 자동 삭제")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="파일삭제")
+async def delete_file_command(ctx, *, name: str = ""):
+    reason = files_disabled_reason(ctx.guild)
+    if reason:
+        await ctx.reply(reason, mention_author=False)
+        return
+    if not name:
+        await ctx.reply("사용법: `!파일삭제 <이름>`", mention_author=False)
+        return
+    row = find_file(ctx.guild.id, name)
+    if not row:
+        await ctx.reply(f"`{name}` 파일이 없습니다. `!파일`로 목록을 확인해 주세요.", mention_author=False)
+        return
+    if not await can_manage_file(ctx.author, ctx.guild, row):
+        await ctx.reply("올린 사람이나 서버 관리 권한이 있는 사람만 지울 수 있습니다.", mention_author=False)
+        return
+    if not await remove_file(row):
+        await ctx.reply("지우지 못했습니다. 잠시 후 다시 시도해 주세요.", mention_author=False)
+        return
+    await ctx.reply(f"**{row['name']}** 파일을 삭제했습니다.", mention_author=False)
+
+
+@upload_command.error
+async def upload_command_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.reply(f"{math.ceil(error.retry_after)}초 후에 다시 시도해 주세요.", mention_author=False)
+    else:
+        await report_error(ctx, error)
+
+
+@tasks.loop(minutes=10)
+async def clean_files():
+    """Delete files older than 7 days (and unfinished browser uploads) from R2 and the list."""
+    try:
+        with connect_db() as conn:
+            rows = [dict(r) for r in conn.execute("SELECT id, key FROM files WHERE expires_at < ?", (time.time(),))]
+        if not rows:
+            return
+        if await storage.delete([r["key"] for r in rows]):
+            with connect_db() as conn:
+                conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
+                conn.commit()
+            print(f"만료된 파일 {len(rows)}개를 삭제했습니다.")
+    except Exception as exc:
+        print(f"파일 자동 삭제 오류: {type(exc).__name__}: {exc}")
+        notify_admin("파일 자동 삭제 오류", f"{type(exc).__name__}: {exc}", "", traceback.format_exc())
+
+
+@clean_files.before_loop
+async def before_clean_files():
+    await bot.wait_until_ready()
+
+
 # ---------------------------------------------------------------- /도움말 (buttons)
 
 HELP_CATEGORIES = {
     "uptime": ("🖥️", "서버 업타임", ["add", "uptime", "list", "delete"]),
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
+    "files": ("📁", "파일", ["upload", "bigupload", "files", "filedelete"]),
     "etc": ("🎲", "기타", ["fortune", "ilchim"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
@@ -1318,6 +1728,12 @@ HELP_COMMANDS = {
                "예: `!주소삭제 하이픽셀`"),
     "hypixel": ("Hypixel 전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
                 "예: `!H전적 hypixel bw`"),
+    "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부\n파일을 올리고 링크를 보냅니다. 사진·영상은 채팅창에서 바로 보입니다.\n"
+               "올린 파일은 Cloudflare R2 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
+    "bigupload": ("큰 파일", "!올리기", "`!올리기` (첨부 없이)\n디스코드에 첨부하기 어려운 큰 파일을 웹페이지에서 올립니다.\n"
+                  "올린 파일은 Cloudflare R2 저장소에 올라가며 **7일 후 자동으로 삭제**됩니다."),
+    "files": ("목록", "!파일", "`!파일 [이름]`\n이 서버에 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일 링크를 보냅니다."),
+    "filedelete": ("삭제", "!파일삭제", "`!파일삭제 <이름>`\n파일을 지웁니다. 올린 사람이나 서버 관리 권한이 있는 사람만 지울 수 있습니다."),
     "fortune": ("운세", "!운세", "`!운세`\n오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다."),
     "ilchim": ("일침", "!일침", "`!일침`\n정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다."),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
@@ -1333,7 +1749,8 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢"}  # plain emoji for command buttons without an uploaded icon
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "upload": "📤", "bigupload": "🗂️", "files": "📄",
+                      "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
 async def load_help_emojis():
@@ -1380,7 +1797,7 @@ def stats_wait_left(command, ctx):
     return math.ceil(retry_after) if retry_after else 0
 
 
-def help_message(page="home", selected=None, notice=None, details=None):
+def help_message(page="home", selected=None, notice=None, details=None, extra_items=()):
     """Embed and buttons for one page of the private /도움말 message.
     Everything private (lists, notices) is shown by editing this one message; only results meant
     for the channel (uptime, stats cards, ...) become separate public messages."""
@@ -1402,8 +1819,9 @@ def help_message(page="home", selected=None, notice=None, details=None):
             embed.title = "Maco"
         for key, (emoji, title, _) in HELP_CATEGORIES.items():
             button(f"page_{key}", title, emoji)
-        button("dm", "DM to Dev.", "✉️")
-        button("commands", "명령어 보기", "📋")
+        # A row holds 5 buttons: categories on the first, the rest on the second.
+        button("dm", "DM to Dev.", "✉️", row=1)
+        button("commands", "명령어 보기", "📋", row=1)
         return {"embed": embed, "view": view}
 
     emoji, title, keys = HELP_CATEGORIES[page]
@@ -1419,6 +1837,8 @@ def help_message(page="home", selected=None, notice=None, details=None):
         style = discord.ButtonStyle.success if key == selected else discord.ButtonStyle.secondary
         button(f"run_{key}", HELP_COMMANDS[key][0], help_emojis.get(key) or HELP_BUTTON_EMOJIS.get(key), style)
     button("home", "◀ 처음으로", style=discord.ButtonStyle.secondary, row=1)
+    for item in extra_items:
+        view.add_item(item)
     return {"embed": discord.Embed(title=title, description=text[:4096], color=color), "view": view}
 
 
@@ -1470,6 +1890,9 @@ async def help_open_page(interaction, page):
     if page == "uptime" and interaction.guild is None:
         await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
         return
+    if page == "files" and files_disabled_reason(interaction.guild):
+        await show_help(interaction, notice=files_disabled_reason(interaction.guild))
+        return
     await show_help(interaction, page=page)
 
 
@@ -1508,6 +1931,26 @@ async def help_run_delete(interaction):
         await show_help(interaction, page="uptime", selected="delete", notice=NO_SERVER_MESSAGE)
         return
     await interaction.response.send_modal(DeleteServerModal(servers))
+
+
+async def help_run_bigupload(interaction):
+    row, link = start_browser_upload(interaction.guild.id, interaction.channel.id, interaction.user.id)
+    await show_help(interaction, page="files", selected="bigupload", details=browser_upload_text(link),
+                    extra_items=[UploadDoneButton(row["id"])])
+
+
+async def help_run_files(interaction):
+    text = file_list_text(interaction.guild.id)
+    await show_help(interaction, page="files", selected="files",
+                    details=text, notice=None if text else "올린 파일이 없습니다.")
+
+
+async def help_run_filedelete(interaction):
+    files = guild_files(interaction.guild.id)
+    if not files:
+        await show_help(interaction, page="files", selected="filedelete", notice="올린 파일이 없습니다.")
+        return
+    await interaction.response.send_modal(FileDeleteModal(files))
 
 
 def help_run_random_line(key):
@@ -1649,12 +2092,68 @@ class ValorantModal(HelpModal):
         await run_from_help(ctx, run_valorant(ctx, name, tag, region))
 
 
+class UploadModal(HelpModal):
+    key = "upload"
+
+    def __init__(self):
+        super().__init__()
+        self.files = discord.ui.FileUpload(max_values=FILE_MAX_PER_MESSAGE)
+        self.file_name = discord.ui.TextInput(required=False, max_length=MAX_NAME_LENGTH, placeholder="비우면 파일 이름")
+        self.add_item(discord.ui.Label(text=f"파일 (최대 {FILE_MAX_PER_MESSAGE}개)", component=self.files))
+        self.add_item(discord.ui.Label(text="이름 (선택, 파일 1개일 때)", component=self.file_name))
+
+    async def on_submit(self, interaction):
+        if not self.files.values:
+            await self.reject(interaction, "파일을 골라 주세요.")
+            return
+        ctx = HelpContext(interaction, "올리기")
+        left = stats_wait_left(upload_command, ctx)
+        if left:
+            await self.reject(interaction, f"{left}초 후에 다시 시도해 주세요.")
+            return
+        ctx = await self.finish(interaction)
+        await run_from_help(ctx, upload_attachments(ctx, self.files.values, self.file_name.value))
+
+
+class FileDeleteModal(HelpModal):
+    key = "filedelete"
+
+    def __init__(self, files):
+        super().__init__()
+        self.file = discord.ui.Select(options=[
+            discord.SelectOption(label=f["name"][:100], value=str(f["id"]),
+                                 description=f"{human_size(f['size'])} · {datetime.fromtimestamp(f['uploaded_at']):%m/%d %H:%M} 올림")
+            for f in files[:25]
+        ])
+        self.add_item(discord.ui.Label(text="삭제할 파일", component=self.file))
+
+    async def on_submit(self, interaction):
+        chosen = self.file.values[0] if self.file.values else None
+        row = next((f for f in guild_files(interaction.guild.id) if str(f["id"]) == chosen), None)
+        if not row:
+            await self.reject(interaction, "이미 삭제된 파일입니다.")
+            return
+        if not await can_manage_file(interaction.user, interaction.guild, row):
+            await self.reject(interaction, "올린 사람이나 서버 관리 권한이 있는 사람만 지울 수 있습니다.")
+            return
+        if not await remove_file(row):
+            await self.reject(interaction, "지우지 못했습니다. 잠시 후 다시 시도해 주세요.")
+            return
+        ctx = await self.finish(interaction)
+        await ctx.reply(f"**{row['name']}** 파일을 삭제했습니다.")
+
+
 HELP_ACTIONS = {
     "home": lambda interaction: show_help(interaction),
     "commands": lambda interaction: show_help(interaction, page="commands"),
     "page_uptime": lambda interaction: help_open_page(interaction, "uptime"),
     "page_stats": lambda interaction: help_open_page(interaction, "stats"),
     "page_etc": lambda interaction: help_open_page(interaction, "etc"),
+    "page_files": lambda interaction: help_open_page(interaction, "files"),
+    "run_upload": help_open_form(UploadModal),
+    "run_bigupload": help_run_bigupload,
+    "run_files": help_run_files,
+    "run_filedelete": help_run_filedelete,
     "run_fortune": help_run_random_line("fortune"),
     "run_ilchim": help_run_random_line("ilchim"),
     "dm": help_dm_to_dev,
@@ -1673,8 +2172,10 @@ async def help_slash(interaction: discord.Interaction):
 
 
 async def setup_hook():
-    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton)
+    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton)
     await load_help_emojis()
+    if storage.configured():
+        await storage.setup_bucket()
     try:
         synced = await bot.tree.sync()
         print(f"슬래시 명령어 {len(synced)}개를 등록했습니다.")
