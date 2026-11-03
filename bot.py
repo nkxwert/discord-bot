@@ -982,10 +982,11 @@ async def valorant_lookup(name, tag, region, suggest=True, progress=None, where=
 class RiotIdChoice(discord.ui.View):
     """Buttons asking whether the user meant one of the similar Riot IDs."""
 
-    def __init__(self, author_id, accounts, region):
+    def __init__(self, author_id, accounts, region, header=None):
         super().__init__(timeout=60)
         self.author_id = author_id
         self.region = region
+        self.header = header  # "누구의 요청" line when started from /도움말, kept on every edit
         self.message = None
         for account in accounts:
             button = discord.ui.Button(label=f"{account['name']}#{account['tag']}", style=discord.ButtonStyle.primary)
@@ -1001,12 +1002,17 @@ class RiotIdChoice(discord.ui.View):
             return False
         return True
 
+    def text(self, content):
+        if not self.header:
+            return content
+        return f"{self.header}\n{content}" if content else self.header
+
     def choose(self, account):
         async def callback(interaction):
             self.stop()
             progress = Progress(VALORANT_STEPS)
-            await interaction.response.edit_message(content=progress.render(), view=None)
-            progress.attach(lambda text: interaction.edit_original_response(content=text))
+            await interaction.response.edit_message(content=self.text(progress.render()), view=None)
+            progress.attach(lambda text: interaction.edit_original_response(content=self.text(text)))
             where = describe_interaction(interaction, f"버튼: Riot ID 선택 ({account['query_name']}#{account['query_tag']})")
             try:
                 profile, error, _ = await valorant_lookup(
@@ -1014,23 +1020,23 @@ class RiotIdChoice(discord.ui.View):
                     suggest=False, progress=progress, where=where,
                 )
                 if error:
-                    await interaction.edit_original_response(content=error)
+                    await interaction.edit_original_response(content=self.text(error))
                     return
                 await progress.step("card")
                 image = await asyncio.to_thread(cards.valorant_card, profile)
                 await interaction.edit_original_response(
-                    content=None, attachments=[discord.File(image, filename="valorant.png")]
+                    content=self.text(None), attachments=[discord.File(image, filename="valorant.png")]
                 )
             except Exception as exc:
                 # Without this the message would stay on "불러오는 중입니다..." forever.
                 print(f"전적 버튼 오류: {type(exc).__name__}: {exc}")
                 notify_admin("전적 버튼 처리 중 오류", f"{type(exc).__name__}: {exc}", where, traceback.format_exc())
-                await interaction.edit_original_response(content="오류가 발생했습니다.")
+                await interaction.edit_original_response(content=self.text("오류가 발생했습니다."))
         return callback
 
     async def decline(self, interaction):
         self.stop()
-        await interaction.response.edit_message(content="알겠습니다. Riot ID를 다시 확인해 주세요.", view=None)
+        await interaction.response.edit_message(content=self.text("알겠습니다. Riot ID를 다시 확인해 주세요."), view=None)
 
     async def on_timeout(self):
         if self.message:
@@ -1062,7 +1068,7 @@ async def run_valorant(ctx, name, tag, region):
         ctx, valorant_lookup(name, tag, region, progress=progress, where=describe_ctx(ctx)), progress
     )
     if suggestions:
-        view = RiotIdChoice(ctx.author.id, suggestions, region)
+        view = RiotIdChoice(ctx.author.id, suggestions, region, getattr(ctx, "header", None))
         view.message = await send_result(ctx, notice, content=f"{error}\n혹시 아래 계정인가요?", view=view)
         return
     if error:
@@ -1553,7 +1559,9 @@ class UploadDoneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mac
             except discord.HTTPException:
                 channel = None
         message = f"<@{row['uploaded_by']}>님이 올린 파일\n\n" + file_message([done])
-        if channel is not None and interaction.channel and channel.id != interaction.channel.id:
+        # A plain channel message, not a follow-up: a follow-up to the private help message would read
+        # "원본 메시지가 삭제되었어요" once that message is closed.
+        if channel is not None:
             try:
                 await channel.send(message)
                 return None
@@ -1769,7 +1777,8 @@ async def load_help_emojis():
 
 class HelpContext:
     """Just enough of commands.Context for the ! command code to run from a /도움말 button.
-    Replies are public follow-up messages, so the result is visible in the channel like a ! command."""
+    Replies are plain public messages in the channel, starting with a small line naming who asked.
+    (A follow-up to the private help message would show "원본 메시지가 삭제되었어요" once that is closed.)"""
 
     def __init__(self, interaction, what):
         self.interaction = interaction
@@ -1778,10 +1787,39 @@ class HelpContext:
         self.channel = interaction.channel
         self.message = type("HelpMessage", (), {"content": f"/도움말 → {what}"})()  # for describe_ctx
         self.notice = None
+        self.header = f"-# {interaction.user.mention}님의 요청 · {what}"  # mentions never ping (allowed_mentions)
+
+    def with_header(self, content):
+        return f"{self.header}\n{content}" if content else self.header
 
     async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
-        extra = {k: v for k, v in {"content": content, "embed": embed, "file": file, "view": view}.items() if v is not None}
-        return await self.interaction.followup.send(wait=True, **extra)
+        extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
+        content = self.with_header(content)
+        try:
+            message = await self.channel.send(content, **extra)
+        except (discord.HTTPException, AttributeError):
+            # No permission to post in this channel (or no channel object): answer through the interaction.
+            if file is not None:
+                file.reset()
+            message = await self.interaction.followup.send(content, wait=True, **extra)
+        return HeaderMessage(message, self)
+
+
+class HeaderMessage:
+    """A sent message whose later edits (progress -> result) keep the "누구의 요청" line on top."""
+
+    def __init__(self, message, ctx):
+        self._message = message
+        self._ctx = ctx
+
+    def __getattr__(self, name):
+        return getattr(self._message, name)
+
+    async def edit(self, **changes):
+        if "content" in changes:
+            changes["content"] = self._ctx.with_header(changes["content"])
+        await self._message.edit(**changes)
+        return self
 
 
 async def run_from_help(ctx, awaitable):
@@ -1956,7 +1994,7 @@ async def help_run_filedelete(interaction):
 def help_run_random_line(key):
     async def handler(interaction):
         await show_help(interaction, page="etc", selected=key)
-        await interaction.followup.send(random_line(key))
+        await HelpContext(interaction, HELP_COMMANDS[key][0]).reply(random_line(key))
     return handler
 
 
