@@ -9,6 +9,9 @@ from urllib.parse import quote
 import aiohttp
 
 CACHE_SECONDS = 300
+PARTIAL_CACHE_SECONDS = 30  # a Valorant result missing its matches is retried soon
+MATCHES_TIMEOUT_SECONDS = 20  # stored-matches is often slower than the other endpoints
+MATCHES_RETRY_TIMEOUT_SECONDS = 15
 MAX_CACHE_ENTRIES = 500
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 USER_AGENT = "discord-minecraft-uptime-bot"
@@ -61,23 +64,25 @@ def _api_cause(data):
     return ""
 
 
-async def _cached(key, loader):
+async def _cached(key, loader, ttl=None):
+    """Cache loader()'s value; ttl(value) may shorten how long (in seconds) a given value is kept."""
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < CACHE_SECONDS:
+    if hit and now < hit[0]:
         return hit[1]
     value = await loader()
     if len(_cache) >= MAX_CACHE_ENTRIES:
-        for old_key in [k for k, (t, _) in _cache.items() if now - t >= CACHE_SECONDS]:
+        for old_key in [k for k, (expires, _) in _cache.items() if now >= expires]:
             del _cache[old_key]
-    _cache[key] = (now, value)
+    _cache[key] = (now + (ttl(value) if ttl else CACHE_SECONDS), value)
     return value
 
 
-async def _request(url, *, headers=None, params=None, raw=False):
+async def _request(url, *, headers=None, params=None, raw=False, timeout=None):
+    timeout = timeout or REQUEST_TIMEOUT
     try:
         async with aiohttp.ClientSession(
-            timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
+            timeout=timeout, headers={"User-Agent": USER_AGENT}
         ) as session:
             async with session.get(url, headers=headers, params=params) as response:
                 if raw:
@@ -87,11 +92,17 @@ async def _request(url, *, headers=None, params=None, raw=False):
                 return response.status, await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
         host = url.split("/")[2] if "://" in url else url
-        print(f"외부 API 요청 실패 ({url.split('?')[0]}): {type(exc).__name__}: {exc}")
-        raise ServiceError(
+        if isinstance(exc, asyncio.TimeoutError):
+            reason = f"응답 시간 초과 ({timeout.total:.0f}초)"  # TimeoutError has no message of its own
+        else:
+            reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        print(f"외부 API 요청 실패 ({url.split('?')[0]}): {reason}")
+        error = ServiceError(
             "외부 서비스에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-            f"{host} 연결 실패: {type(exc).__name__}",
-        ) from exc
+            f"{host} 연결 실패: {reason}",
+        )
+        error.timed_out = isinstance(exc, asyncio.TimeoutError)
+        raise error from exc
 
 
 async def _report(progress, step):
@@ -366,14 +377,14 @@ def parse_riot_id(text):
     return name, tag, region
 
 
-async def _henrik(path):
+async def _henrik(path, timeout=None):
     key = os.getenv("HENRIK_API_KEY", "").strip()
     if not key:
         raise ServiceError(
             "HenrikDev API 키가 설정되지 않았습니다. 봇 관리자에게 알렸습니다.",
             "HENRIK_API_KEY가 설정되지 않음",
         )
-    status, data = await _request(HENRIK_API_URL + path, headers={"Authorization": key})
+    status, data = await _request(HENRIK_API_URL + path, headers={"Authorization": key}, timeout=timeout)
     cause = _api_cause(data)
     if status == 404:
         raise PlayerNotFound("플레이어를 찾을 수 없습니다. Riot ID를 확인해 주세요.")
@@ -523,7 +534,7 @@ async def valorant_profile(name, tag, region=None, progress=None):
         base = f"{region}/{quote(name, safe='')}/{quote(tag, safe='')}"
         mmr, matches = await asyncio.gather(
             _henrik(f"v2/mmr/{base}"),
-            _henrik(f"v1/stored-matches/{base}?size={MATCH_COUNT}"),
+            _recent_matches(base),
             return_exceptions=True,
         )
         if isinstance(mmr, PlayerNotFound):
@@ -531,7 +542,15 @@ async def valorant_profile(name, tag, region=None, progress=None):
         elif isinstance(mmr, BaseException):
             raise mmr
         mmr = mmr or {}
-        matches = [] if isinstance(matches, BaseException) else matches or []
+        # Recent matches are optional: the card still shows the rank, and says the matches couldn't be loaded.
+        matches_error = None
+        if isinstance(matches, PlayerNotFound):
+            matches = []  # no stored matches: really nothing to show
+        elif isinstance(matches, BaseException):
+            matches_error = matches if isinstance(matches, ServiceError) else ServiceError(
+                "최근 경기를 불러오지 못했습니다.", f"HenrikDev stored-matches 오류: {type(matches).__name__}")
+            matches = []
+        matches = matches or []
         summaries = [match_summary(m) for m in matches[:MATCH_COUNT] if isinstance(m, dict)]
         shown = summaries[:MATCHES_SHOWN]
         current = mmr.get("current_data") or {}
@@ -565,6 +584,21 @@ async def valorant_profile(name, tag, region=None, progress=None):
             "peak_season": highest.get("season"),
             "matches": shown,
             "totals": match_totals(summaries),
+            "matches_error": matches_error,  # set when the matches failed to load (not when there are none)
         }
 
-    return await _cached(("valorant", region, name.lower(), tag.lower()), load)
+    return await _cached(
+        ("valorant", region, name.lower(), tag.lower()), load,
+        ttl=lambda profile: PARTIAL_CACHE_SECONDS if profile.get("matches_error") else CACHE_SECONDS,
+    )
+
+
+async def _recent_matches(base):
+    """stored-matches with a longer timeout and one retry when it times out (HenrikDev is often slow here)."""
+    path = f"v1/stored-matches/{base}?size={MATCH_COUNT}"
+    try:
+        return await _henrik(path, aiohttp.ClientTimeout(total=MATCHES_TIMEOUT_SECONDS))
+    except ServiceError as exc:
+        if not getattr(exc, "timed_out", False):
+            raise
+    return await _henrik(path, aiohttp.ClientTimeout(total=MATCHES_RETRY_TIMEOUT_SECONDS))

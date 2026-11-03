@@ -318,13 +318,18 @@ def valorant_card(profile):
         ])
     else:
         card.panel((MARGIN, 308, WIDTH - MARGIN, 398))
-        card.text(WIDTH / 2, 340, "§7집계할 경기 기록이 없습니다", 22)
+        if profile.get("matches_error"):
+            card.text(WIDTH / 2, 328, "§c최근 경기를 불러오지 못했습니다", 22)
+            card.text(WIDTH / 2, 362, "§7HenrikDev 응답 지연 · 잠시 후 다시 조회해 주세요", 18)
+        else:
+            card.text(WIDTH / 2, 340, "§7집계할 경기 기록이 없습니다", 22)
 
     # Recent matches.
     card.text(MARGIN + 4, 414, "§7최근 경기", 18, align="left")
     if not matches:
         card.panel((MARGIN, rows_top, WIDTH - MARGIN, rows_top + row_height))
-        card.text(WIDTH / 2, rows_top + 20, "§7기록이 없습니다", 22)
+        card.text(WIDTH / 2, rows_top + 20,
+                  "§7불러오지 못했습니다" if profile.get("matches_error") else "§7기록이 없습니다", 22)
     for i, match in enumerate(matches):
         y = rows_top + i * (row_height + 8)
         card.panel((MARGIN, y, WIDTH - MARGIN, y + row_height))
