@@ -535,8 +535,8 @@ async def help_command(ctx):
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
     embed.add_field(name="​", value="─" * 24, inline=False)
     embed.add_field(
-        name="/개발자소통",
-        value="개발자에게 메시지를 보냅니다.\n(슬래시 명령어가 안 보이면 `!개발자소통`)",
+        name="!개발자소통",
+        value="개발자에게 메시지를 보냅니다.\n(`/도움말`의 ✉️ DM to Dev. 버튼으로도 보낼 수 있습니다)",
         inline=False,
     )
     await ctx.reply(embed=embed, mention_author=False)
@@ -1197,15 +1197,6 @@ class UserAnswerButton(discord.ui.DynamicItem[discord.ui.Button], template=r"dev
         await interaction.response.send_modal(ReplyModal())
 
 
-@bot.tree.command(name="개발자소통", description="개발자에게 메시지를 보냅니다 (나만 보이는 입력 창)")
-async def feedback_slash(interaction: discord.Interaction):
-    left = feedback_wait_left(interaction.user.id)
-    if left:
-        await interaction.response.send_message(f"{left}초 후에 다시 보낼 수 있습니다.", ephemeral=True)
-        return
-    await interaction.response.send_modal(FeedbackModal())
-
-
 @bot.tree.error
 async def on_app_command_error(interaction, error):
     original = getattr(error, "original", error)
@@ -1236,7 +1227,7 @@ async def feedback_prefix(ctx):
         )
         return
     if ctx.guild:
-        await ctx.reply("DM을 확인해 주세요. (`/개발자소통`을 쓰면 나만 보이는 입력 창으로 보낼 수 있습니다)",
+        await ctx.reply("DM을 확인해 주세요. (`/도움말`의 ✉️ DM to Dev.를 쓰면 나만 보이는 입력 창으로 보낼 수 있습니다)",
                         mention_author=False)
 
     token = object()  # a newer !개발자소통 replaces this prompt
@@ -1286,12 +1277,14 @@ HELP_COMMANDS = {
     "list": ("주소", "!주소", "`!주소`\n등록된 서버 목록을 봅니다."),
     "delete": ("주소삭제", "!주소삭제", "`!주소삭제 <이름>`\n서버와 업타임 기록을 삭제합니다. 서버 관리 권한이 필요합니다.\n"
                "예: `!주소삭제 하이픽셀`"),
-    "hypixel": ("H전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
+    "hypixel": ("Hypixel 전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
                 "예: `!H전적 hypixel bw`"),
-    "valorant": ("V전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
-                 "예: `!V전적 snowe #UIpop`"),
+    "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
+                 "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
 HELP_TIMEOUT_SECONDS = 300
+HELP_BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "images", "help_banner.jpg")
+HELP_BANNER_NAME = "maco.jpg"
 
 
 class HelpContext:
@@ -1325,24 +1318,43 @@ def stats_wait_left(command, ctx):
 
 
 class HelpView(discord.ui.View):
-    """The private /도움말 message: categories -> command buttons that run the command."""
+    """The private /도움말 message: categories -> command buttons that run the command.
+    Everything private (lists, notices) is shown by editing this one message; only results meant
+    for the channel (uptime, stats cards, ...) become separate public messages."""
 
     def __init__(self, interaction):
         super().__init__(timeout=HELP_TIMEOUT_SECONDS)
         self.last_interaction = interaction  # edits the message when the buttons time out
         self.page = "home"
         self.selected = None
+        self.notice = None  # one-off line such as "서버 관리 권한이 필요합니다."
+        self.details = None  # extra private content, such as the 주소 list
         self.build()
 
     def embed(self):
+        color = discord.Color.green()
         if self.page == "home":
-            return discord.Embed(title="Maco", color=discord.Color.green())
+            embed = discord.Embed(description=self.notice, color=color)
+            if os.path.exists(HELP_BANNER_PATH):
+                embed.set_image(url=f"attachment://{HELP_BANNER_NAME}")
+            else:
+                embed.title = "Maco"
+            return embed
         emoji, title, _ = HELP_CATEGORIES[self.page]
         if self.selected:
             _, command, text = HELP_COMMANDS[self.selected]
-            return discord.Embed(title=f"{emoji} {title} · {command}", description=text, color=discord.Color.green())
-        return discord.Embed(title=f"{emoji} {title}", description="버튼을 누르면 바로 사용할 수 있습니다.",
-                             color=discord.Color.green())
+            title = f"{emoji} {title} · {command}"
+        else:
+            title, text = f"{emoji} {title}", "버튼을 누르면 바로 사용할 수 있습니다."
+        for extra in (self.details, self.notice):
+            if extra:
+                text += f"\n\n{extra}"
+        return discord.Embed(title=title, description=text[:4096], color=color)
+
+    def files(self):
+        if self.page == "home" and os.path.exists(HELP_BANNER_PATH):
+            return [discord.File(HELP_BANNER_PATH, filename=HELP_BANNER_NAME)]
+        return []
 
     def build(self):
         self.clear_items()
@@ -1361,16 +1373,28 @@ class HelpView(discord.ui.View):
         button.callback = callback
         self.add_item(button)
 
+    async def send(self, interaction):
+        files = self.files()
+        extra = {"file": files[0]} if files else {}
+        await interaction.response.send_message(embed=self.embed(), view=self, ephemeral=True, **extra)
+
     async def interaction_check(self, interaction):
         self.last_interaction = interaction
         return True
 
-    async def show(self, interaction, page=None, selected=None):
-        """Switch the help message to another page in place."""
-        self.page = page or self.page
-        self.selected = selected
+    async def show(self, interaction, notice=None, details=None, **state):
+        """Redraw this message in place. `page` opens a category, `selected` marks a command."""
+        if "page" in state:
+            self.page, self.selected = state["page"], None
+        if "selected" in state:
+            self.selected = state["selected"]
+        self.notice, self.details = notice, details
         self.build()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        changes = {"embed": self.embed(), "view": self, "attachments": self.files()}
+        if interaction.response.is_done():
+            await interaction.edit_original_response(**changes)
+        else:
+            await interaction.response.edit_message(**changes)
 
     async def on_timeout(self):
         for item in self.children:
@@ -1393,7 +1417,7 @@ class HelpView(discord.ui.View):
     def open_category(self, key):
         async def callback(interaction):
             if key == "uptime" and interaction.guild is None:
-                await interaction.response.send_message(SERVER_ONLY_MESSAGE, ephemeral=True)
+                await self.show(interaction, notice=SERVER_ONLY_MESSAGE)
                 return
             await self.show(interaction, page=key)
         return callback
@@ -1401,9 +1425,9 @@ class HelpView(discord.ui.View):
     async def dm_to_dev(self, interaction):
         left = feedback_wait_left(interaction.user.id)
         if left:
-            await interaction.response.send_message(f"{left}초 후에 다시 보낼 수 있습니다.", ephemeral=True)
+            await self.show(interaction, notice=f"{left}초 후에 다시 보낼 수 있습니다.")
             return
-        await interaction.response.send_modal(FeedbackModal())
+        await interaction.response.send_modal(HelpFeedbackModal(self))
 
     async def go_home(self, interaction):
         await self.show(interaction, page="home")
@@ -1414,30 +1438,28 @@ class HelpView(discord.ui.View):
         await interaction.response.send_modal(AddServerModal(self))
 
     async def run_uptime(self, interaction):
-        await self.show(interaction, selected="uptime")
         if not guild_servers(interaction.guild.id):
-            await interaction.followup.send(NO_SERVER_MESSAGE, ephemeral=True)
+            await self.show(interaction, selected="uptime", notice=NO_SERVER_MESSAGE)
             return
+        await self.show(interaction, selected="uptime")
         ctx = HelpContext(interaction, "업타임")
         await run_from_help(ctx, uptime.callback(ctx))
 
     async def run_list(self, interaction):
-        await self.show(interaction, selected="list")
         servers = guild_servers(interaction.guild.id)
         if not servers:
-            await interaction.followup.send(NO_SERVER_MESSAGE, ephemeral=True)
+            await self.show(interaction, selected="list", notice=NO_SERVER_MESSAGE)
             return
-        lines = [f"• **{s['name']}** — `{s['address']}`" for s in servers]
-        embed = discord.Embed(title="등록된 서버", description="\n".join(lines), color=discord.Color.green())
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        lines = "\n".join(f"• **{s['name']}** — `{s['address']}`" for s in servers)
+        await self.show(interaction, selected="list", details=f"**등록된 서버**\n{lines}")
 
     async def run_delete(self, interaction):
         if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+            await self.show(interaction, selected="delete", notice="서버 관리 권한이 필요합니다.")
             return
         servers = guild_servers(interaction.guild.id)
         if not servers:
-            await interaction.response.send_message(NO_SERVER_MESSAGE, ephemeral=True)
+            await self.show(interaction, selected="delete", notice=NO_SERVER_MESSAGE)
             return
         await interaction.response.send_modal(DeleteServerModal(self, servers))
 
@@ -1446,6 +1468,25 @@ class HelpView(discord.ui.View):
 
     async def run_valorant(self, interaction):
         await interaction.response.send_modal(ValorantModal(self))
+
+
+class HelpFeedbackModal(FeedbackModal):
+    """The developer form opened from /도움말; the outcome replaces the help message instead of a new one."""
+
+    def __init__(self, help_view):
+        super().__init__()
+        self.help_view = help_view
+
+    async def on_submit(self, interaction):
+        self.help_view.last_interaction = interaction
+        await interaction.response.defer()  # photos can take a while; keeps the help message as it is
+        kind = self.kind.values[0] if self.kind.values else "기타"
+        photos = await collect_photos(self.photos.values)
+        message = await finish_feedback(
+            interaction.user, f"[{kind}] {self.subject.value}", self.body.value,
+            describe_place(interaction.guild, interaction.channel), photos,
+        )
+        await self.help_view.show(interaction, notice=message)
 
 
 class HelpModal(SafeModal):
@@ -1457,6 +1498,11 @@ class HelpModal(SafeModal):
         self.help_view = help_view
         self.key = key
         self.add_item(discord.ui.TextDisplay(text))
+
+    async def reject(self, interaction, notice):
+        """Show why the input can't be used on the help message, without posting anything."""
+        self.help_view.last_interaction = interaction
+        await self.help_view.show(interaction, selected=self.key, notice=notice)
 
     async def finish(self, interaction):
         """Show this command's description on the help message, then the result follows publicly."""
@@ -1477,7 +1523,7 @@ class AddServerModal(HelpModal):
         try:
             address, name = check_new_server(interaction.guild.id, self.address.value, self.server_name.value)
         except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await self.reject(interaction, str(exc))
             return
         ctx = await self.finish(interaction)
         await run_from_help(ctx, register_server(ctx, address, name))
@@ -1494,12 +1540,12 @@ class DeleteServerModal(HelpModal):
 
     async def on_submit(self, interaction):
         if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+            await self.reject(interaction, "서버 관리 권한이 필요합니다.")
             return
         chosen = self.server.values[0] if self.server.values else None
         server = next((s for s in guild_servers(interaction.guild.id) if str(s["id"]) == chosen), None)
         if not server:
-            await interaction.response.send_message("이미 삭제된 서버입니다.", ephemeral=True)
+            await self.reject(interaction, "이미 삭제된 서버입니다.")
             return
         remove_server(server["id"])
         ctx = await self.finish(interaction)
@@ -1519,10 +1565,10 @@ class HypixelModal(HelpModal):
         self.add_item(discord.ui.Label(text="유형", component=self.game))
 
     async def on_submit(self, interaction):
-        ctx = HelpContext(interaction, "H전적")
+        ctx = HelpContext(interaction, "Hypixel 전적")
         left = stats_wait_left(hypixel_stats, ctx)
         if left:
-            await interaction.response.send_message(f"{left}초 후에 다시 시도해 주세요.", ephemeral=True)
+            await self.reject(interaction, f"{left}초 후에 다시 시도해 주세요.")
             return
         game = self.game.values[0] if self.game.values else "all"
         ctx = await self.finish(interaction)
@@ -1533,27 +1579,26 @@ class ValorantModal(HelpModal):
     def __init__(self, help_view):
         super().__init__(help_view, "valorant")
         self.riot_id = discord.ui.TextInput(max_length=40, placeholder="snowe #UIpop")
-        self.add_item(discord.ui.Label(text="이름#태그", component=self.riot_id))
+        self.add_item(discord.ui.Label(text="이름#태그 (지역은 선택)", component=self.riot_id))
 
     async def on_submit(self, interaction):
         try:
             name, tag, region = stats.parse_riot_id(self.riot_id.value)
         except stats.StatsError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await self.reject(interaction, str(exc))
             return
-        ctx = HelpContext(interaction, "V전적")
+        ctx = HelpContext(interaction, "Valorant 전적")
         left = stats_wait_left(valorant_stats, ctx)
         if left:
-            await interaction.response.send_message(f"{left}초 후에 다시 시도해 주세요.", ephemeral=True)
+            await self.reject(interaction, f"{left}초 후에 다시 시도해 주세요.")
             return
         ctx = await self.finish(interaction)
         await run_from_help(ctx, run_valorant(ctx, name, tag, region))
 
 
-@bot.tree.command(name="도움말", description="버튼으로 명령어를 보고 바로 사용합니다 (나만 보임)")
+@bot.tree.command(name="도움말", description="버튼으로 명령어를 보고 바로 사용합니다")
 async def help_slash(interaction: discord.Interaction):
-    view = HelpView(interaction)
-    await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+    await HelpView(interaction).send(interaction)
 
 
 async def setup_hook():
