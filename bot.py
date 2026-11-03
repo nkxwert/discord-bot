@@ -1290,6 +1290,25 @@ HELP_COMMANDS = {
 HELP_TIMEOUT_SECONDS = 300
 HELP_BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "images", "help_banner.jpg")
 HELP_BANNER_NAME = "maco.jpg"
+# Icons left of the stats buttons: help command key -> image, uploaded once as the app's own emojis
+# (usable in every server without being added there). Filled by load_help_emojis() at startup.
+HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
+HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
+help_emojis = {}
+
+
+async def load_help_emojis():
+    """Find (or upload, the first time) the button icons. Without them the buttons just have no icon."""
+    try:
+        existing = {e.name: e for e in await bot.fetch_application_emojis()}
+        for key, filename in HELP_EMOJI_FILES.items():
+            name = f"maco_{key}"
+            if name not in existing:
+                with open(os.path.join(HELP_EMOJI_DIR, filename), "rb") as f:
+                    existing[name] = await bot.create_application_emoji(name=name, image=f.read())
+            help_emojis[key] = existing[name]
+    except (discord.HTTPException, discord.errors.MissingApplicationID, OSError) as exc:
+        print(f"버튼 아이콘 준비 실패: {type(exc).__name__}: {exc}")
 
 
 class HelpContext:
@@ -1376,7 +1395,7 @@ class HelpView(discord.ui.View):
             return
         for key in HELP_CATEGORIES[self.page][2]:
             style = discord.ButtonStyle.success if key == self.selected else discord.ButtonStyle.secondary
-            self.add_button(HELP_COMMANDS[key][0], None, style, getattr(self, f"run_{key}"))
+            self.add_button(HELP_COMMANDS[key][0], help_emojis.get(key), style, getattr(self, f"run_{key}"))
         self.add_button("◀ 처음으로", None, discord.ButtonStyle.secondary, self.go_home, row=1)
 
     def add_button(self, label, emoji, style, callback, row=0):
@@ -1617,6 +1636,7 @@ async def help_slash(interaction: discord.Interaction):
 
 async def setup_hook():
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton)
+    await load_help_emojis()
     try:
         synced = await bot.tree.sync()
         print(f"슬래시 명령어 {len(synced)}개를 등록했습니다.")
