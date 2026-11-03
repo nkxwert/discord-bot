@@ -46,7 +46,8 @@ S3 호환 저장소라면 어디든 쓸 수 있습니다. 아래는 Backblaze B2
    STORAGE_SECRET_ACCESS_KEY=applicationKey
    STORAGE_BUCKET=버킷이름
    ```
-- 봇이 켜질 때 큰 파일 업로드 페이지(`assets/upload.html`)를 버킷에 올립니다. 비공개 버킷에서는 페이지와 업로드가 같은 주소라 CORS 설정이 필요 없습니다.
+- 봇이 켜질 때 큰 파일 업로드 페이지(`assets/upload.html`)를 버킷에 올리고 CORS 규칙을 설정합니다. 브라우저는 같은 주소에 올릴 때도 `Origin`을 보내고 B2는 그때 CORS 규칙을 확인하기 때문에, 비공개 버킷에도 필요합니다.
+- `£DB 테스트`로 봇 업로드·서명 링크·웹 업로드(CORS)가 되는지 실제로 확인할 수 있습니다. "CORS 규칙 설정"이 🔴이면(키에 버킷 설정 권한이 없는 경우) B2 웹사이트에서 직접 넣어 주세요: Buckets → 버킷의 **CORS Rules** → **Custom Rules** → 허용 주소에 `https://s3.us-west-004.backblazeb2.com`(내 Endpoint), **S3 Compatible API** 선택, 메서드 PUT·GET·HEAD, 헤더 `*`.
 - B2 무료 범위: 저장 10GB, 다운로드는 저장량의 3배까지, 하루 다운로드 요청 2,500회 등. 카드가 없으면 넘었을 때 요금 대신 막힙니다.
 - 다른 저장소: 공개 버킷을 쓰려면 `STORAGE_PUBLIC_URL`에 공개 주소를 넣습니다(이때 CORS가 필요하며 봇이 설정을 시도합니다). Cloudflare R2는 예전 설정(`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_URL`)도 그대로 동작합니다.
 - 사진·영상·음악은 바로 보이게, 그 밖의 파일(HTML 등)은 열리지 않고 다운로드만 되게 저장합니다.

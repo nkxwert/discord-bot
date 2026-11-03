@@ -80,9 +80,11 @@
         return;
       }
       const code = (/<Code>([^<]+)<\/Code>/.exec(request.responseText || "") || [])[1];
+      const detail = (/<Message>([^<]*)<\/Message>/.exec(request.responseText || "") || [])[1];
       const reason = code === "AccessDenied" || code === "SignatureDoesNotMatch" || code === "RequestExpired"
         ? "링크가 만료되었거나 올바르지 않습니다(10분)." : "저장소가 업로드를 거절했습니다.";
-      say(reason + " 디스코드에서 링크를 다시 받아 주세요. (오류: HTTP " + request.status + (code ? " " + code : "") + ")", true);
+      say(reason + " 디스코드에서 링크를 다시 받아 주세요. (오류: HTTP " + request.status + (code ? " " + code : "")
+          + (detail ? " — " + detail : "") + ")", true);
     };
     request.onerror = () => say("올리지 못했습니다. 인터넷 연결을 확인하고 디스코드에서 링크를 다시 받아 주세요.", true);
     request.send(file);

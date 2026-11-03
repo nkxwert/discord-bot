@@ -557,6 +557,7 @@ OWNER_COMMANDS = [
     ("£DB 서버삭제 <서버ID>", "그 서버에 올라간 파일을 전부 지웁니다. 확인 버튼을 한 번 더 누릅니다."),
     ("£DB 기간 [기간]", "자동 삭제 기간을 보거나 바꿉니다. 새로 올리는 파일부터 적용됩니다. (예: `£DB 기간 3일`, `£DB 기간 12시간`)"),
     ("£DB 정리", "기간이 지난 파일을 바로 지우고, 목록에 없이 저장소에만 남은 파일도 정리합니다."),
+    ("£DB 테스트", "저장소에 실제로 시험 업로드를 해서 봇 업로드·서명 링크·웹 업로드(CORS)가 되는지 하나씩 확인합니다."),
     ("£DB 관리자 [추가|삭제] [사용자]", "파일 관리자 목록을 보거나 바꿉니다. 파일 관리자는 모든 사람의 파일을 보고 지울 수 있습니다. "
                                     "봇 관리자는 항상 포함됩니다. (예: `£DB 관리자 추가 @닉네임`)"),
 ]
@@ -595,7 +596,8 @@ async def owner_db(message, args):
         await message.reply(embed=embed, mention_author=False)
         return
     handlers = {"파일": owner_db_files, "삭제": owner_db_delete, "서버삭제": owner_db_delete_guild,
-                "기간": owner_db_retention, "정리": owner_db_cleanup, "관리자": owner_db_admins}
+                "기간": owner_db_retention, "정리": owner_db_cleanup, "관리자": owner_db_admins,
+                "테스트": owner_db_test}
     handler = handlers.get(sub)
     if handler is None:
         await message.reply("알 수 없는 명령어입니다. `£도움말`을 확인해 주세요.", mention_author=False)
@@ -748,6 +750,16 @@ async def owner_db_retention(message, args):
     await message.reply(f"자동 삭제 기간을 **{current} → {human_duration(seconds)}**(으)로 바꿨습니다. "
                         "새로 올리는 파일부터 적용되며, 이미 올라간 파일은 원래 기간대로 지워집니다.",
                         mention_author=False)
+
+
+async def owner_db_test(message, args):
+    async with message.channel.typing():
+        results = await storage.self_test()
+    lines = [f"{'🟢' if ok else '🔴'} **{label}** · {detail[:300]}" for label, ok, detail in results]
+    embed = discord.Embed(title="저장소 시험", description="\n".join(lines)[:4000],
+                          color=discord.Color.green() if all(ok for _, ok, _ in results) else discord.Color.red())
+    embed.set_footer(text="시험용 파일은 바로 지웁니다")
+    await message.reply(embed=embed, mention_author=False)
 
 
 async def owner_db_admins(message, args):
