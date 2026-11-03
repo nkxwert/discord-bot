@@ -195,9 +195,19 @@ def clean_filename(name):
     return name
 
 
+def key_filename(filename):
+    """ASCII form of the filename for the storage key. Korean letters would be percent-encoded and make
+    links far longer (Discord link buttons allow 512 characters); the original name is kept in the list
+    and in Content-Disposition, so downloads still get it. The extension stays so videos play."""
+    stem, extension = os.path.splitext(clean_filename(filename))
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-_")[:40] or "file"
+    extension = re.sub(r"[^A-Za-z0-9.]", "", extension)[:10].lower()
+    return stem + extension
+
+
 def new_key(guild_id, filename):
     """Random part so links can't be guessed; the filename stays last so the link ends in .mp4 etc."""
-    return f"files/{guild_id or 'dm'}/{secrets.token_urlsafe(9)}/{clean_filename(filename)}"
+    return f"files/{guild_id or 'dm'}/{secrets.token_urlsafe(9)}/{key_filename(filename)}"
 
 
 def link(key, seconds=MAX_LINK_SECONDS):
@@ -218,12 +228,10 @@ def guess_type(filename):
 def stored_headers(filename, content_type=None):
     """Content-Type / Content-Disposition to store: inline for safe media, a forced download otherwise."""
     content_type = (content_type or guess_type(filename)).split(";")[0].strip().lower()
+    name = quote(clean_filename(filename))
     if content_type in INLINE_TYPES:
-        return {"Content-Type": content_type}
-    return {
-        "Content-Type": "application/octet-stream",
-        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(clean_filename(filename))}",
-    }
+        return {"Content-Type": content_type, "Content-Disposition": f"inline; filename*=UTF-8''{name}"}
+    return {"Content-Type": "application/octet-stream", "Content-Disposition": f"attachment; filename*=UTF-8''{name}"}
 
 
 def is_inline(content_type):
@@ -331,13 +339,13 @@ async def finish_browser_upload(temp_key, filename, content_type, size):
             if converted:
                 path, filename, size, cleanup = converted
                 try:
-                    key = f"{folder}/{clean_filename(filename)}"
+                    key = f"{folder}/{key_filename(filename)}"
                     stored_type = await put_path(key, path, filename)
                 finally:
                     cleanup()
                 await delete([temp_key])
                 return key, stored_type, size, filename
-        key = f"{folder}/{clean_filename(filename)}"
+        key = f"{folder}/{key_filename(filename)}"
         stored_type = await copy(temp_key, key, filename, content_type)
         await delete([temp_key])
         return key, stored_type, size, filename
