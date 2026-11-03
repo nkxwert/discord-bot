@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import time
 from urllib.parse import quote, unquote
 
 from dotenv import load_dotenv
@@ -222,6 +223,57 @@ def presigned_put(key):
     return client().generate_presigned_url(
         "put_object", Params={"Bucket": BUCKET, "Key": key}, ExpiresIn=PRESIGN_SECONDS,
     )
+
+
+def describe():
+    """Where files go, for £DB: (host, bucket, link mode)."""
+    host = re.sub(r"^https?://", "", ENDPOINT).split("/")[0]
+    return host, BUCKET, "공개 주소" if PUBLIC_URL else "비공개 + 7일 서명 링크"
+
+
+def _ping():
+    start = time.perf_counter()
+    try:
+        client().head_bucket(Bucket=BUCKET)
+    except Exception:
+        # Some keys may not allow HeadBucket; listing one object proves the connection as well.
+        client().list_objects_v2(Bucket=BUCKET, MaxKeys=1)
+    return (time.perf_counter() - start) * 1000
+
+
+async def ping():
+    """(milliseconds, None) if the bucket answers, else (None, error text)."""
+    try:
+        return await asyncio.to_thread(_ping), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
+def _bucket_usage(max_pages):
+    count = size = 0
+    token = None
+    for _ in range(max_pages):
+        params = {"Bucket": BUCKET, "Prefix": "files/", "MaxKeys": 1000}
+        if token:
+            params["ContinuationToken"] = token
+        page = client().list_objects_v2(**params)
+        for item in page.get("Contents", []):
+            count += 1
+            size += item["Size"]
+        if not page.get("IsTruncated"):
+            return count, size, False
+        token = page.get("NextContinuationToken")
+    return count, size, True
+
+
+async def bucket_usage(max_pages=10):
+    """(object count, bytes, more_left) actually in the bucket under files/, or None on failure.
+    Each page is one list request (B2 counts it against the daily free transactions), so it is capped."""
+    try:
+        return await asyncio.to_thread(_bucket_usage, max_pages)
+    except Exception as exc:
+        print(f"저장소 사용량 확인 실패: {type(exc).__name__}: {exc}")
+        return None
 
 
 async def setup_bucket():
