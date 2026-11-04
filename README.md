@@ -18,6 +18,7 @@
 - 올린 파일은 **7일(관리자가 `£DB 기간`으로 변경 가능) 후 자동 삭제**되며, 올릴 때마다 안내함
 - `!운세` — 오늘의 운세 (칠 때마다 무작위). 문장은 `fortunes.txt`에 한 줄에 하나씩 있으며, 메모장으로 고치면 재시작 없이 바로 적용
 - `!일침` — 정신이 번쩍 드는 한마디 (칠 때마다 무작위). 문장은 `ilchim.txt`
+- `/글자콘 글자:<글자> [메시지:<메시지>]` — 글자를 디시 글자콘처럼 그림(흰 글자·검은 테두리, 투명 배경)으로 만들어 올림. 최대 30자, 길면 여러 줄로 나눔. `/unflip`처럼 메시지를 같이 넣을 수 있음. 이모지는 그릴 수 없어 빠짐
 - `!도움말` — 명령어 안내
 - `/도움말` — 나만 보이는 버튼 도움말 (메시지 1개). [서버 업타임]·[전적]·[파일]·[기타(운세·일침)]·[DM to Dev.]·[명령어 보기(`!도움말`과 같은 전체 목록)]를 누르고, 명령어 버튼을 누르면 바로 실행 (주소추가·Hypixel 전적·Valorant 전적은 입력 창, 주소삭제는 목록에서 고르기). 업타임·전적 카드 같은 결과는 `!` 명령어처럼 채널에 보이고, `주소` 목록과 안내 문구는 도움말 메시지 안에 표시. 배너 이미지는 `assets/images/help_banner.jpg`(GitHub 주소로 표시, 바꾸려면 `.env`의 `HELP_BANNER_URL`), 전적 버튼 아이콘은 `assets/emojis/`(봇이 처음 켜질 때 봇 전용 이모지 `maco_hypixel`·`maco_valorant`로 자동 등록. 이미지를 바꾸면 Developer Portal → Emojis에서 지운 뒤 재시작)
 
@@ -111,7 +112,7 @@ python bot.py
   - `£DB 한도 [서버ID|여기]` — 서버별 한도와 사용량 보기 · `£DB 한도 <서버ID|여기> 용량 2GB 파일 500MB` — 그 서버 한도 바꾸기. 크기는 마음대로(`300KB`, `1.5GB`, `2TB` …), `없음`은 한도 없음, `기본`은 기본값으로, `초기화`는 둘 다 되돌리기 · `£DB 한도 기본 파일 1GB` — 기본 한도 바꾸기
 - 전적 결과는 API 한도를 아끼기 위해 5분간 캐시되며, 같은 사용자는 5초에 한 번 조회할 수 있습니다.
 - `!H전적`은 조회한 닉네임을 Mojang·Hypixel API로, 스킨 이미지를 위해 UUID를 crafatar.com(실패 시 mc-heads.net)으로 보냅니다. `!V전적`은 Riot ID를 HenrikDev API로 보내고, 랭크·요원 아이콘을 media.valorant-api.com에서 받습니다(사용자 정보는 보내지 않음).
-- 카드 폰트는 [Monocraft](https://github.com/IdreesInc/Monocraft)와 [Galmuri](https://github.com/quiple/galmuri)(둘 다 SIL Open Font License 1.1)이며 라이선스는 `assets/fonts/`에 있습니다.
+- 카드 폰트는 [Monocraft](https://github.com/IdreesInc/Monocraft)와 [Galmuri](https://github.com/quiple/galmuri), 글자콘 폰트는 [검은고딕(Black Han Sans)](https://github.com/zesstype/Black-Han-Sans)입니다(모두 SIL Open Font License 1.1). 라이선스는 `assets/fonts/`에 있습니다.
 
 #Invite it!
 https://discord.com/oauth2/authorize?client_id=1561618276763570186&permissions=8515702525262144&integration_type=0&scope=bot%20applications.commands
