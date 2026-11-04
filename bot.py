@@ -561,6 +561,11 @@ OWNER_COMMANDS = [
     ("£DB 테스트", "저장소에 실제로 시험 업로드를 해서 봇 업로드·서명 링크·웹 업로드(CORS)가 되는지 하나씩 확인합니다."),
     ("£DB 관리자 [추가|삭제] [사용자]", "파일 관리자 목록을 보거나 바꿉니다. 파일 관리자는 모든 사람의 파일을 보고 지울 수 있습니다. "
                                     "봇 관리자는 항상 포함됩니다. (예: `£DB 관리자 추가 @닉네임`)"),
+    ("£DB 한도 [서버ID|여기]", "서버별 파일 한도(서버 전체 용량, 파일당 최대 크기)와 사용량을 봅니다."),
+    ("£DB 한도 <서버ID|여기> [용량 <크기>] [파일 <크기>]",
+     "그 서버의 한도를 바꿉니다. `기본`을 적으면 기본값으로 돌아가고, `초기화`는 둘 다 되돌립니다. "
+     "(예: `£DB 한도 여기 용량 2GB 파일 500MB`, `£DB 한도 123456789 파일 기본`)"),
+    ("£DB 한도 기본 [용량 <크기>] [파일 <크기>]", "따로 정하지 않은 서버들에 쓰는 기본 한도를 바꿉니다. (예: `£DB 한도 기본 파일 1GB`)"),
 ]
 
 
@@ -598,12 +603,12 @@ async def owner_db(message, args):
         return
     handlers = {"파일": owner_db_files, "삭제": owner_db_delete, "서버삭제": owner_db_delete_guild,
                 "기간": owner_db_retention, "정리": owner_db_cleanup, "관리자": owner_db_admins,
-                "테스트": owner_db_test}
+                "테스트": owner_db_test, "한도": owner_db_limits}
     handler = handlers.get(sub)
     if handler is None:
         await message.reply("알 수 없는 명령어입니다. `£도움말`을 확인해 주세요.", mention_author=False)
         return
-    if sub not in ("기간", "관리자") and not storage.configured():
+    if sub not in ("기간", "관리자", "한도") and not storage.configured():
         await message.reply(FILE_NOT_CONFIGURED, mention_author=False)
         return
     await handler(message, rest)
@@ -787,6 +792,118 @@ async def owner_db_admins(message, args):
     )
 
 
+def parse_size(text):
+    """'500MB', '2GB', '1.5g', '300' (MB) -> bytes, or None."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb|k|m|g|t)?", text.strip().lower())
+    if not match:
+        return None
+    unit = {"k": 1, "m": 2, "g": 3, "t": 4}[(match[2] or "m")[0]]
+    return int(float(match[1]) * 1024 ** unit)
+
+
+LIMIT_WORDS = {"용량": "quota", "전체": "quota", "파일": "max", "최대": "max"}
+
+
+def limits_line(guild_id):
+    quota, used = guild_quota(guild_id), file_usage(guild_id)
+    marks = {kind: "" if _limit_setting(kind, guild_id) else " (기본)" for kind in LIMIT_NAMES}
+    return (f"용량 **{human_size(used)} / {human_size(quota)}**{marks['quota']} · "
+            f"파일당 최대 **{human_size(guild_max_file(guild_id))}**{marks['max']}")
+
+
+async def owner_db_limits(message, args):
+    if len(args) <= 1 and (not args or args[0] in ("여기", "기본") or args[0].isdigit()):
+        await message.reply(embed=limits_embed(message, args[0] if args else None), mention_author=False)
+        return
+    target = args[0]
+    if target == "여기":
+        if message.guild is None:
+            await message.reply("`여기`는 서버 채널에서만 쓸 수 있습니다. 서버ID를 적어 주세요.", mention_author=False)
+            return
+        scope = message.guild.id
+    elif target == "기본":
+        scope = "default"
+    elif target.isdigit():
+        scope = int(target)
+    else:
+        await message.reply("사용법: `£DB 한도 <서버ID|여기|기본> [용량 <크기>] [파일 <크기>]` (`£도움말` 참고)",
+                            mention_author=False)
+        return
+    rest = args[1:]
+    if rest == ["초기화"]:
+        changes = {"quota": None, "max": None}
+    else:
+        changes = {}
+        if len(rest) % 2 or not rest:
+            rest = []
+        for word, value in zip(rest[::2], rest[1::2]):
+            kind = LIMIT_WORDS.get(word)
+            size = None if value == "기본" else parse_size(value)
+            if kind is None or (size is None and value != "기본"):
+                changes = {}
+                break
+            changes[kind] = size
+        if not changes:
+            await message.reply("알아보지 못했습니다. 예: `£DB 한도 여기 용량 2GB 파일 500MB`, `£DB 한도 기본 파일 1GB`, "
+                                "`£DB 한도 123456789 초기화`", mention_author=False)
+            return
+    for kind, size in changes.items():
+        if size is None:
+            continue
+        low, high = 1024 ** 2, (FILE_MAX_HARD if kind == "max" else 1024 ** 5)
+        if not low <= size <= high:
+            await message.reply(f"{LIMIT_NAMES[kind]}는 {human_size(low)} ~ {human_size(high)} 사이로 정해 주세요.",
+                                mention_author=False)
+            return
+    for kind, size in changes.items():
+        key = f"file_limit:{kind}:{scope}"
+        if size is None:
+            with connect_db() as conn:
+                conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        else:
+            set_setting(key, size)
+    if scope == "default":
+        where = "기본 한도 (따로 정하지 않은 서버)"
+        result = (f"서버 전체 용량 **{human_size(default_limit('quota'))}** · "
+                  f"파일당 최대 **{human_size(default_limit('max'))}**")
+    else:
+        where = f"**{guild_label(scope)}**"
+        result = limits_line(scope)
+    notes = []
+    if scope != "default" and file_usage(scope) > guild_quota(scope):
+        notes.append("지금 쓰는 용량이 한도보다 많습니다. 이미 올라간 파일은 그대로 두고, 공간이 생길 때까지 새로 올리기만 막습니다.")
+    if "quota" in changes and changes["quota"] and changes["quota"] > FILE_TOTAL_QUOTA:
+        notes.append(f"봇 전체 한도({human_size(FILE_TOTAL_QUOTA)}, `FILE_TOTAL_QUOTA_MB`)가 더 작아서 그 이상은 올라가지 않습니다.")
+    await message.reply(f"{where} 한도를 바꿨습니다.\n{result}" + "".join(f"\n-# {n}" for n in notes)
+                        + "\n-# 이미 열어 둔 업로드 링크도 올린 뒤에 새 한도로 다시 확인합니다.", mention_author=False)
+
+
+def limits_embed(message, target):
+    embed = discord.Embed(title="파일 한도", color=discord.Color.blurple())
+    embed.add_field(name="기본 (따로 정하지 않은 서버)", inline=False, value=(
+        f"서버 전체 용량 **{human_size(default_limit('quota'))}** · 파일당 최대 **{human_size(default_limit('max'))}**\n"
+        f"-# 봇 전체: {human_size(file_usage())} / {human_size(FILE_TOTAL_QUOTA)} · 한 파일은 5GB를 넘을 수 없습니다"
+    ))
+    if target == "여기" and message.guild:
+        target = str(message.guild.id)
+    if target and target.isdigit():
+        embed.add_field(name=guild_label(int(target)), value=limits_line(int(target)), inline=False)
+    with connect_db() as conn:
+        keys = [r["key"] for r in conn.execute("SELECT key FROM settings WHERE key LIKE 'file_limit:%'")]
+    custom = sorted({int(k.rsplit(":", 1)[1]) for k in keys if k.rsplit(":", 1)[1].isdigit()})
+    if custom:
+        lines = [f"• {guild_label(g)} (`{g}`) · {limits_line(g)}" for g in custom]
+        text = ""
+        for i, line in enumerate(lines):
+            if len(text) + len(line) > 1000:
+                text += f"… 외 {len(lines) - i}개"
+                break
+            text += line + "\n"
+        embed.add_field(name="따로 정한 서버", value=text, inline=False)
+    embed.set_footer(text="바꾸기: £DB 한도 <서버ID|여기|기본> 용량 2GB 파일 500MB")
+    return embed
+
+
 async def owner_db_cleanup(message, args):
     async with message.channel.typing():
         with connect_db() as conn:
@@ -896,8 +1013,8 @@ async def db_status_embed():
     percent = used / total * 100 if total else 0
     embed.add_field(name="💾 용량", inline=False, value=(
         f"사용 {human_size(used)} / {human_size(total)} ({percent:.1f}%)\n"
-        f"남은 용량 **{human_size(max(0, total - used))}** · 서버당 한도 {human_size(FILE_GUILD_QUOTA)} · "
-        f"파일당 최대 {human_size(FILE_MAX_BYTES)}"
+        f"남은 용량 **{human_size(max(0, total - used))}** · 기본 한도: 서버당 {human_size(default_limit('quota'))}, "
+        f"파일당 {human_size(default_limit('max'))} (`£DB 한도`)"
     ))
     files_text = f"올라간 파일 **{ready:,}개** · 업로드 진행 중 {pending:,}개 · 자동 삭제 기간 {retention_text()}"
     if next_expiry:
@@ -971,7 +1088,7 @@ def command_list_embed():
         value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
-    embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 미리보기로 보여 줍니다(영상은 바로 재생). 첨부 없이 쓰면 큰 파일(최대 5GB)용 링크를 DM으로 받습니다. "
+    embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 미리보기로 보여 줍니다(영상은 바로 재생). 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
                     f"{retention_text()} 후 자동 삭제됩니다.", inline=False)
     embed.add_field(name="!파일 [이름]", value="내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다.", inline=False)
     embed.add_field(name="!파일삭제 <이름>", value="내가 올린 파일을 지웁니다.", inline=False)
@@ -1767,9 +1884,11 @@ async def feedback_prefix(ctx):
 FILE_RETENTION_DEFAULT = 7 * 24 * 60 * 60
 FILE_RETENTION_MIN = 60 * 60
 FILE_PENDING_SECONDS = 60 * 60  # an unfinished browser upload is cleaned up after this
-FILE_GUILD_QUOTA = env_int("FILE_GUILD_QUOTA_MB", 10240, 1) * 1024 * 1024
+FILE_MAX_HARD = 5 * 1024 ** 3  # the most one S3 / B2 upload can take
 FILE_TOTAL_QUOTA = env_int("FILE_TOTAL_QUOTA_MB", 10240, 1) * 1024 * 1024  # B2 / R2 free tiers are 10GB
-FILE_MAX_BYTES = env_int("FILE_MAX_MB", 5120, 1) * 1024 * 1024  # 5GB: the most one S3 upload can take
+# Starting defaults only: bot admins change them (for all servers or one) with £DB 한도, kept in the DB.
+FILE_GUILD_QUOTA = env_int("FILE_GUILD_QUOTA_MB", 10240, 1) * 1024 * 1024
+FILE_MAX_BYTES = min(env_int("FILE_MAX_MB", 5120, 1) * 1024 * 1024, FILE_MAX_HARD)
 FILE_MAX_PER_MESSAGE = 5
 FILE_COOLDOWN_SECONDS = 10
 
@@ -1807,8 +1926,8 @@ FILE_NOT_CONFIGURED = "파일 저장소가 설정되지 않았습니다. 봇 관
 
 
 def human_size(size):
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
             return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
         size /= 1024
 
@@ -1823,10 +1942,60 @@ def file_usage(guild_id=None):
     return row[0]
 
 
+# ---- per-server limits (£DB 한도): "quota" = the server's total space, "max" = the largest single file.
+# Settings keys: file_limit:<quota|max>:default and file_limit:<quota|max>:<guild id>.
+LIMIT_NAMES = {"quota": "서버 전체 용량", "max": "파일당 최대 크기"}
+
+
+def _limit_setting(kind, scope):
+    try:
+        value = get_setting(f"file_limit:{kind}:{scope}")
+        return int(value) if value else None
+    except (ValueError, sqlite3.Error):
+        return None
+
+
+def default_limit(kind):
+    value = _limit_setting(kind, "default")
+    return value if value else FILE_GUILD_QUOTA if kind == "quota" else FILE_MAX_BYTES
+
+
+def guild_limit(guild_id, kind):
+    """The server's own limit if a bot admin set one, else the default."""
+    value = _limit_setting(kind, guild_id) if guild_id else None
+    value = value or default_limit(kind)
+    return min(value, FILE_MAX_HARD) if kind == "max" else value
+
+
+def guild_quota(guild_id):
+    return guild_limit(guild_id, "quota")
+
+
+def guild_max_file(guild_id):
+    return guild_limit(guild_id, "max")
+
+
+def guild_upload_max(guild_id):
+    """Largest file this server can take right now: its per-file limit, or its free space if that is less."""
+    space = max(0, guild_quota(guild_id) - file_usage(guild_id))
+    return min(guild_max_file(guild_id), space, max(0, FILE_TOTAL_QUOTA - file_usage()))
+
+
+def too_big_message(guild_id):
+    return f"파일이 너무 큽니다. (이 서버는 파일당 최대 {human_size(guild_max_file(guild_id))})"
+
+
+def check_file_size(guild_id, size):
+    if size > guild_max_file(guild_id):
+        raise storage.StorageError(too_big_message(guild_id))
+
+
 def check_file_quota(guild_id, size):
-    if file_usage(guild_id) + size > FILE_GUILD_QUOTA:
+    quota = guild_quota(guild_id)
+    used = file_usage(guild_id)
+    if used + size > quota:
         raise storage.StorageError(
-            f"이 서버의 저장 공간({human_size(FILE_GUILD_QUOTA)})이 부족합니다. "
+            f"이 서버의 저장 공간이 부족합니다. (남은 용량 {human_size(max(0, quota - used))} / {human_size(quota)}) "
             "`!파일삭제`로 정리하거나 자동 삭제를 기다려 주세요."
         )
     if file_usage() + size > FILE_TOTAL_QUOTA:
@@ -1900,12 +2069,12 @@ async def store_attachment(guild_id, channel_id, user_id, attachment, name=""):
     """Stream one Discord attachment into storage and record it. The file never sits in memory as a whole
     (the bot host has 128MB). Videos are converted only when FILE_CONVERT_VIDEO is on."""
     filename, size = attachment.filename, attachment.size
-    if size > FILE_MAX_BYTES:
-        raise storage.StorageError(f"파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
+    check_file_size(guild_id, size)
     converted = await storage.convert_url(attachment.url, filename) if storage.should_convert(filename, size) else None
     if converted:
         path, filename, size, cleanup = converted
         try:
+            check_file_size(guild_id, size)
             check_file_quota(guild_id, size)
             key = storage.new_key(guild_id, filename)
             content_type = await storage.put_path(key, path, filename)
@@ -1921,8 +2090,7 @@ async def store_attachment(guild_id, channel_id, user_id, attachment, name=""):
 
 async def store_file(guild_id, channel_id, user_id, filename, data, name=""):
     """Upload small in-memory data and record it (used by tests and tools; users go through attachments)."""
-    if len(data) > FILE_MAX_BYTES:
-        raise storage.StorageError(f"파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
+    check_file_size(guild_id, len(data))
     check_file_quota(guild_id, len(data))
     key = storage.new_key(guild_id, filename)
     content_type = await storage.put_bytes(key, data, filename)
@@ -2005,9 +2173,13 @@ class CopyLinkButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:
             await interaction.response.send_message("삭제됐거나 기간이 지난 파일입니다.", ephemeral=True)
             return
         row = dict(row)
-        if not row.get("url"):
-            await add_short_links([row])
-        await interaction.response.send_message(f"```\n{open_link(row)}\n```", ephemeral=True)
+        if row.get("url") or not shortlinks.configured():
+            await interaction.response.send_message(f"```\n{open_link(row)}\n```", ephemeral=True)
+            return
+        # Making the short link first can take longer than the 3 seconds Discord waits for an answer.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await add_short_links([row])
+        await interaction.followup.send(f"```\n{open_link(row)}\n```", ephemeral=True)
 
 
 def file_line(row):
@@ -2063,8 +2235,8 @@ async def upload_attachments(ctx, attachments, name=""):
     async def work():
         rows, errors = [], []
         for attachment in attachments[:FILE_MAX_PER_MESSAGE]:
-            if attachment.size > FILE_MAX_BYTES:
-                errors.append(f"`{attachment.filename}`: 파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
+            if attachment.size > guild_max_file(ctx.guild.id):
+                errors.append(f"`{attachment.filename}`: {too_big_message(ctx.guild.id)}")
                 continue
             try:
                 rows.append(await store_attachment(ctx.guild.id, ctx.channel.id, ctx.author.id, attachment,
@@ -2096,19 +2268,25 @@ _upload_locks = {}
 
 
 async def start_browser_upload(guild_id, channel_id, user_id, name=""):
-    """A pending upload and the page link where the user picks the file (any size up to FILE_MAX_BYTES)."""
+    """A pending upload and the page link where the user picks the file (up to the server's limits).
+    Raises StorageError when the server has no space left."""
+    max_bytes = guild_upload_max(guild_id)
+    if max_bytes <= 0:
+        check_file_quota(guild_id, 1)  # raises with the server's numbers
+        raise storage.StorageError("봇 전체 저장 공간이 가득 찼습니다. 오래된 파일이 자동 삭제된 뒤 다시 시도해 주세요.")
     key = storage.new_key(guild_id, "upload")
     row = save_file_row(guild_id, channel_id, user_id, name.strip()[:MAX_NAME_LENGTH], key, "", 0, status="pending")
-    link = await storage.upload_page_link(key, retention_text(), shortlinks.signal_url(key))
+    link = await storage.upload_page_link(key, retention_text(), shortlinks.signal_url(key), max_bytes)
     # nnaco.kro.kr/xxxx: fits a link button, and has no "#|" for Discord to rewrite. Lives as long as the row.
     return row, await shortlinks.shorten(link, row["expires_at"]) or link
 
 
-def browser_upload_text(link=None):
+def browser_upload_text(guild_id, link=None):
     """link=None when the link is on a button instead (Discord link buttons hold up to 512 characters)."""
     return (
         (f"**[🌐 파일 올리는 페이지 열기]({link})**\n" if link else "")
-        + f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** (최대 {human_size(FILE_MAX_BYTES)}, 링크는 1시간 동안 사용)"
+        + f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** (최대 {human_size(guild_max_file(guild_id))}, "
+          "링크는 1시간 동안 사용)"
     )
 
 
@@ -2148,8 +2326,7 @@ async def finish_upload(row_id):
         size, content_type, filename = info
         await upload_placeholder(row, "⏳ 파일 불러오는 중...")
         try:
-            if size > FILE_MAX_BYTES:
-                raise storage.StorageError(f"파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
+            check_file_size(row["guild_id"], size)
             check_file_quota(row["guild_id"], size)
         except storage.StorageError as exc:
             await storage.delete([row["key"]])
@@ -2350,7 +2527,8 @@ async def finish_link_message(interaction, message):
     if interaction.guild is None:  # the DM from !올리기
         await interaction.edit_original_response(content=message, view=None)
     else:  # the /도움말 message
-        await interaction.edit_original_response(**help_message(page="files", selected="upload", notice=message))
+        await interaction.edit_original_response(**help_message(page="files", selected="upload", notice=message,
+                                                                 guild_id=interaction.guild.id))
 
 
 async def can_manage_file(user, row):
@@ -2408,10 +2586,14 @@ async def upload_command(ctx, *, name: str = ""):
         await upload_attachments(ctx, ctx.message.attachments, name)
         return
     # No attachment: big files go through the web page, sent by DM so nobody else can use the link.
-    row, link = await start_browser_upload(ctx.guild.id, ctx.channel.id, ctx.author.id, name)
+    try:
+        row, link = await start_browser_upload(ctx.guild.id, ctx.channel.id, ctx.author.id, name)
+    except storage.StorageError as exc:
+        await ctx.reply(str(exc), mention_author=False)
+        return
     try:
         on_button = len(link) <= LINK_BUTTON_MAX
-        dm = await ctx.author.send(browser_upload_text(None if on_button else link),
+        dm = await ctx.author.send(browser_upload_text(ctx.guild.id, None if on_button else link),
                                    view=browser_upload_view(row["id"], link))
     except discord.HTTPException:
         drop_file_row(row["id"])
@@ -2538,7 +2720,7 @@ HELP_COMMANDS = {
     "hypixel": ("Hypixel 전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
                 "예: `!H전적 hypixel bw`"),
     "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부 · 첨부 없이 쓰면 웹 업로드 링크\n"
-               "**🌐 올리기**를 누르면 업로드 페이지가 바로 열리고, 올리면 **자동으로 채널에 올라갑니다** (최대 5GB).\n"
+               "**🌐 올리기**를 누르면 업로드 페이지가 바로 열리고, 올리면 **자동으로 채널에 올라갑니다**.\n"
                "사진은 바로 보이고 영상은 채팅창에서 바로 재생됩니다. 작은 파일은 **📎 첨부**로도 올릴 수 있습니다.\n"
                "올린 파일은 봇의 파일 저장소에 올라가며 **{보관} 후 자동으로 삭제**됩니다."),
     "files": ("목록", "!파일", "`!파일 [이름]`\n내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다."),
@@ -2636,7 +2818,8 @@ def stats_wait_left(command, ctx):
     return math.ceil(retry_after) if retry_after else 0
 
 
-def help_message(page="home", selected=None, notice=None, details=None, extra_items=(), upload_url=None):
+def help_message(page="home", selected=None, notice=None, details=None, extra_items=(), upload_url=None,
+                 upload_pending=False, guild_id=None):
     """Embed and buttons for one page of the private /도움말 message.
     Everything private (lists, notices) is shown by editing this one message; only results meant
     for the channel (uptime, stats cards, ...) become separate public messages."""
@@ -2678,6 +2861,10 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
         if key == "upload" and upload_url:
             # A link button: one press opens the upload page; the file is posted automatically afterwards.
             view.add_item(discord.ui.Button(label="올리기", emoji="🌐", url=upload_url, row=0))
+        elif key == "upload" and upload_pending:
+            # Shown at once while the link is made (B2 + NKOTE can take a few seconds), so the press shows.
+            view.add_item(discord.ui.Button(label="준비 중...", emoji="⏳", disabled=True, row=0,
+                                            custom_id="maco:help:wait"))
         else:
             button(f"run_{key}", HELP_COMMANDS[key][0], help_emojis.get(key) or HELP_BUTTON_EMOJIS.get(key), style)
         if key == "upload":
@@ -2685,7 +2872,12 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
     button("home", "◀ 처음으로", style=discord.ButtonStyle.secondary, row=1)
     for item in extra_items:
         view.add_item(item)
-    return {"embed": discord.Embed(title=title, description=text[:4096], color=color), "view": view}
+    embed = discord.Embed(title=title, description=text[:4096], color=color)
+    if page == "files" and guild_id and storage.configured():
+        quota, used = guild_quota(guild_id), file_usage(guild_id)
+        embed.set_footer(text=f"이 서버 · 남은 용량 {human_size(max(0, quota - used))} / {human_size(quota)} · "
+                              f"파일당 최대 {human_size(guild_max_file(guild_id))}")
+    return {"embed": embed, "view": view}
 
 
 def help_text(key):
@@ -2698,21 +2890,34 @@ def help_page_of(key):
 
 async def show_help(interaction, **page):
     """Redraw the /도움말 message the interaction came from (a button, or a form opened from one).
-    The 파일 page gets a ready upload link on its [올리기] button."""
-    if page.get("page") == "files" and "upload_url" not in page and interaction.guild and storage.configured():
-        try:
-            if not cached_upload_link(interaction) and not interaction.response.is_done():
-                await interaction.response.defer()  # a new link needs B2, which can take over 3 seconds
-            _, url = await upload_link_for(interaction)
-            if len(url) <= LINK_BUTTON_MAX:
-                page["upload_url"] = url
-        except Exception as exc:
-            print(f"업로드 링크 만들기 실패: {type(exc).__name__}: {exc}")
-    changes = help_message(**page)
-    if interaction.response.is_done():
-        await interaction.edit_original_response(**changes)
-    else:
-        await interaction.response.edit_message(**changes)
+    The 파일 page gets a ready upload link on its [올리기] button. Making a new link can take a few
+    seconds, so the page is shown at once with [⏳ 준비 중...] and the link is filled in afterwards
+    (waiting first made the 파일 button look like it did nothing)."""
+    async def draw(**changes):
+        if interaction.response.is_done():
+            await interaction.edit_original_response(**changes)
+        else:
+            await interaction.response.edit_message(**changes)
+
+    if page.get("page") == "files" and interaction.guild:
+        page["guild_id"] = interaction.guild.id
+    wants_link = (page.get("page") == "files" and "upload_url" not in page and interaction.guild
+                  and storage.configured())
+    if wants_link:
+        cached = cached_upload_link(interaction)
+        if cached:
+            page["upload_url"] = cached["url"] if len(cached["url"]) <= LINK_BUTTON_MAX else None
+        else:
+            await draw(**help_message(**page, upload_pending=True))
+            try:
+                _, url = await upload_link_for(interaction)
+                if len(url) <= LINK_BUTTON_MAX:
+                    page["upload_url"] = url
+            except storage.StorageError as exc:  # e.g. the server's space is full
+                page["notice"] = "\n".join(filter(None, [page.get("notice"), f"⚠️ {exc}"]))
+            except Exception as exc:
+                print(f"업로드 링크 만들기 실패: {type(exc).__name__}: {exc}")
+    await draw(**help_message(**page))
 
 
 # A DynamicItem keeps working after a restart (and on any copy of the bot): the custom_id says what the
@@ -2793,7 +2998,9 @@ async def help_run_delete(interaction):
     await interaction.response.send_modal(DeleteServerModal(servers))
 
 
-UPLOAD_LINK_REUSE_SECONDS = 8 * 60
+# A link works for an hour (the pending upload, its short link and the watcher all last that long), so it is
+# reused for 45 minutes: fewer new links (each one asks B2 and NKOTE) and fewer watchers running at once.
+UPLOAD_LINK_REUSE_SECONDS = 45 * 60
 _upload_links = {}  # (guild id, user id) -> {"row": row id, "url": link, "at": time}
 _link_interactions = {}  # row id -> the latest /도움말 interaction showing that link (to update it when done)
 
@@ -2829,17 +3036,23 @@ async def link_upload_finished(row_id, message):
         del _upload_links[key]
     interaction = _link_interactions.pop(row_id, None)
     if interaction:
-        await interaction.edit_original_response(**help_message(page="files", selected="upload", notice=message))
+        await interaction.edit_original_response(**help_message(page="files", selected="upload", notice=message,
+                                                                 guild_id=interaction.guild.id))
 
 
 async def help_run_upload(interaction):
     """[올리기] as a plain button: shown when the link didn't fit a link button, or after an upload finished."""
-    await interaction.response.defer()
-    row_id, url = await upload_link_for(interaction)
+    await interaction.response.edit_message(**help_message(page="files", selected="upload", upload_pending=True,
+                                                                guild_id=interaction.guild.id))
+    try:
+        row_id, url = await upload_link_for(interaction)
+    except storage.StorageError as exc:
+        await show_help(interaction, page="files", selected="upload", upload_url=None, notice=f"⚠️ {exc}")
+        return
     if len(url) <= LINK_BUTTON_MAX:
         await show_help(interaction, page="files", selected="upload", upload_url=url)
     else:
-        await show_help(interaction, page="files", selected="upload", details=browser_upload_text(url),
+        await show_help(interaction, page="files", selected="upload", details=browser_upload_text(interaction.guild.id, url),
                         upload_url=None, extra_items=[UploadDoneButton(row_id)])
 
 
