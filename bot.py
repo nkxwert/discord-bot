@@ -2058,16 +2058,22 @@ async def start_browser_upload(guild_id, channel_id, user_id, name=""):
     return row, await storage.upload_page_link(key, retention_text())
 
 
-def browser_upload_text(link):
+def browser_upload_text(link=None):
+    """link=None when the link is on a button instead (Discord link buttons hold up to 512 characters)."""
     return (
-        f"**[🌐 파일 올리는 페이지 열기]({link})**\n"
-        f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** 안 올라가면 아래 **[업로드 완료]**를 눌러 주세요.\n"
+        (f"**[🌐 파일 올리는 페이지 열기]({link})**\n" if link else "")
+        + f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** 안 올라가면 **[업로드 완료]**를 눌러 주세요.\n"
         f"링크는 10분 동안 쓸 수 있고, 파일당 최대 {human_size(FILE_MAX_BYTES)}입니다.\n{file_notice()}"
     )
 
 
-def browser_upload_view(row_id):
+LINK_BUTTON_MAX = 512
+
+
+def browser_upload_view(row_id, link=None):
     view = discord.ui.View(timeout=None)
+    if link and len(link) <= LINK_BUTTON_MAX:
+        view.add_item(discord.ui.Button(label="업로드 페이지 열기", emoji="🌐", url=link))
     view.add_item(UploadDoneButton(row_id))
     return view
 
@@ -2263,7 +2269,9 @@ async def upload_command(ctx, *, name: str = ""):
     # No attachment: big files go through the web page, sent by DM so nobody else can use the link.
     row, link = await start_browser_upload(ctx.guild.id, ctx.channel.id, ctx.author.id, name)
     try:
-        dm = await ctx.author.send(browser_upload_text(link), view=browser_upload_view(row["id"]))
+        on_button = len(link) <= LINK_BUTTON_MAX
+        dm = await ctx.author.send(browser_upload_text(None if on_button else link),
+                                   view=browser_upload_view(row["id"], link))
     except discord.HTTPException:
         drop_file_row(row["id"])
         await ctx.reply("DM을 보낼 수 없습니다. 파일을 메시지에 첨부해서 `!올리기`를 하거나, "
@@ -2389,8 +2397,8 @@ HELP_COMMANDS = {
     "hypixel": ("Hypixel 전적", "!H전적", "`!H전적 <닉네임> [bw|sw|duels]`\n하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.\n"
                 "예: `!H전적 hypixel bw`"),
     "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부 · 첨부 없이 쓰면 웹 업로드 링크\n"
-               "파일을 올리면 사진은 바로 보이고 영상은 채팅창에서 바로 재생됩니다.\n"
-               "작은 파일은 **📎 디스코드로 첨부**, 큰 파일(최대 5GB)은 **🌐 웹에서 올리기**를 눌러 주세요.\n"
+               "**🌐 올리기**를 누르면 업로드 페이지가 바로 열리고, 올리면 **자동으로 채널에 올라갑니다** (최대 5GB).\n"
+               "사진은 바로 보이고 영상은 채팅창에서 바로 재생됩니다. 작은 파일은 **📎 첨부**로도 올릴 수 있습니다.\n"
                "올린 파일은 봇의 파일 저장소에 올라가며 **{보관} 후 자동으로 삭제**됩니다."),
     "files": ("목록", "!파일", "`!파일 [이름]`\n내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다."),
     "filedelete": ("삭제", "!파일삭제", "`!파일삭제 <이름>`\n내가 올린 파일을 지웁니다."),
@@ -2487,7 +2495,7 @@ def stats_wait_left(command, ctx):
     return math.ceil(retry_after) if retry_after else 0
 
 
-def help_message(page="home", selected=None, notice=None, details=None, extra_items=()):
+def help_message(page="home", selected=None, notice=None, details=None, extra_items=(), upload_url=None):
     """Embed and buttons for one page of the private /도움말 message.
     Everything private (lists, notices) is shown by editing this one message; only results meant
     for the channel (uptime, stats cards, ...) become separate public messages."""
@@ -2526,7 +2534,13 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
             text += f"\n\n{extra}"
     for key in keys:
         style = discord.ButtonStyle.success if key == selected else discord.ButtonStyle.secondary
-        button(f"run_{key}", HELP_COMMANDS[key][0], help_emojis.get(key) or HELP_BUTTON_EMOJIS.get(key), style)
+        if key == "upload" and upload_url:
+            # A link button: one press opens the upload page; the file is posted automatically afterwards.
+            view.add_item(discord.ui.Button(label="올리기", emoji="🌐", url=upload_url, row=0))
+        else:
+            button(f"run_{key}", HELP_COMMANDS[key][0], help_emojis.get(key) or HELP_BUTTON_EMOJIS.get(key), style)
+        if key == "upload":
+            button("attach", "첨부", "📎", discord.ButtonStyle.secondary)
     button("home", "◀ 처음으로", style=discord.ButtonStyle.secondary, row=1)
     for item in extra_items:
         view.add_item(item)
@@ -2542,7 +2556,17 @@ def help_page_of(key):
 
 
 async def show_help(interaction, **page):
-    """Redraw the /도움말 message the interaction came from (a button, or a form opened from one)."""
+    """Redraw the /도움말 message the interaction came from (a button, or a form opened from one).
+    The 파일 page gets a ready upload link on its [올리기] button."""
+    if page.get("page") == "files" and "upload_url" not in page and interaction.guild and storage.configured():
+        try:
+            if not cached_upload_link(interaction) and not interaction.response.is_done():
+                await interaction.response.defer()  # a new link needs B2, which can take over 3 seconds
+            _, url = await upload_link_for(interaction)
+            if len(url) <= LINK_BUTTON_MAX:
+                page["upload_url"] = url
+        except Exception as exc:
+            print(f"업로드 링크 만들기 실패: {type(exc).__name__}: {exc}")
     changes = help_message(**page)
     if interaction.response.is_done():
         await interaction.edit_original_response(**changes)
@@ -2628,21 +2652,54 @@ async def help_run_delete(interaction):
     await interaction.response.send_modal(DeleteServerModal(servers))
 
 
+UPLOAD_LINK_REUSE_SECONDS = 8 * 60
+_upload_links = {}  # (guild id, user id) -> {"row": row id, "url": link, "at": time}
+_link_interactions = {}  # row id -> the latest /도움말 interaction showing that link (to update it when done)
+
+
+def cached_upload_link(interaction):
+    """The person's recent unused upload link, so moving around the menu doesn't start a new upload
+    (and a new background check) every time."""
+    entry = _upload_links.get((interaction.guild.id, interaction.user.id))
+    if not entry or time.time() - entry["at"] > UPLOAD_LINK_REUSE_SECONDS:
+        return None
+    with connect_db() as conn:
+        row = conn.execute("SELECT status FROM files WHERE id = ?", (entry["row"],)).fetchone()
+    return entry if row and row["status"] == "pending" else None
+
+
+async def upload_link_for(interaction):
+    """(row id, link) of an upload link for this person, new or reused; a new one is watched in the
+    background so the file is posted as soon as it arrives."""
+    entry = cached_upload_link(interaction)
+    if entry is None:
+        row, url = await start_browser_upload(interaction.guild.id, interaction.channel.id, interaction.user.id)
+        entry = {"row": row["id"], "url": url, "at": time.time()}
+        _upload_links[(interaction.guild.id, interaction.user.id)] = entry
+        watch_upload(row["id"], lambda message, row_id=row["id"]: link_upload_finished(row_id, message))
+    _link_interactions[entry["row"]] = interaction
+    return entry["row"], entry["url"]
+
+
+async def link_upload_finished(row_id, message):
+    """Show the outcome on the /도움말 message that last showed this link (its [올리기] gets a fresh link
+    the next time the 파일 page is opened)."""
+    for key in [k for k, v in _upload_links.items() if v["row"] == row_id]:
+        del _upload_links[key]
+    interaction = _link_interactions.pop(row_id, None)
+    if interaction:
+        await interaction.edit_original_response(**help_message(page="files", selected="upload", notice=message))
+
+
 async def help_run_upload(interaction):
-    # One [올리기]: pick attaching through Discord (small files) or the web page (up to 5GB).
-    await show_help(interaction, page="files", selected="upload", extra_items=[
-        HelpButton("attach", "디스코드로 첨부", "📎", discord.ButtonStyle.primary, row=2),
-        HelpButton("web", "웹에서 올리기 (큰 파일)", "🌐", discord.ButtonStyle.primary, row=2),
-    ])
-
-
-async def help_run_web_upload(interaction):
-    await interaction.response.defer()  # getting a B2 upload address can take over Discord's 3 seconds
-    row, link = await start_browser_upload(interaction.guild.id, interaction.channel.id, interaction.user.id)
-    await show_help(interaction, page="files", selected="upload", details=browser_upload_text(link),
-                    extra_items=[UploadDoneButton(row["id"])])
-    watch_upload(row["id"], lambda message: interaction.edit_original_response(
-        **help_message(page="files", selected="upload", notice=message)))
+    """[올리기] as a plain button: shown when the link didn't fit a link button, or after an upload finished."""
+    await interaction.response.defer()
+    row_id, url = await upload_link_for(interaction)
+    if len(url) <= LINK_BUTTON_MAX:
+        await show_help(interaction, page="files", selected="upload", upload_url=url)
+    else:
+        await show_help(interaction, page="files", selected="upload", details=browser_upload_text(url),
+                        upload_url=None, extra_items=[UploadDoneButton(row_id)])
 
 
 async def help_run_files(interaction):
@@ -2860,7 +2917,7 @@ HELP_ACTIONS = {
     "page_files": lambda interaction: help_open_page(interaction, "files"),
     "run_upload": help_run_upload,
     "attach": help_open_form(UploadModal),
-    "web": help_run_web_upload,
+    "web": help_run_upload,
     "run_files": help_run_files,
     "run_filedelete": help_run_filedelete,
     "run_fortune": help_run_random_line("fortune"),

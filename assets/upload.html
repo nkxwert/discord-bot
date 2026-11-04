@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta name="maco-upload-page" content="4">
+<meta name="maco-upload-page" content="5">
 <title>마코 파일 올리기</title>
 <style>
   :root { --bg: #eef3ee; --card: #ffffff; --text: #2f3b33; --muted: #5b6b60; --accent: #7f9c86; --accent-dark: #5f7d67; --bar: #dfe8e0; --error: #b3261e; }
@@ -38,28 +38,34 @@
   <div id="status" role="status"></div>
 </main>
 <script>
-  // Discord rewrites "|" in a clicked link to "%7C" (and some apps encode the link once more), so accept
-  // both and undo extra encoding; otherwise the retention would end up glued to the upload target.
+  // The #fragment holds where to upload and the retention, joined with "!":
+  //   "b2!<upload URL>!<token>!<file key>!<retention>"  Backblaze's native browser upload
+  //   "<presigned PUT URL>!<retention>"                  any S3 storage
+  // Older links used "|" (which Discord rewrites to "%7C") and "b2:" + base64 JSON; both still work.
   function decodeFully(text) {
-    for (let i = 0; i < 3 && /%[0-9a-f]{2}/i.test(text) && /^(b2|https?)%3A/i.test(text); i++) {
-      try { text = decodeURIComponent(text); } catch (e) { break; }
+    for (let i = 0; i < 3 && /%[0-9a-f]{2}/i.test(text); i++) {
+      try { const next = decodeURIComponent(text); if (next === text) break; text = next; } catch (e) { break; }
     }
     return text;
   }
-  const hash = location.hash.slice(1).replace(/%25(7C)/gi, "%$1").replace(/%7C/gi, "|");
-  const [rawTarget, rawRetention] = hash.split("|");
-  let target = rawTarget || "";
-  try { target = decodeURIComponent(target); } catch (e) { target = ""; }
-  target = decodeFully(target).split("|")[0];
-  // "b2:" + base64 JSON {u: upload URL, t: token, k: file key} = Backblaze's native browser upload.
-  let native = null;
-  if (target.startsWith("b2:")) {
-    try { native = JSON.parse(atob(target.slice(3).replace(/-/g, "+").replace(/_/g, "/"))); } catch (e) { native = null; }
+  let hash = location.hash.slice(1);
+  if (/^(b2|https?)%(3A|21)/i.test(hash) || /^b2%21/i.test(hash)) hash = decodeFully(hash);  // whole fragment encoded
+  hash = hash.replace(/%25(7C|21)/gi, "%$1").replace(/%7C/gi, "|").replace(/%21/g, "!");
+  let target = "", retention = "", native = null;
+  if (hash.startsWith("b2!")) {
+    const parts = hash.split("!").map(decodeFully);
+    native = {u: parts[1], t: parts[2], k: parts[3]};
+    retention = parts[4] || "";
+  } else {
+    const parts = hash.split(/[!|]/);
+    target = decodeFully(parts[0] || "");
+    retention = decodeFully(parts[1] || "");
+    if (target.startsWith("b2:")) {  // older native format
+      try { native = JSON.parse(atob(target.slice(3).replace(/-/g, "+").replace(/_/g, "/"))); } catch (e) { native = null; }
+    }
   }
   const usable = native ? native.u && native.u.startsWith("https://") : target.startsWith("https://");
-  if (rawRetention) {
-    try { document.getElementById("retention").textContent = decodeFully(decodeURIComponent(rawRetention)); } catch (e) {}
-  }
+  if (retention) document.getElementById("retention").textContent = retention;
   const fileInput = document.getElementById("file");
   const send = document.getElementById("send");
   const status = document.getElementById("status");
