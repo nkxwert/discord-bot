@@ -80,6 +80,25 @@ async def delete(short_url):
         print(f"단축 링크 삭제 실패: {type(exc).__name__}: {exc}")
 
 
+async def update(short_url, url, expires_at):
+    """Point an existing short link at a new url and expiry, keeping its slug (so links already posted in
+    Discord keep working). True if NKOTE took it."""
+    slug = slug_of(short_url)
+    if not configured() or not slug:
+        return False
+    try:
+        async with net.session().patch(
+            f"{BASE_URL}/api/links/{slug}", headers=_headers(), timeout=TIMEOUT,
+            json={"url": url, "expiresAt": int(expires_at * 1000)},
+        ) as response:
+            if response.status == 200:
+                return True
+            print(f"단축 링크 바꾸기 실패: HTTP {response.status}")
+    except Exception as exc:
+        print(f"단축 링크 바꾸기 실패: {type(exc).__name__}: {exc}")
+    return False
+
+
 async def self_test():
     """[(label, ok, detail)] for £DB 테스트: make a short link, open it (without following), delete it."""
     if not configured():
