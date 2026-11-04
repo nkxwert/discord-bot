@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 import cards
 import net
 import easter_eggs
+import shortlinks
 import stats
 import storage
 
@@ -754,7 +755,7 @@ async def owner_db_retention(message, args):
 
 async def owner_db_test(message, args):
     async with message.channel.typing():
-        results = await storage.self_test()
+        results = await storage.self_test() + await shortlinks.self_test()
     lines = [f"{'🟢' if ok else '🔴'} **{label}** · {detail[:300]}" for label, ok, detail in results]
     embed = discord.Embed(title="저장소 시험", description="\n".join(lines)[:4000],
                           color=discord.Color.green() if all(ok for _, ok, _ in results) else discord.Color.red())
@@ -888,6 +889,7 @@ async def db_status_embed():
     used, total = file_usage(), FILE_TOTAL_QUOTA
     embed.add_field(name="📦 파일 저장소", inline=False, value=(
         f"{connection}\n`{host}` · 버킷 `{bucket}` · {mode}\n"
+        f"단축 링크 {f'`{shortlinks.host()}`' if shortlinks.configured() else '설정 안 됨 (긴 링크 사용)'}\n"
         f"자동 삭제 {'🟢 동작 중' if clean_files.is_running() else '🔴 멈춤'} · "
         f"영상 변환(ffmpeg) {'있음' if storage.can_convert() else '없음'}"
     ))
@@ -1933,6 +1935,23 @@ def file_link(row):
     return storage.link(row["key"], row["expires_at"] - time.time())
 
 
+def open_link(row):
+    """Link for buttons and text: the file's short link if it has one, else the long one."""
+    return row.get("url") or file_link(row)
+
+
+async def add_short_links(rows):
+    """Give each file a nnaco.kro.kr short link (made once, kept in the url column, expiring with the file)."""
+    for row in rows:
+        if row.get("url") or not shortlinks.configured():
+            continue
+        short = await shortlinks.shorten(file_link(row), row["expires_at"])
+        if short:
+            row["url"] = short
+            with connect_db() as conn:
+                conn.execute("UPDATE files SET url = ? WHERE id = ?", (short, row["id"]))
+
+
 def file_title(row):
     return (f"**{discord.utils.escape_markdown(row['name'])}** · {human_size(row['size'])} · "
             f"<t:{int(row['expires_at'])}:R> 자동 삭제")
@@ -1945,12 +1964,12 @@ def file_layout(rows, errors=(), header=None):
     if header:
         view.add_item(discord.ui.TextDisplay(header))
     for row in rows:
-        url = file_link(row)
+        url = open_link(row)
         media = (row["content_type"] or "").startswith(("image/", "video/"))
         card = discord.ui.Container(accent_colour=discord.Colour.green())
         card.add_item(discord.ui.TextDisplay(f"📁 {file_title(row)}"))
-        if media:
-            card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(url)))
+        if media:  # the storage link itself: Discord may not preview through a redirect
+            card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(file_link(row))))
         if len(url) <= 512:  # Discord's limit for a link button
             card.add_item(discord.ui.ActionRow(discord.ui.Button(
                 label="원본 열기" if storage.is_inline(row["content_type"]) else "다운로드", emoji="⬇️", url=url,
@@ -1966,7 +1985,7 @@ def file_layout(rows, errors=(), header=None):
 
 
 def file_line(row):
-    return f"{file_title(row)}\n{file_link(row)}"
+    return f"{file_title(row)}\n{open_link(row)}"
 
 
 def file_messages(rows, errors=()):
@@ -1988,6 +2007,7 @@ async def send_files(send, rows, errors=(), header=None):
     if not rows:
         text = "\n".join(f"⚠️ {e}" for e in errors)[:2000] or "올린 파일이 없습니다."
         return await send(content=f"{header}\n{text}" if header else text)
+    await add_short_links(rows)
     try:
         return await send(view=file_layout(rows, errors, header))
     except discord.HTTPException as exc:
@@ -2055,7 +2075,9 @@ async def start_browser_upload(guild_id, channel_id, user_id, name=""):
     """A pending upload and the page link where the user picks the file (any size up to FILE_MAX_BYTES)."""
     key = storage.new_key(guild_id, "upload")
     row = save_file_row(guild_id, channel_id, user_id, name.strip()[:MAX_NAME_LENGTH], key, "", 0, status="pending")
-    return row, await storage.upload_page_link(key, retention_text())
+    link = await storage.upload_page_link(key, retention_text())
+    # nnaco.kro.kr/xxxx: fits a link button, and has no "#|" for Discord to rewrite. Lives as long as the row.
+    return row, await shortlinks.shorten(link, row["expires_at"]) or link
 
 
 def browser_upload_text(link=None):
@@ -2222,6 +2244,7 @@ async def remove_file(row):
     """Delete from storage and the list; False if storage refused (the row is kept so cleanup retries)."""
     if not await storage.delete([row["key"]]):
         return False
+    await shortlinks.delete(row.get("url"))
     with connect_db() as conn:
         conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
         conn.commit()
