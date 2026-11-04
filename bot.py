@@ -564,8 +564,8 @@ OWNER_COMMANDS = [
                                     "봇 관리자는 항상 포함됩니다. (예: `£DB 관리자 추가 @닉네임`)"),
     ("£DB 한도 [서버ID|여기]", "서버별 파일 한도(서버 전체 용량, 파일당 최대 크기)와 사용량을 봅니다."),
     ("£DB 한도 <서버ID|여기> [용량 <크기>] [파일 <크기>]",
-     "그 서버의 한도를 바꿉니다. `기본`을 적으면 기본값으로 돌아가고, `초기화`는 둘 다 되돌립니다. "
-     "(예: `£DB 한도 여기 용량 2GB 파일 500MB`, `£DB 한도 123456789 파일 기본`)"),
+     "그 서버의 한도를 바꿉니다. 크기는 마음대로 정할 수 있고, `없음`은 한도 없음, `기본`은 기본값, `초기화`는 둘 다 되돌리기입니다. "
+     "(예: `£DB 한도 여기 용량 2GB 파일 500MB`, `£DB 한도 여기 용량 없음`, `£DB 한도 123456789 파일 기본`)"),
     ("£DB 한도 기본 [용량 <크기>] [파일 <크기>]", "따로 정하지 않은 서버들에 쓰는 기본 한도를 바꿉니다. (예: `£DB 한도 기본 파일 1GB`)"),
 ]
 
@@ -805,13 +805,20 @@ async def owner_db_admins(message, args):
     )
 
 
+UNLIMITED_WORDS = {"없음", "한도없음", "무제한", "제한없음", "unlimited", "none", "∞"}
+
+
 def parse_size(text):
-    """'500MB', '2GB', '1.5g', '300' (MB) -> bytes, or None."""
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb|k|m|g|t)?", text.strip().lower())
+    """'500MB', '2GB', '1.5g', '300' (MB) -> bytes; '없음' / '무제한' / '한도 없음' -> UNLIMITED; else None."""
+    text = text.strip().lower()
+    if text.replace(" ", "") in UNLIMITED_WORDS:
+        return UNLIMITED
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(b|kb|mb|gb|tb|k|m|g|t)?", text)
     if not match:
         return None
-    unit = {"k": 1, "m": 2, "g": 3, "t": 4}[(match[2] or "m")[0]]
-    return int(float(match[1]) * 1024 ** unit)
+    unit = {"b": 0, "k": 1, "m": 2, "g": 3, "t": 4}[(match[2] or "m")[0]]
+    size = int(float(match[1]) * 1024 ** unit)
+    return size if size > 0 else None
 
 
 LIMIT_WORDS = {"용량": "quota", "전체": "quota", "파일": "max", "최대": "max"}
@@ -820,8 +827,8 @@ LIMIT_WORDS = {"용량": "quota", "전체": "quota", "파일": "max", "최대": 
 def limits_line(guild_id):
     quota, used = guild_quota(guild_id), file_usage(guild_id)
     marks = {kind: "" if _limit_setting(kind, guild_id) else " (기본)" for kind in LIMIT_NAMES}
-    return (f"용량 **{human_size(used)} / {human_size(quota)}**{marks['quota']} · "
-            f"파일당 최대 **{human_size(guild_max_file(guild_id))}**{marks['max']}")
+    return (f"용량 **{human_size(used)} / {limit_size(quota)}**{marks['quota']} · "
+            f"파일당 최대 **{limit_size(guild_limit(guild_id, 'max'))}**{marks['max']}")
 
 
 async def owner_db_limits(message, args):
@@ -858,7 +865,7 @@ async def owner_db_limits(message, args):
             changes[kind] = size
         if not changes:
             await message.reply("알아보지 못했습니다. 예: `£DB 한도 여기 용량 2GB 파일 500MB`, `£DB 한도 기본 파일 1GB`, "
-                                "`£DB 한도 123456789 초기화`", mention_author=False)
+                                "`£DB 한도 여기 용량 없음`, `£DB 한도 123456789 초기화`", mention_author=False)
             return
     await message.reply(apply_limits(scope, changes)[1], mention_author=False)
 
@@ -873,38 +880,36 @@ def limit_changes(quota=None, max_size=None):
             continue
         size = None if value == "기본" else parse_size(value)
         if size is None and value != "기본":
-            return f"{LIMIT_NAMES[kind]} `{value}`를 알아보지 못했습니다. 예: 500MB, 2GB"
+            return f"{LIMIT_NAMES[kind]} `{value}`를 알아보지 못했습니다. 예: 500MB, 2GB, 한도 없음"
         changes[kind] = size
     return changes or "바꿀 값이 없습니다."
 
 
 def apply_limits(scope, changes):
     """(ok, message): save a server's limits (scope = guild id) or the defaults (scope = "default")."""
-    for kind, size in changes.items():
-        if size is None:
-            continue
-        low, high = 1024 ** 2, (FILE_MAX_HARD if kind == "max" else 1024 ** 5)
-        if not low <= size <= high:
-            return False, f"{LIMIT_NAMES[kind]}는 {human_size(low)} ~ {human_size(high)} 사이로 정해 주세요."
+    # Any size (or 한도 없음). Only what storage itself can't do is noted: one upload holds at most 5GB, and
+    # everything together stays within the bot-wide FILE_TOTAL_QUOTA.
     for kind, size in changes.items():
         key = f"file_limit:{kind}:{scope}"
         if size is None:
             with connect_db() as conn:
                 conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         else:
-            set_setting(key, size)
+            set_setting(key, "unlimited" if size == UNLIMITED else int(size))
     if scope == "default":
         where = "기본 한도 (따로 정하지 않은 서버)"
-        result = (f"서버 전체 용량 **{human_size(default_limit('quota'))}** · "
-                  f"파일당 최대 **{human_size(default_limit('max'))}**")
+        result = (f"서버 전체 용량 **{limit_size(default_limit('quota'))}** · "
+                  f"파일당 최대 **{limit_size(default_limit('max'))}**")
     else:
         where = f"**{guild_label(scope)}**"
         result = limits_line(scope)
     notes = []
     if scope != "default" and file_usage(scope) > guild_quota(scope):
         notes.append("지금 쓰는 용량이 한도보다 많습니다. 이미 올라간 파일은 그대로 두고, 공간이 생길 때까지 새로 올리기만 막습니다.")
-    if "quota" in changes and changes["quota"] and changes["quota"] > FILE_TOTAL_QUOTA:
-        notes.append(f"봇 전체 한도({human_size(FILE_TOTAL_QUOTA)}, `FILE_TOTAL_QUOTA_MB`)가 더 작아서 그 이상은 올라가지 않습니다.")
+    if changes.get("quota") and changes["quota"] > FILE_TOTAL_QUOTA:
+        notes.append(f"봇 전체 한도({human_size(FILE_TOTAL_QUOTA)}, `FILE_TOTAL_QUOTA_MB`) 안에서만 올라갑니다.")
+    if changes.get("max") and changes["max"] > FILE_MAX_HARD:
+        notes.append(f"저장소는 한 번에 {human_size(FILE_MAX_HARD)}까지만 받아서, 그보다 큰 파일은 올라가지 않습니다.")
     return True, (f"{where} 한도를 바꿨습니다.\n{result}" + "".join(f"\n-# {n}" for n in notes)
                   + "\n-# 이미 열어 둔 업로드 링크도 올린 뒤에 새 한도로 다시 확인합니다.")
 
@@ -912,7 +917,7 @@ def apply_limits(scope, changes):
 def limits_embed(message, target):
     embed = discord.Embed(title="파일 한도", color=discord.Color.blurple())
     embed.add_field(name="기본 (따로 정하지 않은 서버)", inline=False, value=(
-        f"서버 전체 용량 **{human_size(default_limit('quota'))}** · 파일당 최대 **{human_size(default_limit('max'))}**\n"
+        f"서버 전체 용량 **{limit_size(default_limit('quota'))}** · 파일당 최대 **{limit_size(default_limit('max'))}**\n"
         f"-# 봇 전체: {human_size(file_usage())} / {human_size(FILE_TOTAL_QUOTA)} · 한 파일은 5GB를 넘을 수 없습니다"
     ))
     if target == "여기" and message.guild:
@@ -931,7 +936,7 @@ def limits_embed(message, target):
                 break
             text += line + "\n"
         embed.add_field(name="따로 정한 서버", value=text, inline=False)
-    embed.set_footer(text="바꾸기: £DB 한도 <서버ID|여기|기본> 용량 2GB 파일 500MB")
+    embed.set_footer(text="바꾸기: £DB 한도 <서버ID|여기|기본> 용량 2GB 파일 500MB (없음 = 한도 없음)")
     return embed
 
 
@@ -1045,8 +1050,8 @@ async def db_status_embed():
     percent = used / total * 100 if total else 0
     embed.add_field(name="💾 용량", inline=False, value=(
         f"사용 {human_size(used)} / {human_size(total)} ({percent:.1f}%)\n"
-        f"남은 용량 **{human_size(max(0, total - used))}** · 기본 한도: 서버당 {human_size(default_limit('quota'))}, "
-        f"파일당 {human_size(default_limit('max'))} (`£DB 한도`)"
+        f"남은 용량 **{human_size(max(0, total - used))}** · 기본 한도: 서버당 {limit_size(default_limit('quota'))}, "
+        f"파일당 {limit_size(default_limit('max'))} (`£DB 한도`)"
     ))
     files_text = f"올라간 파일 **{ready:,}개** · 업로드 진행 중 {pending:,}개 · 자동 삭제 기간 {retention_text()}"
     if next_expiry:
@@ -1976,12 +1981,16 @@ def file_usage(guild_id=None):
 
 # ---- per-server limits (£DB 한도): "quota" = the server's total space, "max" = the largest single file.
 # Settings keys: file_limit:<quota|max>:default and file_limit:<quota|max>:<guild id>.
+# A limit of UNLIMITED ("한도 없음", stored as "unlimited") never blocks by itself.
 LIMIT_NAMES = {"quota": "서버 전체 용량", "max": "파일당 최대 크기"}
+UNLIMITED = math.inf
 
 
 def _limit_setting(kind, scope):
     try:
         value = get_setting(f"file_limit:{kind}:{scope}")
+        if value == "unlimited":
+            return UNLIMITED
         return int(value) if value else None
     except (ValueError, sqlite3.Error):
         return None
@@ -1993,10 +2002,13 @@ def default_limit(kind):
 
 
 def guild_limit(guild_id, kind):
-    """The server's own limit if a bot admin set one, else the default."""
+    """The limit as set: the server's own if a bot admin set one, else the default (may be UNLIMITED)."""
     value = _limit_setting(kind, guild_id) if guild_id else None
-    value = value or default_limit(kind)
-    return min(value, FILE_MAX_HARD) if kind == "max" else value
+    return value or default_limit(kind)
+
+
+def limit_size(value):
+    return "한도 없음" if value == UNLIMITED else human_size(value)
 
 
 def guild_quota(guild_id):
@@ -2004,7 +2016,13 @@ def guild_quota(guild_id):
 
 
 def guild_max_file(guild_id):
-    return guild_limit(guild_id, "max")
+    """Largest file the server allows: its setting, but never more than one upload can hold (5GB)."""
+    return min(guild_limit(guild_id, "max"), FILE_MAX_HARD)
+
+
+def max_file_text(guild_id):
+    value = guild_limit(guild_id, "max")
+    return f"한도 없음 (한 번에 {human_size(FILE_MAX_HARD)}까지)" if value >= FILE_MAX_HARD else human_size(value)
 
 
 def guild_upload_max(guild_id):
@@ -2014,6 +2032,8 @@ def guild_upload_max(guild_id):
 
 
 def too_big_message(guild_id):
+    if guild_limit(guild_id, "max") >= FILE_MAX_HARD:
+        return f"파일이 너무 큽니다. (저장소는 한 번에 {human_size(FILE_MAX_HARD)}까지만 받습니다)"
     return f"파일이 너무 큽니다. (이 서버는 파일당 최대 {human_size(guild_max_file(guild_id))})"
 
 
@@ -2027,7 +2047,7 @@ def check_file_quota(guild_id, size):
     used = file_usage(guild_id)
     if used + size > quota:
         raise storage.StorageError(
-            f"이 서버의 저장 공간이 부족합니다. (남은 용량 {human_size(max(0, quota - used))} / {human_size(quota)}) "
+            f"이 서버의 저장 공간이 부족합니다. (남은 용량 {human_size(max(0, quota - used))} / {limit_size(quota)}) "
             "`!파일삭제`로 정리하거나 자동 삭제를 기다려 주세요."
         )
     if file_usage() + size > FILE_TOTAL_QUOTA:
@@ -2317,7 +2337,7 @@ def browser_upload_text(guild_id, link=None):
     """link=None when the link is on a button instead (Discord link buttons hold up to 512 characters)."""
     return (
         (f"**[🌐 파일 올리는 페이지 열기]({link})**\n" if link else "")
-        + f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** (최대 {human_size(guild_max_file(guild_id))}, "
+        + f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** (최대 {max_file_text(guild_id)}, "
           "링크는 1시간 동안 사용)"
     )
 
@@ -2907,8 +2927,8 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
     embed = discord.Embed(title=title, description=text[:4096], color=color)
     if page == "files" and guild_id and storage.configured():
         quota, used = guild_quota(guild_id), file_usage(guild_id)
-        embed.set_footer(text=f"이 서버 · 남은 용량 {human_size(max(0, quota - used))} / {human_size(quota)} · "
-                              f"파일당 최대 {human_size(guild_max_file(guild_id))}")
+        space = "용량 한도 없음" if quota == UNLIMITED else f"남은 용량 {human_size(max(0, quota - used))} / {human_size(quota)}"
+        embed.set_footer(text=f"이 서버 · {space} · 파일당 최대 {max_file_text(guild_id)}")
     return {"embed": embed, "view": view}
 
 
@@ -3340,6 +3360,11 @@ def plain_text(text):
     return text.replace("**", "").replace("`", "")
 
 
+def json_limit(value):
+    """-1 for 한도 없음 (JSON has no infinity)."""
+    return -1 if value == UNLIMITED else int(value)
+
+
 def user_name(user_id):
     user = bot.get_user(user_id)
     return user.display_name if user else ""
@@ -3356,7 +3381,7 @@ async def dashboard_snapshot():
             "memory": {"current": current, "peak": peak, "limit": env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024},
         },
         "retention": {"seconds": file_retention(), "text": retention_text(), "maxText": human_duration(retention_max)},
-        "limits": {"quota": default_limit("quota"), "max": min(default_limit("max"), FILE_MAX_HARD),
+        "limits": {"quota": json_limit(default_limit("quota")), "max": json_limit(default_limit("max")),
                    "hardMax": FILE_MAX_HARD, "totalQuota": FILE_TOTAL_QUOTA},
         "storage": {"configured": storage.configured()},
         "guilds": [], "admins": [], "files": [], "filesTotal": 0,
@@ -3380,7 +3405,7 @@ async def dashboard_snapshot():
         snapshot["guilds"].append({
             "id": str(guild_id), "name": guild.name if guild else f"(나간 서버) {guild_id}",
             "members": guild.member_count if guild else None, "used": used, "files": count,
-            "quota": guild_quota(guild_id), "max": guild_max_file(guild_id),
+            "quota": json_limit(guild_quota(guild_id)), "max": json_limit(guild_limit(guild_id, "max")),
             "customQuota": f"file_limit:quota:{guild_id}" in custom, "customMax": f"file_limit:max:{guild_id}" in custom,
         })
     for row in files:
