@@ -3706,6 +3706,11 @@ async def dashboard_loop():
                 await dashboard.report(snapshot)
         except dashboard.NotBound:
             problem, delay = "다른 키가 대시보드에 연결돼 있습니다. 대시보드 → 설정 → 봇 연결에서 해제해 주세요.", 300
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as exc:
+            # TimeoutError carries no message of its own; say where and what to check.
+            reason = "10초 안에 응답하지 않았습니다" if isinstance(exc, asyncio.TimeoutError) else f"연결 실패 ({exc})"
+            problem, delay = (f"NKOTE({shortlinks.BASE_URL})가 {reason}. 브라우저에서 이 주소가 열리는지, "
+                              "`£DB 테스트`의 단축 링크 항목이 되는지 확인해 주세요. 1분 뒤 다시 시도합니다."), 60
         except Exception as exc:
             problem, delay = f"{type(exc).__name__}: {exc}", 60
         if problem and problem != last_problem:
