@@ -56,6 +56,15 @@ S3 호환 저장소라면 어디든 쓸 수 있습니다. 아래는 Backblaze B2
 - 파일은 메모리에 통째로 담지 않고 조금씩 저장소로 흘려보내므로, 큰 파일을 올려도 봇의 메모리 사용량은 거의 늘지 않습니다.
 - 한도: 서버당 `FILE_GUILD_QUOTA_MB`, 전체 `FILE_TOTAL_QUOTA_MB`(기본 각 10GB), 파일당 `FILE_MAX_MB`(기본 5GB, 한 번에 올릴 수 있는 최대 크기). 디스코드 첨부는 서버 부스트에 따라 더 작은 제한이 있어 큰 파일은 업로드 페이지를 씁니다.
 
+## 단축 링크 (NKOTE, nnaco.kro.kr)
+업로드 페이지 링크와 파일의 [원본 열기]·[다운로드] 버튼을 `nnaco.kro.kr/xxxxxxxxxx`처럼 짧게 줄입니다. 사진·영상 미리보기는 원래 저장소 주소를 씁니다.
+1. [NKOTE](https://github.com/nkxwert/NKOTE)를 Vercel에 배포하고 nnaco.kro.kr을 연결합니다. (NKOTE README 참고. 봇 소개·약관·개인정보 페이지도 NKOTE가 제공합니다)
+2. `nnaco.kro.kr/manage`에 관리자 키로 접속해 **API 키 발급**에서 봇용 키를 만듭니다.
+3. `.env`에 `NKOTE_URL=https://nnaco.kro.kr`, `NKOTE_API_KEY=nk_…`를 넣고 재시작합니다.
+- 링크는 10자리 무작위 주소이고, 업로드 링크는 1시간 뒤, 파일 링크는 파일과 같은 시각에 만료됩니다. 파일을 지우면 단축 링크도 지웁니다.
+- NKOTE가 응답하지 않으면 긴 링크를 씁니다. `£DB 테스트`에서 단축 링크 만들기·열기를 확인할 수 있습니다.
+- 이 저장소의 `index.html`·`terms.html`·`privacy.html`·`CNAME`(GitHub Pages)은 nnaco.kro.kr을 Vercel로 옮긴 뒤에는 쓰이지 않습니다.
+
 ## 메모리 (128MB 호스팅)
 - 봇은 메모리를 아끼도록 설정되어 있습니다: DB 연결을 쓰자마자 닫음, 저장소 통신을 boto3 없이 직접 처리, 파일은 조금씩 흘려보냄, 통신 세션 공유, 디스코드 메시지 캐시 끔, 작업 스레드 2개, 메모리 할당기 조정(arena 2개, 큰 버퍼는 바로 반납), 전적 캐시·폰트 캐시 상한.
 - `£DB`의 🧠 메모리에서 지금 사용량과 켜진 뒤 최대치를 볼 수 있습니다. 호스팅 한도가 128MB가 아니면 `.env`의 `MEMORY_LIMIT_MB`로 맞춥니다.

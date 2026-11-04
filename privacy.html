@@ -55,13 +55,14 @@
     <tr><td>crafatar.com, mc-heads.net</td><td>조회한 플레이어의 UUID (스킨 이미지용)</td><td><code>!H전적</code> 사용 시</td></tr>
     <tr><td>HenrikDev API</td><td>조회한 Riot ID, 지역</td><td><code>!V전적</code> 사용 시</td></tr>
     <tr><td>Backblaze B2 (파일 저장소)</td><td>올린 파일 (링크가 있으면 누구나 볼 수 있음)</td><td><code>!올리기</code> 사용 시</td></tr>
+    <tr><td>NKOTE 단축 링크 (Vercel, Upstash)</td><td>파일과 업로드 페이지의 원래 주소, 링크를 연 횟수. 링크를 열 때 접속 기록(IP 주소 등)이 Vercel을 거칩니다</td><td>파일을 올리거나 업로드 링크를 받을 때 (파일과 같은 기간 뒤, 업로드 링크는 1시간 뒤 자동 삭제)</td></tr>
     <tr><td>media.valorant-api.com</td><td>사용자 정보 없음 (랭크·요원 아이콘 이미지 요청)</td><td><code>!V전적</code> 사용 시</td></tr>
   </table>
   </div>
   <p>각 서비스가 받은 정보를 어떻게 처리하는지는 해당 서비스의 정책을 따릅니다. 봇 운영자는 정보를 판매하거나 위 목적 외로 다른 곳에 제공하지 않습니다.</p>
 
   <h2>3. 저장 위치</h2>
-  <p>정보는 봇을 실행하는 호스팅 서버에 저장됩니다. 올린 파일은 Backblaze B2(미국 서부)에 저장됩니다.</p>
+  <p>정보는 봇을 실행하는 호스팅 서버에 저장됩니다. 올린 파일은 Backblaze B2(미국 서부)에 저장됩니다. nnaco.kro.kr 단축 링크는 Upstash(Vercel 연동)에 만료 시각까지 저장됩니다.</p>
 
   <h2>4. 정보 삭제</h2>
   <ul>
