@@ -3,6 +3,7 @@
 Used for the upload page link and the [원본 열기] buttons, so links stay short (Discord link buttons hold
 512 characters) and carry no "#|" for Discord to rewrite. Every short link expires with what it points to.
 If NKOTE isn't configured or doesn't answer, callers simply keep the long link."""
+import hashlib
 import os
 import secrets
 import time
@@ -97,3 +98,27 @@ async def self_test():
         results.append(("단축 링크 열기", False, f"{type(exc).__name__}: {exc}"))
     await delete(short)
     return results
+
+
+# ---- upload signals: the upload page reports "started"/"done" to NKOTE; the bot reads them with its key,
+# so it notices a finished upload within seconds without polling the file storage.
+
+def signal_id(key):
+    """Per-upload id, derived from the storage key and the bot's secret key: unguessable, and the same after
+    a restart without being stored anywhere."""
+    return hashlib.sha256(f"maco-signal:{API_KEY}:{key}".encode()).hexdigest()[:32]
+
+
+def signal_url(key):
+    return f"{BASE_URL}/api/signal/{signal_id(key)}" if configured() else None
+
+
+async def get_signal(key):
+    """"started", "done", None (nothing yet), or raises on a connection problem."""
+    async with net.session().get(f"{BASE_URL}/api/signal/{signal_id(key)}", headers=_headers(),
+                                 timeout=TIMEOUT) as response:
+        if response.status == 404:
+            return None
+        if response.status != 200:
+            raise RuntimeError(f"NKOTE 신호 확인 HTTP {response.status}")
+        return (await response.json(content_type=None)).get("state")

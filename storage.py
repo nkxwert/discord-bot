@@ -53,10 +53,10 @@ CHUNK_SIZE = 64 * 1024
 
 UPLOAD_PAGE_KEY = "upload.html"  # the big-file upload page, served from the bucket itself
 UPLOAD_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "upload.html")
-PRESIGN_SECONDS = 600
+PRESIGN_SECONDS = 60 * 60  # as long as an unfinished upload is kept
 # Bump together with <meta name="maco-upload-page"> in assets/upload.html whenever the link format changes,
 # so an old page file left on the host is noticed instead of failing with "올바른 업로드 링크가 아닙니다".
-UPLOAD_PAGE_VERSION = "5"
+UPLOAD_PAGE_VERSION = "6"
 
 # Shown in the browser / played in Discord. Everything else is stored as a plain download, so an uploaded
 # HTML or SVG file can't be opened as a web page on our domain (phishing, scripts).
@@ -696,7 +696,7 @@ def _part(text):
     return quote(text, safe=":/=-_.~")
 
 
-async def upload_page_link(key, retention="7일"):
+async def upload_page_link(key, retention="7일", signal_url=None):
     """Link to the upload page. Where to upload (and the retention shown) ride in the #fragment, which
     browsers never send to a server. Parts are joined with "!" (Discord rewrites "|" to "%7C").
     On B2: "b2!<upload URL>!<token>!<key>!<retention>" on the short page link; elsewhere (or if B2's API
@@ -704,7 +704,8 @@ async def upload_page_link(key, retention="7일"):
     if is_b2():
         try:
             upload_url, token = await b2_upload_target()
-            fragment = "!".join(["b2", _part(upload_url), _part(token), _part(key), _part(retention)])
+            fragment = "!".join(["b2", _part(upload_url), _part(token), _part(key), _part(retention)]
+                                + ([_part(signal_url)] if signal_url else []))
             try:
                 page = await b2_page_url()
             except Exception as exc:
@@ -713,7 +714,8 @@ async def upload_page_link(key, retention="7일"):
             return f"{page}#{fragment}"
         except Exception as exc:
             print(f"B2 업로드 주소 받기 실패, 서명 링크로 대신합니다: {type(exc).__name__}: {exc}")
-    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}!{_part(retention)}"
+    signal = f"!{_part(signal_url)}" if signal_url else ""
+    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}!{_part(retention)}{signal}"
 
 
 # ---------------------------------------------------------------- video conversion (optional, off by default)

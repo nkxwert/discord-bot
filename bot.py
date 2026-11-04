@@ -1953,8 +1953,7 @@ async def add_short_links(rows):
 
 
 def file_title(row):
-    return (f"**{discord.utils.escape_markdown(row['name'])}** · {human_size(row['size'])} · "
-            f"<t:{int(row['expires_at'])}:R> 자동 삭제")
+    return f"**{discord.utils.escape_markdown(row['name'])}** · {human_size(row['size'])}"
 
 
 def file_layout(rows, errors=(), header=None):
@@ -1970,18 +1969,45 @@ def file_layout(rows, errors=(), header=None):
         card.add_item(discord.ui.TextDisplay(f"📁 {file_title(row)}"))
         if media:  # the storage link itself: Discord may not preview through a redirect
             card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(file_link(row))))
+        buttons = discord.ui.ActionRow()
         if len(url) <= 512:  # Discord's limit for a link button
-            card.add_item(discord.ui.ActionRow(discord.ui.Button(
+            buttons.add_item(discord.ui.Button(
                 label="원본 열기" if storage.is_inline(row["content_type"]) else "다운로드", emoji="⬇️", url=url,
-            )))
+            ))
         else:
             card.add_item(discord.ui.TextDisplay(f"[⬇️ 다운로드]({url})"))
+        buttons.add_item(CopyLinkButton(row["id"]))
+        card.add_item(buttons)
         view.add_item(card)
     for error in errors:
         view.add_item(discord.ui.TextDisplay(f"⚠️ {error}"[:1900]))
-    if rows:
-        view.add_item(discord.ui.TextDisplay(f"-# {file_notice()}"))
     return view
+
+
+class CopyLinkButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:copy:(?P<row_id>\d+)"):
+    """[📋 링크 복사]: Discord buttons can't write to the clipboard, so this shows the link privately in a code
+    box (long-press or select to copy). Works after a restart too."""
+
+    def __init__(self, row_id):
+        super().__init__(discord.ui.Button(
+            label="링크 복사", emoji="📋", style=discord.ButtonStyle.secondary, custom_id=f"maco:copy:{row_id}",
+        ))
+        self.row_id = row_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["row_id"]))
+
+    async def callback(self, interaction):
+        with connect_db() as conn:
+            row = conn.execute("SELECT * FROM files WHERE id = ? AND status = 'ready'", (self.row_id,)).fetchone()
+        if not row:
+            await interaction.response.send_message("삭제됐거나 기간이 지난 파일입니다.", ephemeral=True)
+            return
+        row = dict(row)
+        if not row.get("url"):
+            await add_short_links([row])
+        await interaction.response.send_message(f"```\n{open_link(row)}\n```", ephemeral=True)
 
 
 def file_line(row):
@@ -1991,8 +2017,6 @@ def file_line(row):
 def file_messages(rows, errors=()):
     """Plain-text fallback (if Discord refuses the layout), split under 2000 characters without cutting a link."""
     parts = [file_line(r) for r in rows] + [f"⚠️ {e}"[:1900] for e in errors]
-    if rows:
-        parts.append(file_notice())
     messages = [""]
     for part in parts:
         if messages[-1] and len(messages[-1]) + 2 + len(part) > 2000:
@@ -2075,7 +2099,7 @@ async def start_browser_upload(guild_id, channel_id, user_id, name=""):
     """A pending upload and the page link where the user picks the file (any size up to FILE_MAX_BYTES)."""
     key = storage.new_key(guild_id, "upload")
     row = save_file_row(guild_id, channel_id, user_id, name.strip()[:MAX_NAME_LENGTH], key, "", 0, status="pending")
-    link = await storage.upload_page_link(key, retention_text())
+    link = await storage.upload_page_link(key, retention_text(), shortlinks.signal_url(key))
     # nnaco.kro.kr/xxxx: fits a link button, and has no "#|" for Discord to rewrite. Lives as long as the row.
     return row, await shortlinks.shorten(link, row["expires_at"]) or link
 
@@ -2084,8 +2108,7 @@ def browser_upload_text(link=None):
     """link=None when the link is on a button instead (Discord link buttons hold up to 512 characters)."""
     return (
         (f"**[🌐 파일 올리는 페이지 열기]({link})**\n" if link else "")
-        + f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** 안 올라가면 **[업로드 완료]**를 눌러 주세요.\n"
-        f"링크는 10분 동안 쓸 수 있고, 파일당 최대 {human_size(FILE_MAX_BYTES)}입니다.\n{file_notice()}"
+        + f"페이지에서 파일을 올리면 **자동으로 채널에 올라갑니다.** (최대 {human_size(FILE_MAX_BYTES)}, 링크는 1시간 동안 사용)"
     )
 
 
@@ -2123,6 +2146,7 @@ async def finish_upload(row_id):
                 return "gone", "업로드 시간이 지났습니다. 다시 `!올리기`를 해 주세요."
             return "waiting", "아직 올라간 파일이 없습니다. 페이지에서 파일을 다 올린 뒤 눌러 주세요."
         size, content_type, filename = info
+        await upload_placeholder(row, "⏳ 파일 불러오는 중...")
         try:
             if size > FILE_MAX_BYTES:
                 raise storage.StorageError(f"파일이 너무 큽니다. (최대 {human_size(FILE_MAX_BYTES)})")
@@ -2130,6 +2154,7 @@ async def finish_upload(row_id):
         except storage.StorageError as exc:
             await storage.delete([row["key"]])
             drop_file_row(row_id)
+            await upload_placeholder(row, f"⚠️ {exc} 올린 파일은 지웠습니다.", final=True)
             return "failed", f"{exc} 올린 파일은 지웠습니다."
         filename = filename or storage.name_for_type(content_type)
         key, stored_type, size, filename = await storage.finish_browser_upload(row["key"], filename, content_type, size)
@@ -2148,39 +2173,131 @@ async def finish_upload(row_id):
     return "done", f"✅ **{discord.utils.escape_markdown(name)}** 올리기를 마쳤습니다. 채널에 올렸습니다."
 
 
-async def post_upload(row):
-    """Post a finished browser upload in the channel where it was started."""
+_placeholders = {}  # row id -> the "⏳ ..." channel message that becomes the file card
+
+
+async def upload_channel(row):
     channel = bot.get_channel(row["channel_id"])
     if channel is None:
         try:
             channel = await bot.fetch_channel(row["channel_id"])
         except discord.HTTPException:
-            return
+            return None
+    return channel
+
+
+def upload_header(row):
+    return f"-# <@{row['uploaded_by']}>님이 올린 파일"
+
+
+async def upload_placeholder(row, text, final=False):
+    """Show (or update) a channel message for a browser upload in progress: "⏳ 올리는 중..." when the page
+    starts, "⏳ 불러오는 중..." once the file is in storage. It turns into the file card at the end."""
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(discord.ui.TextDisplay(f"{upload_header(row)}\n{text}"))
+    message = _placeholders.pop(row["id"], None) if final else _placeholders.get(row["id"])
     try:
-        await send_files(channel.send, [row], header=f"-# <@{row['uploaded_by']}>님이 올린 파일")
+        if message:
+            await message.edit(view=view)
+        elif not final:
+            channel = await upload_channel(row)
+            if channel:
+                _placeholders[row["id"]] = await channel.send(view=view)
+    except discord.HTTPException as exc:
+        print(f"업로드 진행 표시 실패: {type(exc).__name__}: {exc}")
+
+
+async def post_upload(row):
+    """Post a finished browser upload in the channel where it was started (turning the "⏳" message into it)."""
+    placeholder = _placeholders.pop(row["id"], None)
+    if placeholder:
+        await add_short_links([row])
+        try:
+            await placeholder.edit(view=file_layout([row], header=upload_header(row)))
+            return
+        except discord.HTTPException as exc:
+            print(f"업로드 결과로 바꾸기 실패, 새로 보냅니다: {type(exc).__name__}: {exc}")
+            try:
+                await placeholder.delete()
+            except discord.HTTPException:
+                pass
+    channel = await upload_channel(row)
+    if channel is None:
+        return
+    try:
+        await send_files(channel.send, [row], header=upload_header(row))
     except discord.HTTPException as exc:
         print(f"업로드 결과 전송 실패: {type(exc).__name__}: {exc}")
 
 
+SIGNAL_WATCH_SECONDS = 60 * 60  # as long as the link and the pending upload last
+STORAGE_CHECK_SECONDS = 60  # with signals, still look in the storage now and then (signal lost, NKOTE down)
+
+
+def signal_poll_delay(elapsed):
+    """Seconds between signal checks: quick while an upload is likely, slower later (NKOTE requests)."""
+    return 3 if elapsed < 180 else 6 if elapsed < 600 else 20
+
+
 def watch_upload(row_id, on_finish):
-    """Look for the file in the background (with growing gaps, about 10 minutes in all), so the user doesn't
-    have to press [업로드 완료]. on_finish(message) updates the private message that held the link."""
-    async def watch():
+    """Post the file as soon as it arrives, so nobody has to press [업로드 완료]. With NKOTE the upload page
+    signals "started"/"done" and the bot checks that every few seconds; without it the bot looks in the
+    storage with growing gaps (about 10 minutes). on_finish(message) updates the private link message."""
+    async def finish(log_label):
+        try:
+            return await finish_upload(row_id)
+        except Exception as exc:
+            print(f"업로드 확인 오류 ({log_label}): {type(exc).__name__}: {exc}")
+            return "waiting", ""
+
+    async def report(state, message):
+        if state != "gone" or "시간이 지났" in message:
+            try:
+                await on_finish(message)
+            except discord.HTTPException:
+                pass
+
+    async def watch_storage():
         for delay in UPLOAD_WATCH_DELAYS:
             await asyncio.sleep(delay)
+            state, message = await finish("저장소")
+            if state != "waiting":
+                return await report(state, message)
+
+    async def watch_signal(row):
+        started = time.time()
+        last_storage_check = started
+        announced = False
+        failures = 0
+        while time.time() - started < SIGNAL_WATCH_SECONDS:
+            await asyncio.sleep(signal_poll_delay(time.time() - started))
             try:
-                state, message = await finish_upload(row_id)
+                signal = await shortlinks.get_signal(row["key"])
+                failures = 0
             except Exception as exc:
-                print(f"업로드 확인 오류: {type(exc).__name__}: {exc}")
-                continue
-            if state == "waiting":
-                continue
-            if state != "gone" or "시간이 지났" in message:
-                try:
-                    await on_finish(message)
-                except discord.HTTPException:
-                    pass
+                failures += 1
+                signal = None
+                if failures == 5:
+                    print(f"NKOTE 신호 확인 실패가 계속됩니다: {type(exc).__name__}: {exc}")
+            if signal == "started" and not announced:
+                announced = True
+                await upload_placeholder(row, "⏳ 파일 올리는 중...")
+            if signal == "done" or time.time() - last_storage_check > STORAGE_CHECK_SECONDS * (1 + failures // 5):
+                last_storage_check = time.time()
+                state, message = await finish("신호" if signal == "done" else "저장소 확인")
+                if state != "waiting":
+                    return await report(state, message)
+
+    async def watch():
+        with connect_db() as conn:
+            row = conn.execute("SELECT * FROM files WHERE id = ?", (row_id,)).fetchone()
+        if not row:
             return
+        if shortlinks.configured():
+            await watch_signal(dict(row))
+        else:
+            await watch_storage()
+        await upload_placeholder(dict(row), "⚠️ 업로드가 끝나지 않았습니다.", final=True)  # only if one was shown
 
     task = asyncio.get_running_loop().create_task(watch())
     _background_tasks.add(task)
@@ -2257,7 +2374,8 @@ def file_list_text(files, everyone):
         return None
     lines = [
         f"• **{discord.utils.escape_markdown(f['name'])}** · {human_size(f['size'])}"
-        + (f" · <@{f['uploaded_by']}>" if everyone else "") + f" · <t:{int(f['expires_at'])}:R> 삭제"
+        + (f" · <@{f['uploaded_by']}>" if everyone else "")
+        + f" · 만료 <t:{int(f['expires_at'])}:f> (<t:{int(f['expires_at'])}:R>)"
         for f in files
     ]
     text = ""
@@ -2963,7 +3081,7 @@ async def help_slash(interaction: discord.Interaction):
 async def setup_hook():
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
-    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton)
+    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton)
     await load_help_emojis()
     if storage.configured():
         problems = await storage.setup_bucket()
