@@ -103,7 +103,7 @@ async def self_test():
     """[(label, ok, detail)] for £DB 테스트: make a short link, open it (without following), delete it."""
     if not configured():
         return [("단축 링크 (NKOTE)", True, "설정 안 됨 (NKOTE_URL / NKOTE_API_KEY) · 긴 링크를 씁니다")]
-    target = f"https://example.com/maco-selftest#b2!x!y!files/1/z/upload!7%EC%9D%BC"
+    target = "https://example.com/maco-selftest#b2!x!y!files/1/z/upload!7%EC%9D%BC"
     short = await shorten(target, time.time() + 300)
     if not short:
         return [("단축 링크 만들기", False, "실패 (봇 로그에 이유가 남습니다)")]

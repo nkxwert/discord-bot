@@ -65,7 +65,7 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "uptime.db")
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 10, 1)
 HISTORY_DAYS = 30
-PRUNE_INTERVAL_SECONDS = 60
+PRUNE_INTERVAL_SECONDS = 600
 MAX_SERVERS_PER_GUILD = 10
 MAX_NAME_LENGTH = 30
 NO_SERVER_MESSAGE = "등록된 서버가 없습니다. `!주소추가 <주소> [이름]`으로 추가해 주세요."
@@ -103,8 +103,21 @@ OWNER_IDS = {int(i) for i in re.findall(r"\d+", os.getenv("BOT_OWNER_IDS", ""))}
 
 intents = discord.Intents.default()
 intents.message_content = True
+class MacoContext(commands.Context):
+    async def reply(self, content=None, **kwargs):
+        """Reply to the command message; if it was deleted meanwhile (stats take seconds), the answer still
+        arrives as a plain message instead of failing with an error."""
+        kwargs.setdefault("reference", self.message.to_reference(fail_if_not_exists=False))
+        return await self.send(content, **kwargs)
+
+
+class MacoBot(commands.Bot):
+    async def get_context(self, origin, *, cls=MacoContext):
+        return await super().get_context(origin, cls=cls)
+
+
 # Replies echo user input (server names, Riot IDs); never let that ping @everyone, roles or users.
-bot = commands.Bot(
+bot = MacoBot(
     command_prefix="!",
     intents=intents,
     help_command=None,
@@ -247,6 +260,8 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_samples_server_time ON samples(server_id, checked_at)"
         )
+        # For deleting old samples by time; without it every cleanup read the whole table.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_time ON samples(checked_at)")
 
         # Move the old one-address-per-guild table into the new one, keeping its history.
         legacy = conn.execute(
@@ -392,20 +407,25 @@ async def query_external(address: str):
         # Keyed by error kind, not address, so an mcsrvstat outage is one DM rather than one per server.
         kind = f"HTTP {exc.status}" if isinstance(exc, aiohttp.ClientResponseError) else type(exc).__name__
         notify_admin("외부 상태 조회(mcsrvstat) 실패", kind, f"주소: {address}\n{type(exc).__name__}: {exc}")
+    if len(external_cache) >= 300:
+        for key in [k for k, (at, _) in external_cache.items() if now - at >= EXTERNAL_COOLDOWN_SECONDS]:
+            del external_cache[key]
     external_cache[address.lower()] = (now, result)
     return result
 
 
-async def query_server(address: str):
-    """Returns (online, latency_ms, players_online, players_max, via_external)."""
+async def query_server(address: str, quiet=False):
+    """Returns (online, latency_ms, players_online, players_max, via_external). quiet: no log line on failure
+    (the background check logs only when a server goes down)."""
     try:
         # async_lookup: the plain lookup() resolves SRV records synchronously and freezes the whole bot.
-        server = await JavaServer.async_lookup(address)
+        server = await asyncio.wait_for(JavaServer.async_lookup(address), timeout=5)
         status = await asyncio.wait_for(server.async_status(), timeout=5)
         latency = float(status.latency) if status.latency is not None else None
         return True, latency, status.players.online, status.players.max, False
     except Exception as exc:
-        print(f"상태 확인 실패 ({address}): {type(exc).__name__}: {exc}")
+        if not quiet:
+            print(f"상태 확인 실패 ({address}): {type(exc).__name__}: {exc}")
     if EXTERNAL_FALLBACK and can_use_external(address):
         return (*await query_external(address), True)
     return False, None, None, None, False
@@ -436,14 +456,15 @@ def all_servers():
         return conn.execute("SELECT id, guild_id, address FROM servers").fetchall()
 
 
-def save_sample(server_id: int, guild_id: int, online: bool, latency_ms):
+def save_samples(samples):
+    """[(server id, guild id, online, latency)] in one transaction (the background check saves all at once)."""
     global last_prune
     now = time.time()
     with connect_db() as conn:
-        conn.execute(
+        conn.executemany(
             "INSERT INTO samples(server_id, guild_id, checked_at, online, latency_ms) "
             "VALUES (?, ?, ?, ?, ?)",
-            (server_id, guild_id, now, int(online), latency_ms),
+            [(server_id, guild_id, now, int(online), latency) for server_id, guild_id, online, latency in samples],
         )
         if now - last_prune >= PRUNE_INTERVAL_SECONDS:
             conn.execute(
@@ -455,22 +476,18 @@ def save_sample(server_id: int, guild_id: int, online: bool, latency_ms):
 
 
 def uptime_stats(server_id: int, since: float):
+    """(percentage, samples, average latency) since a time. Counted by SQLite: a week of checks every 10
+    seconds is ~60,000 rows per server, which used to be loaded into Python on every !업타임."""
     with connect_db() as conn:
-        rows = conn.execute(
-            "SELECT online, latency_ms FROM samples "
-            "WHERE server_id = ? AND checked_at >= ? ORDER BY checked_at",
+        count, online_count, average_latency = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(online), 0), "
+            "AVG(CASE WHEN online AND latency_ms IS NOT NULL THEN latency_ms END) "
+            "FROM samples WHERE server_id = ? AND checked_at >= ?",
             (server_id, since),
-        ).fetchall()
-    if not rows:
+        ).fetchone()
+    if not count:
         return None, 0, None
-    online_count = sum(row["online"] for row in rows)
-    percentage = online_count / len(rows) * 100
-    latencies = [
-        row["latency_ms"] for row in rows
-        if row["online"] and row["latency_ms"] is not None
-    ]
-    average_latency = sum(latencies) / len(latencies) if latencies else None
-    return percentage, len(rows), average_latency
+    return online_count / count * 100, count, average_latency
 
 
 def percent_text(percentage):
@@ -1485,8 +1502,8 @@ async def uptime(ctx, *, name: str = ""):
     results, notice = await run_with_notice(
         ctx, asyncio.gather(*(query_server(s["address"]) for s in servers))
     )
-    for server, (online, latency, _, _, _) in zip(servers, results):
-        save_sample(server["id"], ctx.guild.id, online, latency)
+    save_samples([(server["id"], ctx.guild.id, online, latency)
+                  for server, (online, latency, _, _, _) in zip(servers, results)])
 
     now = time.time()
     if name:
@@ -2877,15 +2894,46 @@ class HelpContext:
 
     async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
         extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
-        content = self.with_header(content)
-        try:
-            message = await self.channel.send(content, **extra)
-        except (discord.HTTPException, AttributeError):
-            # No permission to post in this channel (or no channel object): answer through the interaction.
-            if file is not None:
-                file.reset()
-            message = await self.interaction.followup.send(content, wait=True, **extra)
-        return HeaderMessage(message, self)
+        if can_post_in(self.channel):
+            try:
+                return HeaderMessage(await self.channel.send(self.with_header(content), **extra), self)
+            except discord.HTTPException as exc:
+                print(f"도움말 결과를 채널에 올리지 못해 도움말 메시지에 보여 줍니다: {type(exc).__name__}: {exc}")
+                if file is not None:
+                    file.reset()
+        # The bot can't post here (no permission in this channel or thread). The result goes into the private
+        # help message itself: a follow-up to it would show "원본 메시지가 삭제되었어요" once it is closed.
+        reply = HelpMessageReply(self.interaction)
+        await reply.edit(content=content, embed=embed, attachments=[file] if file else [], **({"view": view} if view else {}))
+        return reply
+
+
+def can_post_in(channel):
+    """False when the bot surely can't post (with pictures) in this channel; True when it can or can't tell."""
+    if not isinstance(channel, (discord.abc.GuildChannel, discord.Thread)):
+        return channel is not None  # DM, or a channel the bot doesn't know: just try
+    perms = channel.permissions_for(channel.guild.me)
+    talk = perms.send_messages_in_threads if isinstance(channel, discord.Thread) else perms.send_messages
+    return perms.view_channel and talk and perms.attach_files and perms.embed_links
+
+
+class HelpMessageReply:
+    """A result shown in the private /도움말 message (when it can't be posted in the channel). Edits replace
+    the help page; its buttons stay unless the result brings its own, and [◀ 처음으로] redraws the menu."""
+
+    def __init__(self, interaction):
+        self.interaction = interaction
+
+    async def edit(self, **changes):
+        changes.setdefault("embed", None)  # the help page's embed would hide the result
+        if "view" in changes and changes["view"] is None:  # a finished result: offer the way back
+            changes["view"] = discord.ui.View(timeout=None)
+            changes["view"].add_item(HelpButton("home", "◀ 처음으로", style=discord.ButtonStyle.secondary))
+        if self.interaction.response.is_done():
+            await self.interaction.edit_original_response(**changes)
+        else:
+            await self.interaction.response.edit_message(**changes)
+        return self
 
 
 class HeaderMessage:
@@ -2994,6 +3042,8 @@ async def show_help(interaction, **page):
     seconds, so the page is shown at once with [⏳ 준비 중...] and the link is filled in afterwards
     (waiting first made the 파일 button look like it did nothing)."""
     async def draw(**changes):
+        changes.setdefault("attachments", [])  # a result shown in this message (see HelpMessageReply)
+        changes.setdefault("content", None)
         if interaction.response.is_done():
             await interaction.edit_original_response(**changes)
         else:
@@ -3692,6 +3742,10 @@ async def setup_hook():
 bot.setup_hook = setup_hook
 
 
+MONITOR_CONCURRENCY = 5  # servers checked at once: one slow server no longer delays all the others
+_monitor_state = {}  # server id -> online at the last background check (to log only changes)
+
+
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def monitor_servers():
     # An exception escaping this loop stops background checks for good, so contain every error.
@@ -3701,17 +3755,32 @@ async def monitor_servers():
         print(f"백그라운드 확인 오류: {type(exc).__name__}: {exc}")
         notify_admin("백그라운드 서버 확인 오류", f"{type(exc).__name__}: {exc}", "서버 목록 읽기", traceback.format_exc())
         return
-    for row in rows:
-        try:
-            online, latency, _, _, _ = await query_server(row["address"])
-            save_sample(row["id"], row["guild_id"], online, latency)
-        except Exception as exc:
-            print(f"백그라운드 확인 오류 ({row['address']}): {type(exc).__name__}: {exc}")
-            notify_admin(
-                "백그라운드 서버 확인 오류", f"{type(exc).__name__}: {exc}", f"주소: {row['address']}",
-                traceback.format_exc(),
-            )
-        await asyncio.sleep(0.2)
+    limit = asyncio.Semaphore(MONITOR_CONCURRENCY)
+
+    async def check(row):
+        async with limit:
+            try:
+                online, latency, _, _, _ = await query_server(row["address"], quiet=True)
+            except Exception as exc:
+                print(f"백그라운드 확인 오류 ({row['address']}): {type(exc).__name__}: {exc}")
+                notify_admin("백그라운드 서버 확인 오류", f"{type(exc).__name__}: {exc}", f"주소: {row['address']}",
+                             traceback.format_exc())
+                return None
+            if _monitor_state.get(row["id"], True) != online:
+                print(f"서버 {'다시 켜짐' if online else '응답 없음'}: {row['address']}")
+            _monitor_state[row["id"]] = online
+            return row["id"], row["guild_id"], online, latency
+
+    results = [r for r in await asyncio.gather(*(check(row) for row in rows)) if r]
+    known = {row["id"] for row in rows}
+    for server_id in [i for i in _monitor_state if i not in known]:  # deleted servers
+        del _monitor_state[server_id]
+    try:
+        if results:
+            save_samples(results)
+    except sqlite3.Error as exc:
+        print(f"업타임 기록 저장 오류: {type(exc).__name__}: {exc}")
+        notify_admin("업타임 기록 저장 오류", f"{type(exc).__name__}: {exc}", "백그라운드 확인", traceback.format_exc())
 
 
 @monitor_servers.before_loop
