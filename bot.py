@@ -1534,7 +1534,7 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
         ctx.command.reset_cooldown(ctx)
         await ctx.reply("게임은 `bw`(베드워즈), `sw`(스카이워즈), `duels`(듀얼) 중에서 골라 주세요.", mention_author=False)
         return
-    await run_hypixel(ctx, name, game_key)
+    await run_hypixel(RequestContext(ctx, "Hypixel 전적"), name, game_key)
 
 
 async def run_hypixel(ctx, name, game_key):
@@ -1675,7 +1675,7 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
         ctx.command.reset_cooldown(ctx)
         await ctx.reply(str(exc), mention_author=False)
         return
-    await run_valorant(ctx, name, tag, region)
+    await run_valorant(RequestContext(ctx, "Valorant 전적"), name, tag, region)
 
 
 async def run_valorant(ctx, name, tag, region):
@@ -2894,46 +2894,42 @@ class HelpContext:
 
     async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
         extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
-        if can_post_in(self.channel):
-            try:
-                return HeaderMessage(await self.channel.send(self.with_header(content), **extra), self)
-            except discord.HTTPException as exc:
-                print(f"도움말 결과를 채널에 올리지 못해 도움말 메시지에 보여 줍니다: {type(exc).__name__}: {exc}")
-                if file is not None:
-                    file.reset()
-        # The bot can't post here (no permission in this channel or thread). The result goes into the private
-        # help message itself: a follow-up to it would show "원본 메시지가 삭제되었어요" once it is closed.
-        reply = HelpMessageReply(self.interaction)
-        await reply.edit(content=content, embed=embed, attachments=[file] if file else [], **({"view": view} if view else {}))
-        return reply
+        content = self.with_header(content)
+        try:
+            message = await self.channel.send(content, **extra)
+        except (discord.HTTPException, AttributeError):
+            # No permission to post in this channel (or no channel object): answer through the interaction.
+            if file is not None:
+                file.reset()
+            message = await self.interaction.followup.send(content, wait=True, **extra)
+        return HeaderMessage(message, self)
 
 
-def can_post_in(channel):
-    """False when the bot surely can't post (with pictures) in this channel; True when it can or can't tell."""
-    if not isinstance(channel, (discord.abc.GuildChannel, discord.Thread)):
-        return channel is not None  # DM, or a channel the bot doesn't know: just try
-    perms = channel.permissions_for(channel.guild.me)
-    talk = perms.send_messages_in_threads if isinstance(channel, discord.Thread) else perms.send_messages
-    return perms.view_channel and talk and perms.attach_files and perms.embed_links
+class RequestContext:
+    """A ! command whose results are plain channel messages under "-# @누구님의 요청 · 무엇" instead of
+    replies: a reply shows "원본 메시지가 삭제되었어요" once the command message is deleted (stats take a
+    few seconds, and some servers clean up command messages)."""
 
+    def __init__(self, ctx, what):
+        self._ctx = ctx
+        self.guild, self.author, self.channel, self.message = ctx.guild, ctx.author, ctx.channel, ctx.message
+        self.header = f"-# {ctx.author.mention}님의 요청 · {what}"  # mentions never ping (allowed_mentions)
 
-class HelpMessageReply:
-    """A result shown in the private /도움말 message (when it can't be posted in the channel). Edits replace
-    the help page; its buttons stay unless the result brings its own, and [◀ 처음으로] redraws the menu."""
+    # The waiting notice is kept on the real context too, so the command's error handler can replace it.
+    @property
+    def notice(self):
+        return getattr(self._ctx, "notice", None)
 
-    def __init__(self, interaction):
-        self.interaction = interaction
+    @notice.setter
+    def notice(self, value):
+        self._ctx.notice = value
 
-    async def edit(self, **changes):
-        changes.setdefault("embed", None)  # the help page's embed would hide the result
-        if "view" in changes and changes["view"] is None:  # a finished result: offer the way back
-            changes["view"] = discord.ui.View(timeout=None)
-            changes["view"].add_item(HelpButton("home", "◀ 처음으로", style=discord.ButtonStyle.secondary))
-        if self.interaction.response.is_done():
-            await self.interaction.edit_original_response(**changes)
-        else:
-            await self.interaction.response.edit_message(**changes)
-        return self
+    def with_header(self, content):
+        return f"{self.header}\n{content}" if content else self.header
+
+    async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
+        extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
+        return HeaderMessage(await self.channel.send(self.with_header(content), **extra), self)
 
 
 class HeaderMessage:
@@ -3042,8 +3038,6 @@ async def show_help(interaction, **page):
     seconds, so the page is shown at once with [⏳ 준비 중...] and the link is filled in afterwards
     (waiting first made the 파일 button look like it did nothing)."""
     async def draw(**changes):
-        changes.setdefault("attachments", [])  # a result shown in this message (see HelpMessageReply)
-        changes.setdefault("content", None)
         if interaction.response.is_done():
             await interaction.edit_original_response(**changes)
         else:
