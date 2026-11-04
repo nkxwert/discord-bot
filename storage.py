@@ -54,6 +54,9 @@ CHUNK_SIZE = 64 * 1024
 UPLOAD_PAGE_KEY = "upload.html"  # the big-file upload page, served from the bucket itself
 UPLOAD_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "upload.html")
 PRESIGN_SECONDS = 600
+# Bump together with <meta name="maco-upload-page"> in assets/upload.html whenever the link format changes,
+# so an old page file left on the host is noticed instead of failing with "올바른 업로드 링크가 아닙니다".
+UPLOAD_PAGE_VERSION = "3"
 
 # Shown in the browser / played in Discord. Everything else is stored as a plain download, so an uploaded
 # HTML or SVG file can't be opened as a web page on our domain (phishing, scripts).
@@ -505,10 +508,16 @@ async def self_test():
     results.append(await _try("웹 업로드 (브라우저처럼 Origin 포함)", "PUT", presigned_put(key + ".b"), browser, b"b"))
     results.append(await _try("웹 업로드 + 파일 이름 헤더", "PUT", presigned_put(key + ".c"),
                               {**browser, "Content-Disposition": "attachment; filename*=UTF-8''test.txt"}, b"c"))
-    cors_error = await set_cors()
-    results.append(("CORS 규칙 설정", cors_error is None, cors_error or f"허용: {', '.join(upload_origins())}"))
-    if cors_error is None:
-        results.append(await _try("CORS 설정 후 웹 업로드 (Origin 포함)", "PUT", presigned_put(key + ".d"), browser, b"d"))
+    page_version = local_page_version()
+    results.append(("업로드 페이지 파일 버전", page_version == UPLOAD_PAGE_VERSION,
+                    f"v{page_version}" if page_version == UPLOAD_PAGE_VERSION else
+                    f"assets/upload.html이 예전 버전입니다 (v{page_version or '?'}, 필요: v{UPLOAD_PAGE_VERSION}). "
+                    "최신 파일로 바꾸고 재시작해 주세요"))
+    if not is_b2():  # on B2 the native CORS rule below covers it, and B2 refuses S3 CORS calls once it exists
+        cors_error = await set_cors()
+        results.append(("CORS 규칙 설정", cors_error is None, cors_error or f"허용: {', '.join(upload_origins())}"))
+        if cors_error is None:
+            results.append(await _try("CORS 설정 후 웹 업로드 (Origin 포함)", "PUT", presigned_put(key + ".d"), browser, b"d"))
     native_key = f"files/selftest/{secrets.token_urlsafe(6)}/native.txt"
     if is_b2():
         try:
@@ -629,9 +638,23 @@ async def _b2_try(label, origin, data=b"self-test", name="files/selftest/native.
         return label, False, f"{type(exc).__name__}: {exc}"
 
 
+def local_page_version():
+    """Version marked in assets/upload.html, or None if the file is missing or predates the marker."""
+    try:
+        with open(UPLOAD_PAGE_PATH, encoding="utf-8") as f:
+            match = re.search(r'<meta name="maco-upload-page" content="([^"]+)"', f.read())
+    except OSError:
+        return None
+    return match.group(1) if match else None
+
+
 async def setup_bucket():
-    """Upload the big-file page and allow the browser to upload from it (CORS).
-    Failures are only logged: the CORS rule can also be set by hand (see README)."""
+    """Upload the big-file page and allow the browser to upload from it (CORS). Returns a list of
+    problems for the admin (empty when all is well); the CORS rule can also be set by hand (see README)."""
+    problems = []
+    if local_page_version() != UPLOAD_PAGE_VERSION:
+        problems.append(f"assets/upload.html이 예전 버전입니다 (v{local_page_version() or '?'}, 필요: "
+                        f"v{UPLOAD_PAGE_VERSION}). 최신 파일로 바꾸고 재시작하지 않으면 웹 업로드가 실패합니다.")
     try:
         with open(UPLOAD_PAGE_PATH, "rb") as f:
             page = f.read()
@@ -639,9 +662,14 @@ async def setup_bucket():
                   headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache"})
     except Exception as exc:
         print(f"업로드 페이지 올리기 실패: {type(exc).__name__}: {exc}")
+        problems.append(f"업로드 페이지를 저장소에 올리지 못했습니다: {type(exc).__name__}: {exc}")
     error = await set_b2_cors() if is_b2() else await set_cors()
     if error:
         print(f"저장소 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {error}")
+        problems.append(f"저장소 CORS 규칙을 설정하지 못했습니다: {error}")
+    for problem in problems:
+        print(f"파일 저장소 설정 문제: {problem}")
+    return problems
 
 
 async def upload_page_link(key, retention="7일"):

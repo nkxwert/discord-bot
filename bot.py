@@ -2886,7 +2886,9 @@ async def setup_hook():
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton)
     await load_help_emojis()
     if storage.configured():
-        await storage.setup_bucket()
+        problems = await storage.setup_bucket()
+        if problems:
+            notify_admin("파일 저장소 설정 문제", "\n".join(problems), "봇 시작")
     try:
         synced = await bot.tree.sync()
         print(f"슬래시 명령어 {len(synced)}개를 등록했습니다.")
