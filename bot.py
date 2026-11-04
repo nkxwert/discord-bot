@@ -3386,22 +3386,92 @@ HELP_ACTIONS = {
 }
 
 
-@bot.tree.command(name="글자콘", description="글자를 디시 글자콘처럼 그림으로 만들어 올립니다")
+TEXTCON_WEBHOOK_NAME = "마코 글자콘"
+_textcon_webhooks = {}  # channel id -> the bot's webhook there (a few dozen at most; looked up once)
+
+
+async def textcon_webhook(channel):
+    """The bot's webhook in this channel (made the first time), or None if it can't have one
+    (DM, no 웹훅 관리 permission, ...). Threads use their parent channel's webhook."""
+    if not can_post_as_user(channel):
+        return None
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    hook = _textcon_webhooks.get(parent.id)
+    if hook is None:
+        hooks = await parent.webhooks()
+        hook = next((h for h in hooks if h.user and h.user.id == bot.user.id and h.name == TEXTCON_WEBHOOK_NAME), None)
+        hook = hook or await parent.create_webhook(name=TEXTCON_WEBHOOK_NAME, reason="/글자콘")
+        if len(_textcon_webhooks) >= 200:
+            _textcon_webhooks.pop(next(iter(_textcon_webhooks)))
+        _textcon_webhooks[parent.id] = hook
+    return hook
+
+
+def can_post_as_user(channel):
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    return (isinstance(parent, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel))
+            and parent.permissions_for(parent.guild.me).manage_webhooks)
+
+
+async def send_as_user(interaction, content, png):
+    """Post as the person (their server nickname and picture), like /unflip. Bots can't speak from someone
+    else's account, so this goes through a webhook: Discord marks it "앱", and it can't be edited by them.
+    Returns False when that isn't possible here, so the caller posts as the bot instead."""
+    channel = interaction.channel
+    if interaction.guild is None or channel is None:
+        return False
+    try:
+        hook = await textcon_webhook(channel)
+        if hook is None:
+            return False
+        user = interaction.user
+        extra = {"thread": channel} if isinstance(channel, discord.Thread) else {}
+        await hook.send(content=content, file=discord.File(io.BytesIO(png), "글자콘.png"),
+                        username=user.display_name[:80], avatar_url=user.display_avatar.url,
+                        allowed_mentions=discord.AllowedMentions.none(), **extra)
+        return True
+    except discord.NotFound:  # someone deleted the webhook: forget it and post as the bot this time
+        _textcon_webhooks.pop(getattr(channel, "parent_id", None) or channel.id, None)
+    except discord.HTTPException as exc:  # e.g. a nickname Discord refuses for webhooks
+        print(f"글자콘 웹훅 전송 실패: {type(exc).__name__}: {exc}")
+    return False
+
+
+@bot.tree.command(name="글자콘", description="글자를 디시 글자콘처럼 그림으로 만들어 내 이름으로 올립니다")
 @app_commands.rename(text="글자", message="메시지")
 @app_commands.describe(text=f"그림으로 만들 글자 (최대 {textcon.MAX_CHARS}자)", message="글자콘과 같이 보낼 메시지 (선택)")
 @app_commands.checks.cooldown(1, 3.0)
 async def textcon_slash(interaction: discord.Interaction, text: app_commands.Range[str, 1, textcon.MAX_CHARS],
                         message: app_commands.Range[str, 1, 1800] | None = None):
-    """Like /unflip: the optional message goes along with the picture, in one message."""
+    """Like /unflip: posted under the person's name with the optional message, in one message."""
     try:
         text = textcon.clean(text)
     except ValueError as exc:
         await interaction.response.send_message(str(exc), ephemeral=True)
         return
-    await interaction.response.defer(thinking=True)  # drawing shares the card threads, which may be busy
+    file = lambda: discord.File(io.BytesIO(png), "글자콘.png")
+    if not can_post_as_user(interaction.channel):
+        # DM, or no 웹훅 관리 permission: post as the bot (Discord shows who used the command above it).
+        await interaction.response.defer(thinking=True)
+        png = await asyncio.to_thread(textcon.render, text)
+        await interaction.followup.send(content=message, file=file(), allowed_mentions=discord.AllowedMentions.none())
+        return
+    # A private "thinking" answer, removed once the picture is posted under the person's name.
+    await interaction.response.defer(ephemeral=True, thinking=True)
     png = await asyncio.to_thread(textcon.render, text)
-    await interaction.followup.send(content=message, file=discord.File(io.BytesIO(png), "글자콘.png"),
-                                    allowed_mentions=discord.AllowedMentions.none())
+    if not await send_as_user(interaction, message, png):
+        # The webhook failed after all (deleted meanwhile, a nickname Discord refuses ...): post as the bot.
+        header = f"-# {interaction.user.mention}님의 글자콘"
+        try:
+            await interaction.channel.send(content=f"{header}\n{message}" if message else header, file=file(),
+                                           allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            await interaction.followup.send("글자콘을 올리지 못했습니다.", ephemeral=True)
+            return
+    try:
+        await interaction.delete_original_response()
+    except discord.HTTPException:
+        pass
 
 
 @bot.tree.command(name="도움말", description="버튼으로 명령어를 보고 바로 사용합니다")
