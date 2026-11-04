@@ -39,19 +39,25 @@
 <script>
   const [rawTarget, rawRetention] = location.hash.slice(1).split("|");
   const target = decodeURIComponent(rawTarget || "");
+  // "b2:" + base64 JSON {u: upload URL, t: token, k: file key} = Backblaze's native browser upload.
+  let native = null;
+  if (target.startsWith("b2:")) {
+    try { native = JSON.parse(atob(target.slice(3).replace(/-/g, "+").replace(/_/g, "/"))); } catch (e) { native = null; }
+  }
+  const usable = native ? native.u && native.u.startsWith("https://") : target.startsWith("https://");
   if (rawRetention) document.getElementById("retention").textContent = decodeURIComponent(rawRetention);
   const fileInput = document.getElementById("file");
   const send = document.getElementById("send");
   const status = document.getElementById("status");
   const bar = document.getElementById("bar");
   function say(text, isError) { status.textContent = text; status.className = isError ? "error" : ""; }
-  if (!target.startsWith("https://")) {
+  if (!usable) {
     say("올바른 업로드 링크가 아닙니다. 디스코드에서 다시 링크를 받아 주세요.", true);
   }
   fileInput.addEventListener("change", () => {
     const file = fileInput.files[0];
     document.getElementById("pick").textContent = file ? file.name : "눌러서 파일 고르기";
-    send.disabled = !file || !target.startsWith("https://");
+    send.disabled = !file || !usable;
   });
   // Attempts, in order: with the file-name header; without it; the file read into one fixed-size block
   // (some mobile / in-app browsers stream a picked file without stating its size, which storage refuses).
@@ -68,10 +74,18 @@
       try { body = new Uint8Array(await file.arrayBuffer()); } catch (e) { return fail(file, null); }
     }
     const request = new XMLHttpRequest();
-    request.open("PUT", target);
-    request.setRequestHeader("Content-Type", file.type || "application/octet-stream");
-    if (plan.name) {
-      request.setRequestHeader("Content-Disposition", "attachment; filename*=UTF-8''" + encodeURIComponent(file.name));
+    const disposition = "attachment; filename*=UTF-8''" + encodeURIComponent(file.name);
+    if (native) {
+      request.open("POST", native.u);
+      request.setRequestHeader("Authorization", native.t);
+      request.setRequestHeader("X-Bz-File-Name", native.k.split("/").map(encodeURIComponent).join("/"));
+      request.setRequestHeader("Content-Type", file.type || "b2/x-auto");
+      request.setRequestHeader("X-Bz-Content-Sha1", "do_not_verify");
+      if (plan.name) request.setRequestHeader("X-Bz-Info-b2-content-disposition", encodeURIComponent(disposition));
+    } else {
+      request.open("PUT", target);
+      request.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+      if (plan.name) request.setRequestHeader("Content-Disposition", disposition);
     }
     request.upload.onprogress = (e) => {
       if (e.lengthComputable) {
@@ -86,10 +100,10 @@
         say("다 올렸습니다! 잠시 후 디스코드 채널에 자동으로 올라갑니다. 1분이 지나도 안 올라가면 [업로드 완료]를 눌러 주세요.");
         return;
       }
-      const code = (/<Code>([^<]+)<\/Code>/.exec(request.responseText || "") || [])[1];
+      const code = errorCode(request.responseText || "");
       failures.push("#" + (attempt + 1) + " HTTP " + request.status + (code ? " " + code : ""));
       if ((request.status === 400 || request.status === 403) && attempt + 1 < ATTEMPTS.length
-          && code !== "RequestExpired") {
+          && code !== "RequestExpired" && code !== "expired_auth_token") {
         bar.firstElementChild.style.width = "0";
         upload(file, attempt + 1);
         return;
@@ -103,11 +117,19 @@
     request.send(body);
   }
 
+  // S3 answers XML (<Code>, <Message>), B2's native API answers JSON ({code, message}).
+  function errorCode(text) {
+    try { return JSON.parse(text).code; } catch (e) { return (/<Code>([^<]+)<\/Code>/.exec(text) || [])[1]; }
+  }
+  function errorMessage(text) {
+    try { return JSON.parse(text).message; } catch (e) { return (/<Message>([^<]*)<\/Message>/.exec(text) || [])[1]; }
+  }
+
   function fail(file, request) {
     const text = request ? request.responseText || "" : "";
-    const code = (/<Code>([^<]+)<\/Code>/.exec(text) || [])[1];
-    const detail = (/<Message>([^<]*)<\/Message>/.exec(text) || [])[1];
-    const reason = code === "AccessDenied" || code === "SignatureDoesNotMatch" || code === "RequestExpired"
+    const code = errorCode(text);
+    const detail = errorMessage(text);
+    const reason = code === "AccessDenied" || code === "SignatureDoesNotMatch" || code === "RequestExpired" || code === "expired_auth_token" || code === "bad_auth_token"
       ? "링크가 만료되었거나 올바르지 않습니다(10분)." : "저장소가 업로드를 거절했습니다.";
     const browser = (navigator.userAgent.match(/(Discord|KAKAOTALK|Instagram|Line|SamsungBrowser|Edg|OPR|Chrome|CriOS|Firefox|FxiOS|Safari)[\/ ][\d.]+/g) || []).join(" ");
     say(reason + " 디스코드에서 링크를 다시 받아 주세요.\n"
