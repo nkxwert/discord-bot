@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta name="maco-upload-page" content="5">
+<meta name="maco-upload-page" content="6">
 <title>마코 파일 올리기</title>
 <style>
   :root { --bg: #eef3ee; --card: #ffffff; --text: #2f3b33; --muted: #5b6b60; --accent: #7f9c86; --accent-dark: #5f7d67; --bar: #dfe8e0; --error: #b3261e; }
@@ -25,18 +25,37 @@
   .bar div { height: 100%; width: 0; background: var(--accent-dark); transition: width .2s; }
   #status { margin-top: 12px; min-height: 1.5em; font-size: .95rem; white-space: pre-line; word-break: break-word; }
   .error { color: var(--error); }
+  .notice { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; padding: 16px; }
+  .notice.open { display: flex; }
+  .notice div { width: min(100%, 380px); background: var(--card); border-radius: 18px; padding: 22px 20px; box-shadow: 0 16px 40px rgba(0,0,0,.25); }
+  .notice h2 { margin: 0 0 12px; font-size: 1.15rem; }
+  .notice ul { margin: 0 0 14px; padding-left: 20px; line-height: 1.7; }
+  .notice label { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: .95rem; cursor: pointer; }
+  .notice button { margin-top: 14px; }
+  .done { text-align: center; font-size: 1.05rem; }
 </style>
 </head>
 <body>
 <main>
   <h1>마코 파일 올리기</h1>
-  <p>올린 파일은 봇의 파일 저장소(Backblaze B2)에 올라가며 <strong><span id="retention">7일</span> 후 자동으로 삭제</strong>됩니다. 링크가 있으면 누구나 볼 수 있으니 개인정보가 담긴 파일은 올리지 마세요.</p>
   <label class="pick" for="file" id="pick">눌러서 파일 고르기</label>
   <input type="file" id="file">
   <button id="send" disabled>올리기</button>
   <div class="bar" id="bar"><div></div></div>
   <div id="status" role="status"></div>
 </main>
+<div class="notice" id="notice" role="dialog" aria-modal="true" aria-labelledby="notice-title">
+  <div>
+    <h2 id="notice-title">📦 업로드 전에 확인해 주세요</h2>
+    <ul>
+      <li>올린 파일은 <strong><span id="retention">7일</span> 후 자동으로 삭제</strong>됩니다.</li>
+      <li>링크가 있으면 누구나 볼 수 있습니다.</li>
+      <li>개인정보가 담긴 파일은 올리지 마세요.</li>
+    </ul>
+    <label><input type="checkbox" id="hide-notice"> 다시 보지 않기</label>
+    <button id="notice-ok">확인</button>
+  </div>
+</div>
 <script>
   // The #fragment holds where to upload and the retention, joined with "!":
   //   "b2!<upload URL>!<token>!<file key>!<retention>"  Backblaze's native browser upload
@@ -51,21 +70,46 @@
   let hash = location.hash.slice(1);
   if (/^(b2|https?)%(3A|21)/i.test(hash) || /^b2%21/i.test(hash)) hash = decodeFully(hash);  // whole fragment encoded
   hash = hash.replace(/%25(7C|21)/gi, "%$1").replace(/%7C/gi, "|").replace(/%21/g, "!");
-  let target = "", retention = "", native = null;
+  // An optional last part is the bot's signal address (NKOTE): the page reports "started"/"done" there so
+  // the bot can post the file seconds after the upload ends.
+  let target = "", retention = "", native = null, signalUrl = "";
   if (hash.startsWith("b2!")) {
     const parts = hash.split("!").map(decodeFully);
     native = {u: parts[1], t: parts[2], k: parts[3]};
     retention = parts[4] || "";
+    signalUrl = parts[5] || "";
   } else {
     const parts = hash.split(/[!|]/);
     target = decodeFully(parts[0] || "");
     retention = decodeFully(parts[1] || "");
+    signalUrl = decodeFully(parts[2] || "");
     if (target.startsWith("b2:")) {  // older native format
       try { native = JSON.parse(atob(target.slice(3).replace(/-/g, "+").replace(/_/g, "/"))); } catch (e) { native = null; }
     }
   }
   const usable = native ? native.u && native.u.startsWith("https://") : target.startsWith("https://");
   if (retention) document.getElementById("retention").textContent = retention;
+
+  // First-visit notice, with "다시 보지 않기" remembered in this browser.
+  const NOTICE_KEY = "maco-upload-notice-hidden";
+  const notice = document.getElementById("notice");
+  let noticeHidden = false;
+  try { noticeHidden = localStorage.getItem(NOTICE_KEY) === "1"; } catch (e) {}
+  if (!noticeHidden) notice.classList.add("open");
+  document.getElementById("notice-ok").addEventListener("click", () => {
+    if (document.getElementById("hide-notice").checked) {
+      try { localStorage.setItem(NOTICE_KEY, "1"); } catch (e) {}
+    }
+    notice.classList.remove("open");
+  });
+
+  function signal(state) {
+    if (!/^https:\/\//.test(signalUrl)) return;
+    try {
+      fetch(signalUrl, {method: "POST", headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({state}), keepalive: true, mode: "cors"}).catch(() => {});
+    } catch (e) {}
+  }
   const fileInput = document.getElementById("file");
   const send = document.getElementById("send");
   const status = document.getElementById("status");
@@ -117,7 +161,8 @@
     request.onload = () => {
       if (request.status >= 200 && request.status < 300) {
         bar.firstElementChild.style.width = "100%";
-        say("다 올렸습니다! 잠시 후 디스코드 채널에 자동으로 올라갑니다. 1분이 지나도 안 올라가면 [업로드 완료]를 눌러 주세요.");
+        signal("done");
+        finished();
         return;
       }
       const code = errorCode(request.responseText || "");
@@ -145,6 +190,14 @@
     try { return JSON.parse(text).message; } catch (e) { return (/<Message>([^<]*)<\/Message>/.exec(text) || [])[1]; }
   }
 
+  // Done: tell the user to go back, and close the tab if the browser lets the page do that
+  // (tabs opened from a link often can't be closed by script; then the message stays).
+  function finished() {
+    document.querySelector("main").innerHTML =
+      '<h1>✅ 업로드 완료!</h1><p class="done">디스코드로 돌아가 주세요.<br>채널에 곧 파일이 올라갑니다.</p>';
+    setTimeout(() => { try { window.close(); } catch (e) {} }, 1500);
+  }
+
   function fail(file, request) {
     const text = request ? request.responseText || "" : "";
     const code = errorCode(text);
@@ -165,6 +218,7 @@
     send.disabled = true;
     fileInput.disabled = true;
     bar.style.display = "block";
+    signal("started");
     upload(file, 0);
   });
 </script>
