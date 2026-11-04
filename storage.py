@@ -56,7 +56,7 @@ UPLOAD_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ass
 PRESIGN_SECONDS = 600
 # Bump together with <meta name="maco-upload-page"> in assets/upload.html whenever the link format changes,
 # so an old page file left on the host is noticed instead of failing with "올바른 업로드 링크가 아닙니다".
-UPLOAD_PAGE_VERSION = "4"
+UPLOAD_PAGE_VERSION = "5"
 
 # Shown in the browser / played in Discord. Everything else is stored as a plain download, so an uploaded
 # HTML or SVG file can't be opened as a web page on our domain (phishing, scripts).
@@ -458,6 +458,8 @@ def upload_origins():
     origins = [f"{urlsplit(ENDPOINT).scheme}://{HOST}"]
     if PUBLIC_URL:
         origins.append(f"{urlsplit(PUBLIC_URL).scheme}://{urlsplit(PUBLIC_URL).netloc}")
+    if _b2.get("downloadUrl"):  # the short page link is served from B2's download host (f00X.backblazeb2.com)
+        origins.append(_b2["downloadUrl"].rstrip("/"))
     return list(dict.fromkeys(origins))
 
 
@@ -576,7 +578,8 @@ async def _b2_auth():
         raise B2Error(f"b2_authorize_account HTTP {response.status} {data.get('code', '')} {data.get('message', '')}".strip())
     storage_api = data["apiInfo"]["storageApi"]
     _b2.clear()
-    _b2.update(apiUrl=storage_api["apiUrl"], token=data["authorizationToken"], accountId=data["accountId"], at=time.time())
+    _b2.update(apiUrl=storage_api["apiUrl"], downloadUrl=storage_api.get("downloadUrl", ""),
+               token=data["authorizationToken"], accountId=data["accountId"], at=time.time())
     allowed = [b for b in storage_api.get("allowed", {}).get("buckets") or [] if b.get("name") == BUCKET]
     if allowed and allowed[0].get("id"):
         _b2["bucketId"] = allowed[0]["id"]
@@ -672,20 +675,45 @@ async def setup_bucket():
     return problems
 
 
+_page_link = {}  # B2 download-authorized page URL, reused for an hour
+
+
+async def b2_page_url():
+    """Short link to the upload page on B2's download host with a download authorization (~150 characters
+    instead of ~350 for a presigned URL), so the whole upload link fits a Discord link button (512)."""
+    if _page_link and time.time() - _page_link["at"] < 60 * 60:
+        return _page_link["url"]
+    auth = await _b2_auth()
+    data = await _b2_call("b2_get_download_authorization", {
+        "bucketId": auth["bucketId"], "fileNamePrefix": UPLOAD_PAGE_KEY, "validDurationInSeconds": 2 * 60 * 60,
+    })
+    url = f"{auth['downloadUrl'].rstrip('/')}/file/{quote(BUCKET)}/{UPLOAD_PAGE_KEY}?Authorization={quote(data['authorizationToken'], safe='')}"
+    _page_link.update(url=url, at=time.time())
+    return url
+
+
+def _part(text):
+    return quote(text, safe=":/=-_.~")
+
+
 async def upload_page_link(key, retention="7일"):
     """Link to the upload page. Where to upload (and the retention shown) ride in the #fragment, which
-    browsers never send to a server. On B2 that is a native upload URL and token ("b2:" + base64 JSON),
-    elsewhere (or if B2's API fails) a presigned PUT URL."""
-    target = presigned_put(key)
+    browsers never send to a server. Parts are joined with "!" (Discord rewrites "|" to "%7C").
+    On B2: "b2!<upload URL>!<token>!<key>!<retention>" on the short page link; elsewhere (or if B2's API
+    fails): "<presigned PUT>!<retention>" on a presigned page link."""
     if is_b2():
         try:
             upload_url, token = await b2_upload_target()
-            import base64
-            import json
-            target = "b2:" + base64.urlsafe_b64encode(json.dumps({"u": upload_url, "t": token, "k": key}).encode()).decode()
+            fragment = "!".join(["b2", _part(upload_url), _part(token), _part(key), _part(retention)])
+            try:
+                page = await b2_page_url()
+            except Exception as exc:
+                print(f"B2 페이지 링크 받기 실패, 서명 링크로 엽니다: {type(exc).__name__}: {exc}")
+                page = link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)
+            return f"{page}#{fragment}"
         except Exception as exc:
             print(f"B2 업로드 주소 받기 실패, 서명 링크로 대신합니다: {type(exc).__name__}: {exc}")
-    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(target, safe='')}|{quote(retention, safe='')}"
+    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}!{_part(retention)}"
 
 
 # ---------------------------------------------------------------- video conversion (optional, off by default)
