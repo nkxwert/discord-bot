@@ -1534,7 +1534,7 @@ async def hypixel_stats(ctx, name: str = "", game: str = ""):
         ctx.command.reset_cooldown(ctx)
         await ctx.reply("게임은 `bw`(베드워즈), `sw`(스카이워즈), `duels`(듀얼) 중에서 골라 주세요.", mention_author=False)
         return
-    await run_hypixel(ctx, name, game_key)
+    await run_hypixel(RequestContext(ctx, "Hypixel 전적"), name, game_key)
 
 
 async def run_hypixel(ctx, name, game_key):
@@ -1675,7 +1675,7 @@ async def valorant_stats(ctx, *, riot_id: str = ""):
         ctx.command.reset_cooldown(ctx)
         await ctx.reply(str(exc), mention_author=False)
         return
-    await run_valorant(ctx, name, tag, region)
+    await run_valorant(RequestContext(ctx, "Valorant 전적"), name, tag, region)
 
 
 async def run_valorant(ctx, name, tag, region):
@@ -2888,54 +2888,48 @@ class HelpContext:
         self.message = type("HelpMessage", (), {"content": f"/도움말 → {what}"})()  # for describe_ctx
         self.notice = None
         self.header = f"-# {interaction.user.mention}님의 요청 · {what}"  # mentions never ping (allowed_mentions)
-        self.told = False  # the help message already says the result can't be posted
 
     def with_header(self, content):
         return f"{self.header}\n{content}" if content else self.header
 
     async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
-        """Results are public: posted in the channel. (A follow-up to the private help message would show
-        "원본 메시지가 삭제되었어요", so that is never used.) Buttons check can_post_in first; if posting
-        still fails, the help message says why and the result is dropped."""
         extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
+        content = self.with_header(content)
         try:
-            return HeaderMessage(await self.channel.send(self.with_header(content), **extra), self)
-        except (discord.HTTPException, AttributeError) as exc:
-            print(f"도움말 결과를 채널에 올리지 못했습니다: {type(exc).__name__}: {exc}")
-            if not self.told:
-                self.told = True
-                try:
-                    await show_help(self.interaction, notice=CANNOT_POST_MESSAGE)
-                except discord.HTTPException:
-                    pass
-            return DroppedMessage()
+            message = await self.channel.send(content, **extra)
+        except (discord.HTTPException, AttributeError):
+            # No permission to post in this channel (or no channel object): answer through the interaction.
+            if file is not None:
+                file.reset()
+            message = await self.interaction.followup.send(content, wait=True, **extra)
+        return HeaderMessage(message, self)
 
 
-CANNOT_POST_MESSAGE = ("⚠️ 이 채널에는 마코가 글을 쓸 수 없어서 결과를 모두에게 보여 줄 수 없습니다.\n"
-                       "채널 설정 → 권한에서 마코에게 **메시지 보내기 · 파일 첨부 · 링크 첨부**를 켜 주시거나, "
-                       "마코가 글을 쓸 수 있는 채널에서 사용해 주세요.")
-# /도움말 actions whose result is posted in the channel for everyone
-PUBLIC_HELP_ACTIONS = {"run_uptime", "run_fortune", "run_ilchim", "run_add", "run_delete", "run_hypixel",
-                       "run_valorant", "attach", "run_upload"}
+class RequestContext:
+    """A ! command whose results are plain channel messages under "-# @누구님의 요청 · 무엇" instead of
+    replies: a reply shows "원본 메시지가 삭제되었어요" once the command message is deleted (stats take a
+    few seconds, and some servers clean up command messages)."""
 
+    def __init__(self, ctx, what):
+        self._ctx = ctx
+        self.guild, self.author, self.channel, self.message = ctx.guild, ctx.author, ctx.channel, ctx.message
+        self.header = f"-# {ctx.author.mention}님의 요청 · {what}"  # mentions never ping (allowed_mentions)
 
-def can_post_in(channel):
-    """False when the bot surely can't post (with pictures) in this channel; True when it can or can't tell."""
-    if not isinstance(channel, (discord.abc.GuildChannel, discord.Thread)):
-        return channel is not None  # DM, or a channel the bot doesn't know: just try
-    perms = channel.permissions_for(channel.guild.me)
-    talk = perms.send_messages_in_threads if isinstance(channel, discord.Thread) else perms.send_messages
-    return perms.view_channel and talk and perms.attach_files and perms.embed_links
+    # The waiting notice is kept on the real context too, so the command's error handler can replace it.
+    @property
+    def notice(self):
+        return getattr(self._ctx, "notice", None)
 
+    @notice.setter
+    def notice(self, value):
+        self._ctx.notice = value
 
-class DroppedMessage:
-    """Stands in for a result that couldn't be posted, so the rest of the command just carries on."""
+    def with_header(self, content):
+        return f"{self.header}\n{content}" if content else self.header
 
-    async def edit(self, **changes):
-        return self
-
-    async def delete(self, **kwargs):
-        pass
+    async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
+        extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
+        return HeaderMessage(await self.channel.send(self.with_header(content), **extra), self)
 
 
 class HeaderMessage:
@@ -3044,8 +3038,6 @@ async def show_help(interaction, **page):
     seconds, so the page is shown at once with [⏳ 준비 중...] and the link is filled in afterwards
     (waiting first made the 파일 button look like it did nothing)."""
     async def draw(**changes):
-        changes.setdefault("attachments", [])  # nothing from an earlier page lingers
-        changes.setdefault("content", None)
         if interaction.response.is_done():
             await interaction.edit_original_response(**changes)
         else:
@@ -3088,11 +3080,6 @@ class HelpButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:help
     async def callback(self, interaction):
         handler = HELP_ACTIONS.get(self.action)
         if handler is None:
-            return
-        if self.action in PUBLIC_HELP_ACTIONS and interaction.guild and not can_post_in(interaction.channel):
-            # Say so before any form opens: the result is for everyone, and here it can't be posted.
-            key = "upload" if self.action == "attach" else self.action[4:]
-            await show_help(interaction, page=help_page_of(key), selected=key, notice=CANNOT_POST_MESSAGE)
             return
         try:
             await handler(interaction)
