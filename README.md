@@ -18,7 +18,7 @@
 - 올린 파일은 **7일(관리자가 `£DB 기간`으로 변경 가능) 후 자동 삭제**되며, 올릴 때마다 안내함
 - `!운세` — 오늘의 운세 (칠 때마다 무작위). 문장은 `fortunes.txt`에 한 줄에 하나씩 있으며, 메모장으로 고치면 재시작 없이 바로 적용
 - `!일침` — 정신이 번쩍 드는 한마디 (칠 때마다 무작위). 문장은 `ilchim.txt`
-- `/글자콘 글자:<글자> [메시지:<메시지>]` — 글자를 디시 글자콘처럼 그림(흰 글자·검은 테두리, 투명 배경)으로 만들어 올림. 최대 30자, 길면 여러 줄로 나눔. `/unflip`처럼 메시지를 같이 넣을 수 있음. 이모지는 그릴 수 없어 빠짐
+- `/글자콘 글자:<글자> [메시지:<메시지>]` — 글자를 디시 글자콘처럼 그림(흰 글자·검은 테두리, 투명 배경)으로 만들어 올림. 최대 30자, 길면 여러 줄로 나눔. `/unflip`처럼 메시지를 같이 넣을 수 있고, **내 이름과 프로필 사진으로** 올라감(웹훅이라 이름 옆에 "앱" 표시. 봇에 **웹훅 관리** 권한이 없거나 DM이면 봇 이름으로 올림). 이모지는 그릴 수 없어 빠짐
 - `!도움말` — 명령어 안내
 - `/도움말` — 나만 보이는 버튼 도움말 (메시지 1개). [서버 업타임]·[전적]·[파일]·[기타(운세·일침)]·[DM to Dev.]·[명령어 보기(`!도움말`과 같은 전체 목록)]를 누르고, 명령어 버튼을 누르면 바로 실행 (주소추가·Hypixel 전적·Valorant 전적은 입력 창, 주소삭제는 목록에서 고르기). 업타임·전적 카드 같은 결과는 `!` 명령어처럼 채널에 보이고, `주소` 목록과 안내 문구는 도움말 메시지 안에 표시. 배너 이미지는 `assets/images/help_banner.jpg`(GitHub 주소로 표시, 바꾸려면 `.env`의 `HELP_BANNER_URL`), 전적 버튼 아이콘은 `assets/emojis/`(봇이 처음 켜질 때 봇 전용 이모지 `maco_hypixel`·`maco_valorant`로 자동 등록. 이미지를 바꾸면 Developer Portal → Emojis에서 지운 뒤 재시작)
 
@@ -115,4 +115,4 @@ python bot.py
 - 카드 폰트는 [Monocraft](https://github.com/IdreesInc/Monocraft)와 [Galmuri](https://github.com/quiple/galmuri), 글자콘 폰트는 [검은고딕(Black Han Sans)](https://github.com/zesstype/Black-Han-Sans)입니다(모두 SIL Open Font License 1.1). 라이선스는 `assets/fonts/`에 있습니다.
 
 #Invite it!
-https://discord.com/oauth2/authorize?client_id=1561618276763570186&permissions=8515702525262144&integration_type=0&scope=bot%20applications.commands
+https://discord.com/oauth2/authorize?client_id=1561618276763570186&permissions=8515703062133056&integration_type=0&scope=bot%20applications.commands
