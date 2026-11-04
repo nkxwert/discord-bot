@@ -56,7 +56,7 @@ UPLOAD_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ass
 PRESIGN_SECONDS = 600
 # Bump together with <meta name="maco-upload-page"> in assets/upload.html whenever the link format changes,
 # so an old page file left on the host is noticed instead of failing with "올바른 업로드 링크가 아닙니다".
-UPLOAD_PAGE_VERSION = "3"
+UPLOAD_PAGE_VERSION = "4"
 
 # Shown in the browser / played in Discord. Everything else is stored as a plain download, so an uploaded
 # HTML or SVG file can't be opened as a web page on our domain (phishing, scripts).
