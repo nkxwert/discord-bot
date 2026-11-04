@@ -20,6 +20,7 @@ from mcstatus import JavaServer
 from dotenv import load_dotenv
 
 import cards
+import dashboard
 import net
 import easter_eggs
 import shortlinks
@@ -711,12 +712,7 @@ async def owner_db_delete_guild(message, args):
         return
 
     async def delete_all():
-        if not await storage.delete([r["key"] for r in rows]):
-            return "지우지 못했습니다. 저장소 연결을 확인해 주세요. (`£DB`)"
-        with connect_db() as conn:
-            conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
-            conn.commit()
-        return f"{guild_label(guild_id)}의 파일 {len(rows)}개를 삭제했습니다."
+        return (await delete_guild_files(guild_id))[1]
 
     view = ConfirmView(message.author.id, delete_all)
     total = sum(r["size"] for r in rows)
@@ -724,6 +720,21 @@ async def owner_db_delete_guild(message, args):
         f"**{guild_label(guild_id)}**의 파일 **{len(rows)}개** ({human_size(total)})를 전부 지울까요? 되돌릴 수 없습니다.",
         view=view, mention_author=False,
     )
+
+
+async def delete_guild_files(guild_id):
+    """(ok, message) after deleting every file of a server (£DB 서버삭제 and the dashboard)."""
+    with connect_db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT id, key, url FROM files WHERE guild_id = ?", (guild_id,))]
+    if not rows:
+        return True, f"{guild_label(guild_id)}에 올라간 파일이 없습니다."
+    if not await storage.delete([r["key"] for r in rows]):
+        return False, "지우지 못했습니다. 저장소 연결을 확인해 주세요."
+    with connect_db() as conn:
+        conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
+    for row in rows:
+        await shortlinks.delete(row.get("url"))
+    return True, f"{guild_label(guild_id)}의 파일 {len(rows)}개를 삭제했습니다."
 
 
 def parse_duration(text):
@@ -743,19 +754,21 @@ async def owner_db_retention(message, args):
         await message.reply(f"자동 삭제 기간: **{current}** (설정할 수 있는 범위: 1시간 ~ {limit})\n"
                             "바꾸려면 `£DB 기간 3일`처럼 입력해 주세요.", mention_author=False)
         return
-    seconds = parse_duration(" ".join(args))
+    await message.reply(apply_retention(" ".join(args))[1], mention_author=False)
+
+
+def apply_retention(text):
+    """(ok, message): set the auto-delete period from text like '3일' (£DB 기간 and the dashboard)."""
+    current = retention_text()
+    seconds = parse_duration(text)
     if seconds is None:
-        await message.reply("기간을 알아보지 못했습니다. 예: `£DB 기간 3일`, `£DB 기간 12시간`, `£DB 기간 1일 6시간`",
-                            mention_author=False)
-        return
+        return False, "기간을 알아보지 못했습니다. 예: `3일`, `12시간`, `1일 6시간`"
     if not FILE_RETENTION_MIN <= seconds <= file_retention_max():
         reason = " 비공개 저장소의 링크는 최대 7일까지만 쓸 수 있습니다." if not storage.PUBLIC_URL else ""
-        await message.reply(f"1시간 ~ {limit} 사이로 정해 주세요.{reason}", mention_author=False)
-        return
+        return False, f"1시간 ~ {human_duration(file_retention_max())} 사이로 정해 주세요.{reason}"
     set_setting("file_retention_seconds", seconds)
-    await message.reply(f"자동 삭제 기간을 **{current} → {human_duration(seconds)}**(으)로 바꿨습니다. "
-                        "새로 올리는 파일부터 적용되며, 이미 올라간 파일은 원래 기간대로 지워집니다.",
-                        mention_author=False)
+    return True, (f"자동 삭제 기간을 **{current} → {human_duration(seconds)}**(으)로 바꿨습니다. "
+                  "새로 올리는 파일부터 적용되며, 이미 올라간 파일은 원래 기간대로 지워집니다.")
 
 
 async def owner_db_test(message, args):
@@ -847,14 +860,32 @@ async def owner_db_limits(message, args):
             await message.reply("알아보지 못했습니다. 예: `£DB 한도 여기 용량 2GB 파일 500MB`, `£DB 한도 기본 파일 1GB`, "
                                 "`£DB 한도 123456789 초기화`", mention_author=False)
             return
+    await message.reply(apply_limits(scope, changes)[1], mention_author=False)
+
+
+def limit_changes(quota=None, max_size=None):
+    """{kind: bytes or None (= back to default)} from dashboard text ('' or missing = unchanged), or a
+    message saying what couldn't be read."""
+    changes = {}
+    for kind, value in (("quota", quota), ("max", max_size)):
+        value = str(value or "").strip()
+        if not value:
+            continue
+        size = None if value == "기본" else parse_size(value)
+        if size is None and value != "기본":
+            return f"{LIMIT_NAMES[kind]} `{value}`를 알아보지 못했습니다. 예: 500MB, 2GB"
+        changes[kind] = size
+    return changes or "바꿀 값이 없습니다."
+
+
+def apply_limits(scope, changes):
+    """(ok, message): save a server's limits (scope = guild id) or the defaults (scope = "default")."""
     for kind, size in changes.items():
         if size is None:
             continue
         low, high = 1024 ** 2, (FILE_MAX_HARD if kind == "max" else 1024 ** 5)
         if not low <= size <= high:
-            await message.reply(f"{LIMIT_NAMES[kind]}는 {human_size(low)} ~ {human_size(high)} 사이로 정해 주세요.",
-                                mention_author=False)
-            return
+            return False, f"{LIMIT_NAMES[kind]}는 {human_size(low)} ~ {human_size(high)} 사이로 정해 주세요."
     for kind, size in changes.items():
         key = f"file_limit:{kind}:{scope}"
         if size is None:
@@ -874,8 +905,8 @@ async def owner_db_limits(message, args):
         notes.append("지금 쓰는 용량이 한도보다 많습니다. 이미 올라간 파일은 그대로 두고, 공간이 생길 때까지 새로 올리기만 막습니다.")
     if "quota" in changes and changes["quota"] and changes["quota"] > FILE_TOTAL_QUOTA:
         notes.append(f"봇 전체 한도({human_size(FILE_TOTAL_QUOTA)}, `FILE_TOTAL_QUOTA_MB`)가 더 작아서 그 이상은 올라가지 않습니다.")
-    await message.reply(f"{where} 한도를 바꿨습니다.\n{result}" + "".join(f"\n-# {n}" for n in notes)
-                        + "\n-# 이미 열어 둔 업로드 링크도 올린 뒤에 새 한도로 다시 확인합니다.", mention_author=False)
+    return True, (f"{where} 한도를 바꿨습니다.\n{result}" + "".join(f"\n-# {n}" for n in notes)
+                  + "\n-# 이미 열어 둔 업로드 링크도 올린 뒤에 새 한도로 다시 확인합니다.")
 
 
 def limits_embed(message, target):
@@ -906,23 +937,24 @@ def limits_embed(message, target):
 
 async def owner_db_cleanup(message, args):
     async with message.channel.typing():
-        with connect_db() as conn:
-            expired = conn.execute("SELECT COUNT(*) FROM files WHERE expires_at < ?", (time.time(),)).fetchone()[0]
-        await clean_files.coro()
-        with connect_db() as conn:
-            known = {r["key"] for r in conn.execute("SELECT key FROM files")}
-        orphans = await storage.orphan_keys(known)
+        _, text = await run_cleanup()
+    await message.reply(text, mention_author=False)
+
+
+async def run_cleanup():
+    """(ok, message): delete expired files now and files left in storage without a list entry."""
+    with connect_db() as conn:
+        expired = conn.execute("SELECT COUNT(*) FROM files WHERE expires_at < ?", (time.time(),)).fetchone()[0]
+    await clean_files.coro()
+    with connect_db() as conn:
+        known = {r["key"] for r in conn.execute("SELECT key FROM files")}
+    orphans = await storage.orphan_keys(known)
     if orphans is None:
-        await message.reply(f"기간이 지난 파일 {expired}개를 정리했습니다. 저장소 목록은 확인하지 못했습니다.",
-                            mention_author=False)
-        return
+        return False, f"기간이 지난 파일 {expired}개를 정리했습니다. 저장소 목록은 확인하지 못했습니다."
     removed = len(orphans) if orphans and await storage.delete(orphans) else 0
-    await message.reply(
-        f"기간이 지난 파일 **{expired}개**를 정리했습니다.\n"
-        f"목록에 없이 저장소에만 남아 있던 파일 **{removed}개**를 지웠습니다."
-        + ("\n⚠️ 일부를 지우지 못했습니다." if orphans and not removed else ""),
-        mention_author=False,
-    )
+    return True, (f"기간이 지난 파일 **{expired}개**를 정리했습니다.\n"
+                  f"목록에 없이 저장소에만 남아 있던 파일 **{removed}개**를 지웠습니다."
+                  + ("\n⚠️ 일부를 지우지 못했습니다." if orphans and not removed else ""))
 
 
 def memory_usage():
@@ -3291,11 +3323,187 @@ async def help_slash(interaction: discord.Interaction):
     await interaction.response.send_message(ephemeral=True, **help_message())
 
 
+# ---------------------------------------------------------------- 대시보드 (nnaco.kro.kr/admin, on NKOTE)
+# The dashboard does what the £ commands do. The bot only polls NKOTE (see dashboard.py): no web server,
+# no extra library, nothing kept between polls, so it costs next to no memory.
+
+STARTED_AT = time.time()
+DASHBOARD_IDLE_SECONDS = 30  # nobody has the dashboard open
+DASHBOARD_AWAKE_SECONDS = 3  # someone does
+DASHBOARD_IDLE_SNAPSHOT_SECONDS = 30 * 60  # so the page opens with fairly recent numbers
+DASHBOARD_MAX_FILES = 300
+
+
+def plain_text(text):
+    """Discord markdown → plain text for the web page."""
+    text = re.sub(r"^-# ", "", text, flags=re.M)
+    return text.replace("**", "").replace("`", "")
+
+
+def user_name(user_id):
+    user = bot.get_user(user_id)
+    return user.display_name if user else ""
+
+
+async def dashboard_snapshot():
+    """What the dashboard shows. Built on demand and dropped right after sending (a few KB to ~60KB)."""
+    current, peak = memory_usage()
+    retention_max = file_retention_max()
+    snapshot = {
+        "bot": {
+            "name": str(bot.user) if bot.user else "마코", "startedAt": int(STARTED_AT), "guilds": len(bot.guilds),
+            "latencyMs": round(bot.latency * 1000) if bot.latency == bot.latency else None,  # NaN before connecting
+            "memory": {"current": current, "peak": peak, "limit": env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024},
+        },
+        "retention": {"seconds": file_retention(), "text": retention_text(), "maxText": human_duration(retention_max)},
+        "limits": {"quota": default_limit("quota"), "max": min(default_limit("max"), FILE_MAX_HARD),
+                   "hardMax": FILE_MAX_HARD, "totalQuota": FILE_TOTAL_QUOTA},
+        "storage": {"configured": storage.configured()},
+        "guilds": [], "admins": [], "files": [], "filesTotal": 0,
+    }
+    with connect_db() as conn:
+        usage = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT guild_id, COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE status = 'ready' GROUP BY guild_id")}
+        custom = {r["key"] for r in conn.execute("SELECT key FROM settings WHERE key LIKE 'file_limit:%'")}
+        ready, pending = conn.execute(
+            "SELECT COALESCE(SUM(status = 'ready'), 0), COALESCE(SUM(status = 'pending'), 0) FROM files").fetchone()
+        next_expiry = conn.execute("SELECT MIN(expires_at) FROM files WHERE status = 'ready'").fetchone()[0]
+        files = [dict(r) for r in conn.execute(
+            "SELECT id, guild_id, name, size, uploaded_by, expires_at, status FROM files "
+            "ORDER BY uploaded_at DESC LIMIT ?", (DASHBOARD_MAX_FILES,))]
+    snapshot["filesTotal"] = ready + pending
+    guild_ids = [g.id for g in sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)]
+    guild_ids += [g for g in usage if g and g not in guild_ids]  # servers the bot left that still have files
+    for guild_id in guild_ids:
+        guild = bot.get_guild(guild_id)
+        count, used = usage.get(guild_id, (0, 0))
+        snapshot["guilds"].append({
+            "id": str(guild_id), "name": guild.name if guild else f"(나간 서버) {guild_id}",
+            "members": guild.member_count if guild else None, "used": used, "files": count,
+            "quota": guild_quota(guild_id), "max": guild_max_file(guild_id),
+            "customQuota": f"file_limit:quota:{guild_id}" in custom, "customMax": f"file_limit:max:{guild_id}" in custom,
+        })
+    for row in files:
+        guild = bot.get_guild(row["guild_id"]) if row["guild_id"] else None
+        snapshot["files"].append({
+            "id": row["id"], "guildId": str(row["guild_id"]), "guild": guild.name if guild else str(row["guild_id"]),
+            "name": row["name"] or "(이름 없음)", "size": row["size"], "uploader": str(row["uploaded_by"]),
+            "uploaderName": user_name(row["uploaded_by"]), "expiresAt": int(row["expires_at"]), "status": row["status"],
+        })
+    try:
+        owners = await admin_user_ids()
+    except discord.HTTPException:
+        owners = set()
+    owners.discard(None)
+    snapshot["admins"] = [{"id": str(i), "name": user_name(i) or str(i), "owner": i in owners}
+                          for i in sorted(owners) + sorted(file_admin_ids() - owners)]
+    if storage.configured():
+        host, bucket, mode = storage.describe()
+        ping_ms, error = await storage.ping()
+        snapshot["storage"].update({
+            "host": host, "bucket": bucket, "mode": mode, "ok": not error, "error": error,
+            "pingMs": round(ping_ms) if ping_ms is not None else None, "used": file_usage(), "total": FILE_TOTAL_QUOTA,
+            "ready": ready, "pending": pending, "nextExpiry": int(next_expiry) if next_expiry else None,
+            "cleaner": clean_files.is_running(), "shortlinks": shortlinks.host() if shortlinks.configured() else None,
+        })
+    return snapshot
+
+
+def dashboard_guild_id(value):
+    text = str(value or "")
+    return int(text) if text.isdigit() else None
+
+
+async def dashboard_job(job):
+    """Do one dashboard job; {"id", "ok", "message", "data"?} for NKOTE. The bot checks every value itself."""
+    kind, args = job.get("type"), job.get("args") or {}
+    ok, message, data = True, "", None
+    needs_storage = kind in ("delete_files", "delete_guild_files", "cleanup", "test")
+    try:
+        if needs_storage and not storage.configured():
+            ok, message = False, FILE_NOT_CONFIGURED
+        elif kind == "snapshot":
+            pass
+        elif kind == "set_limits":
+            scope = "default" if args.get("scope") == "default" else dashboard_guild_id(args.get("scope"))
+            changes = limit_changes(args.get("quota"), args.get("max")) if scope else "서버를 알 수 없습니다."
+            ok, message = (False, changes) if isinstance(changes, str) else apply_limits(scope, changes)
+        elif kind == "set_retention":
+            ok, message = apply_retention(str(args.get("value", "")))
+        elif kind == "set_admins":
+            ids = lambda key: {int(i) for i in args.get(key) or [] if re.fullmatch(r"\d{15,20}", str(i))}
+            add, remove = ids("add"), ids("remove")
+            set_setting("file_admins", ",".join(str(i) for i in sorted((file_admin_ids() | add) - remove)))
+            message = "파일 관리자를 바꿨습니다."
+        elif kind == "delete_files":
+            wanted = [int(i) for i in args.get("ids") or [] if str(i).isdigit()][:100]
+            with connect_db() as conn:
+                rows = [dict(r) for r in conn.execute(
+                    f"SELECT * FROM files WHERE id IN ({','.join('?' * len(wanted))})", wanted)] if wanted else []
+            removed = [row for row in rows if await remove_file(row)]
+            ok = len(removed) == len(rows)
+            message = f"파일 {len(removed)}개를 삭제했습니다." + ("" if ok else f" {len(rows) - len(removed)}개는 저장소 오류로 지우지 못했습니다.")
+        elif kind == "delete_guild_files":
+            guild_id = dashboard_guild_id(args.get("guildId"))
+            ok, message = await delete_guild_files(guild_id) if guild_id else (False, "서버를 알 수 없습니다.")
+        elif kind == "cleanup":
+            ok, message = await run_cleanup()
+        elif kind == "test":
+            results = await storage.self_test() + await shortlinks.self_test()
+            data = [[label, bool(good), str(detail)[:300]] for label, good, detail in results]
+            ok = all(good for _, good, _ in results)
+            message = "저장소 테스트를 마쳤습니다." + ("" if ok else " 🔴 항목을 확인해 주세요.")
+        else:
+            ok, message = False, "알 수 없는 작업입니다."
+    except Exception as exc:
+        trace = traceback.format_exc()
+        print(f"대시보드 작업 오류 ({kind}):\n{trace}")
+        notify_admin("대시보드 작업 오류", f"{type(exc).__name__}: {exc}", f"작업: {kind}", trace)
+        ok, message = False, f"오류가 발생했습니다: {type(exc).__name__}"
+    return {"id": job.get("id"), "ok": ok, "message": plain_text(message), "data": data}
+
+
+async def dashboard_loop():
+    await bot.wait_until_ready()
+    last_snapshot = 0
+    last_problem = None
+    while not bot.is_closed():
+        delay = DASHBOARD_IDLE_SECONDS
+        problem = None
+        try:
+            data = await dashboard.sync()
+            if data.get("missing"):
+                delay = 600
+            elif data.get("wake"):
+                delay = DASHBOARD_AWAKE_SECONDS
+                results = [await dashboard_job(job) for job in data.get("jobs") or []]
+                if results or time.time() - last_snapshot > 60:
+                    snapshot = await dashboard_snapshot()
+                    last_snapshot = time.time()
+                    await dashboard.report(snapshot, results)
+            elif time.time() - last_snapshot > DASHBOARD_IDLE_SNAPSHOT_SECONDS:
+                snapshot = await dashboard_snapshot()
+                last_snapshot = time.time()
+                await dashboard.report(snapshot)
+        except dashboard.NotBound:
+            problem, delay = "다른 키가 대시보드에 연결돼 있습니다. 대시보드 → 설정 → 봇 연결에서 해제해 주세요.", 300
+        except Exception as exc:
+            problem, delay = f"{type(exc).__name__}: {exc}", 60
+        if problem and problem != last_problem:
+            print(f"대시보드 연결 문제: {problem}")
+        last_problem = problem
+        await asyncio.sleep(delay)
+
+
 async def setup_hook():
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton)
     await load_help_emojis()
+    if dashboard.configured():
+        task = asyncio.get_running_loop().create_task(dashboard_loop())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
     if storage.configured():
         problems = await storage.setup_bucket()
         if problems:
