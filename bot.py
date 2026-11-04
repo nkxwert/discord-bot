@@ -2888,24 +2888,35 @@ class HelpContext:
         self.message = type("HelpMessage", (), {"content": f"/도움말 → {what}"})()  # for describe_ctx
         self.notice = None
         self.header = f"-# {interaction.user.mention}님의 요청 · {what}"  # mentions never ping (allowed_mentions)
+        self.told = False  # the help message already says the result can't be posted
 
     def with_header(self, content):
         return f"{self.header}\n{content}" if content else self.header
 
     async def reply(self, content=None, *, embed=None, file=None, view=None, mention_author=None):
+        """Results are public: posted in the channel. (A follow-up to the private help message would show
+        "원본 메시지가 삭제되었어요", so that is never used.) Buttons check can_post_in first; if posting
+        still fails, the help message says why and the result is dropped."""
         extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
-        if can_post_in(self.channel):
-            try:
-                return HeaderMessage(await self.channel.send(self.with_header(content), **extra), self)
-            except discord.HTTPException as exc:
-                print(f"도움말 결과를 채널에 올리지 못해 도움말 메시지에 보여 줍니다: {type(exc).__name__}: {exc}")
-                if file is not None:
-                    file.reset()
-        # The bot can't post here (no permission in this channel or thread). The result goes into the private
-        # help message itself: a follow-up to it would show "원본 메시지가 삭제되었어요" once it is closed.
-        reply = HelpMessageReply(self.interaction)
-        await reply.edit(content=content, embed=embed, attachments=[file] if file else [], **({"view": view} if view else {}))
-        return reply
+        try:
+            return HeaderMessage(await self.channel.send(self.with_header(content), **extra), self)
+        except (discord.HTTPException, AttributeError) as exc:
+            print(f"도움말 결과를 채널에 올리지 못했습니다: {type(exc).__name__}: {exc}")
+            if not self.told:
+                self.told = True
+                try:
+                    await show_help(self.interaction, notice=CANNOT_POST_MESSAGE)
+                except discord.HTTPException:
+                    pass
+            return DroppedMessage()
+
+
+CANNOT_POST_MESSAGE = ("⚠️ 이 채널에는 마코가 글을 쓸 수 없어서 결과를 모두에게 보여 줄 수 없습니다.\n"
+                       "채널 설정 → 권한에서 마코에게 **메시지 보내기 · 파일 첨부 · 링크 첨부**를 켜 주시거나, "
+                       "마코가 글을 쓸 수 있는 채널에서 사용해 주세요.")
+# /도움말 actions whose result is posted in the channel for everyone
+PUBLIC_HELP_ACTIONS = {"run_uptime", "run_fortune", "run_ilchim", "run_add", "run_delete", "run_hypixel",
+                       "run_valorant", "attach", "run_upload"}
 
 
 def can_post_in(channel):
@@ -2917,23 +2928,14 @@ def can_post_in(channel):
     return perms.view_channel and talk and perms.attach_files and perms.embed_links
 
 
-class HelpMessageReply:
-    """A result shown in the private /도움말 message (when it can't be posted in the channel). Edits replace
-    the help page; its buttons stay unless the result brings its own, and [◀ 처음으로] redraws the menu."""
-
-    def __init__(self, interaction):
-        self.interaction = interaction
+class DroppedMessage:
+    """Stands in for a result that couldn't be posted, so the rest of the command just carries on."""
 
     async def edit(self, **changes):
-        changes.setdefault("embed", None)  # the help page's embed would hide the result
-        if "view" in changes and changes["view"] is None:  # a finished result: offer the way back
-            changes["view"] = discord.ui.View(timeout=None)
-            changes["view"].add_item(HelpButton("home", "◀ 처음으로", style=discord.ButtonStyle.secondary))
-        if self.interaction.response.is_done():
-            await self.interaction.edit_original_response(**changes)
-        else:
-            await self.interaction.response.edit_message(**changes)
         return self
+
+    async def delete(self, **kwargs):
+        pass
 
 
 class HeaderMessage:
@@ -3042,7 +3044,7 @@ async def show_help(interaction, **page):
     seconds, so the page is shown at once with [⏳ 준비 중...] and the link is filled in afterwards
     (waiting first made the 파일 button look like it did nothing)."""
     async def draw(**changes):
-        changes.setdefault("attachments", [])  # a result shown in this message (see HelpMessageReply)
+        changes.setdefault("attachments", [])  # nothing from an earlier page lingers
         changes.setdefault("content", None)
         if interaction.response.is_done():
             await interaction.edit_original_response(**changes)
@@ -3086,6 +3088,11 @@ class HelpButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:help
     async def callback(self, interaction):
         handler = HELP_ACTIONS.get(self.action)
         if handler is None:
+            return
+        if self.action in PUBLIC_HELP_ACTIONS and interaction.guild and not can_post_in(interaction.channel):
+            # Say so before any form opens: the result is for everyone, and here it can't be posted.
+            key = "upload" if self.action == "attach" else self.action[4:]
+            await show_help(interaction, page=help_page_of(key), selected=key, notice=CANNOT_POST_MESSAGE)
             return
         try:
             await handler(interaction)
