@@ -509,12 +509,128 @@ async def self_test():
     results.append(("CORS 규칙 설정", cors_error is None, cors_error or f"허용: {', '.join(upload_origins())}"))
     if cors_error is None:
         results.append(await _try("CORS 설정 후 웹 업로드 (Origin 포함)", "PUT", presigned_put(key + ".d"), browser, b"d"))
-    await delete([key] + [key + s for s in (".a", ".b", ".c", ".d")])
+    native_key = f"files/selftest/{secrets.token_urlsafe(6)}/native.txt"
+    if is_b2():
+        try:
+            await _b2_auth()
+            results.append(("B2 고유 API 로그인", True, f"버킷 ID {_b2['bucketId'][:8]}…"))
+            native_cors = await set_b2_cors()
+            results.append(("B2 고유 CORS 규칙 설정", native_cors is None, native_cors or "b2_upload_file 허용"))
+            results.append(await _b2_try("B2 고유 업로드 (Origin 포함, 페이지 방식)", origin, name=native_key))
+        except Exception as exc:
+            results.append(("B2 고유 API 로그인", False, f"{type(exc).__name__}: {exc}"))
+    await delete([key] + [key + s for s in (".a", ".b", ".c", ".d")] + [native_key])
     return results
 
 
+# ---------------------------------------------------------------- Backblaze B2 native API (browser uploads)
+# Browsers got "400 InvalidRequest" from B2's S3 endpoint on presigned PUTs that work from the bot.
+# Backblaze's documented browser upload is the native b2_upload_file call (see backblaze-b2-samples/
+# b2-browser-upload), so on B2 the upload page uses that, with B2's own CORS rule for it.
+
+B2_AUTH_URL = "https://api.backblazeb2.com/b2api/v3/b2_authorize_account"
+B2_AUTH_SECONDS = 12 * 60 * 60  # tokens last 24 hours; renew well before
+_b2 = {}  # cached authorization: apiUrl, token, accountId, bucketId, at
+
+
+def is_b2():
+    return "backblazeb2.com" in HOST
+
+
+class B2Error(Exception):
+    pass
+
+
+async def _b2_call(name, payload, retry=True):
+    auth = await _b2_auth()
+    url = f"{auth['apiUrl']}/b2api/v3/{name}"
+    async with net.session().post(url, json=payload, headers={"Authorization": auth["token"]},
+                                  timeout=aiohttp.ClientTimeout(total=20)) as response:
+        data = await response.json(content_type=None)
+    if response.status == 401 and retry:
+        _b2.clear()
+        return await _b2_call(name, payload, retry=False)
+    if response.status != 200:
+        raise B2Error(f"{name} HTTP {response.status} {data.get('code', '')} {data.get('message', '')}".strip())
+    return data
+
+
+async def _b2_auth():
+    if _b2 and time.time() - _b2["at"] < B2_AUTH_SECONDS:
+        return _b2
+    import base64
+    basic = base64.b64encode(f"{ACCESS_KEY_ID}:{SECRET_ACCESS_KEY}".encode()).decode()
+    async with net.session().get(B2_AUTH_URL, headers={"Authorization": f"Basic {basic}"},
+                                 timeout=aiohttp.ClientTimeout(total=20)) as response:
+        data = await response.json(content_type=None)
+    if response.status != 200:
+        raise B2Error(f"b2_authorize_account HTTP {response.status} {data.get('code', '')} {data.get('message', '')}".strip())
+    storage_api = data["apiInfo"]["storageApi"]
+    _b2.clear()
+    _b2.update(apiUrl=storage_api["apiUrl"], token=data["authorizationToken"], accountId=data["accountId"], at=time.time())
+    allowed = [b for b in storage_api.get("allowed", {}).get("buckets") or [] if b.get("name") == BUCKET]
+    if allowed and allowed[0].get("id"):
+        _b2["bucketId"] = allowed[0]["id"]
+    else:
+        listing = await _b2_call("b2_list_buckets", {"accountId": data["accountId"], "bucketName": BUCKET})
+        if not listing.get("buckets"):
+            raise B2Error(f"버킷 {BUCKET}을(를) 찾지 못했습니다")
+        _b2["bucketId"] = listing["buckets"][0]["bucketId"]
+    return _b2
+
+
+async def b2_upload_target():
+    """(uploadUrl, upload token) for one browser upload. A fresh URL per link, since B2 wants one upload
+    at a time per URL."""
+    auth = await _b2_auth()
+    data = await _b2_call("b2_get_upload_url", {"bucketId": auth["bucketId"]})
+    return data["uploadUrl"], data["authorizationToken"]
+
+
+async def set_b2_cors():
+    """B2's own CORS rule: lets the page (served from the S3 host) call b2_upload_file, and keeps the S3
+    operations. Replaces the bucket's CORS rules. Returns None or the error text."""
+    try:
+        auth = await _b2_auth()
+        await _b2_call("b2_update_bucket", {
+            "accountId": auth["accountId"], "bucketId": auth["bucketId"],
+            "corsRules": [{
+                "corsRuleName": "maco-upload",
+                "allowedOrigins": upload_origins(),
+                "allowedOperations": ["b2_upload_file", "b2_download_file_by_name", "b2_download_file_by_id",
+                                      "s3_put", "s3_get", "s3_head"],
+                "allowedHeaders": ["authorization", "content-type", "content-disposition", "x-bz-file-name",
+                                   "x-bz-content-sha1", "x-bz-info-b2-content-disposition", "x-bz-info-*"],
+                "exposeHeaders": ["x-bz-content-sha1", "x-bz-file-id"],
+                "maxAgeSeconds": 3600,
+            }],
+        })
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+async def _b2_try(label, origin, data=b"self-test", name="files/selftest/native.txt"):
+    try:
+        upload_url, token = await b2_upload_target()
+        headers = {"Authorization": token, "X-Bz-File-Name": quote(name, safe="/"), "Content-Type": "text/plain",
+                   "X-Bz-Content-Sha1": "do_not_verify",
+                   "X-Bz-Info-b2-content-disposition": quote("attachment; filename*=UTF-8''test.txt", safe="")}
+        if origin:
+            headers["Origin"] = origin
+        async with net.session().post(upload_url, headers=headers, data=data,
+                                      timeout=aiohttp.ClientTimeout(total=20)) as response:
+            body = await response.json(content_type=None)
+        if response.status == 200:
+            allow = response.headers.get("Access-Control-Allow-Origin")
+            return label, True, "HTTP 200" + (f" · CORS 허용 {allow}" if origin else "")
+        return label, False, f"HTTP {response.status} {body.get('code', '')} {body.get('message', '')}".strip()
+    except Exception as exc:
+        return label, False, f"{type(exc).__name__}: {exc}"
+
+
 async def setup_bucket():
-    """Upload the big-file page and allow the browser to PUT from it (CORS).
+    """Upload the big-file page and allow the browser to upload from it (CORS).
     Failures are only logged: the CORS rule can also be set by hand (see README)."""
     try:
         with open(UPLOAD_PAGE_PATH, "rb") as f:
@@ -523,14 +639,25 @@ async def setup_bucket():
                   headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache"})
     except Exception as exc:
         print(f"업로드 페이지 올리기 실패: {type(exc).__name__}: {exc}")
-    error = await set_cors()
+    error = await set_b2_cors() if is_b2() else await set_cors()
     if error:
         print(f"저장소 CORS 설정 실패 (대시보드에서 직접 설정해 주세요): {error}")
 
 
-def upload_page_link(key, retention="7일"):
-    # The PUT link (and the retention shown on the page) ride in the #fragment, never sent to the server.
-    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(presigned_put(key), safe='')}|{quote(retention, safe='')}"
+async def upload_page_link(key, retention="7일"):
+    """Link to the upload page. Where to upload (and the retention shown) ride in the #fragment, which
+    browsers never send to a server. On B2 that is a native upload URL and token ("b2:" + base64 JSON),
+    elsewhere (or if B2's API fails) a presigned PUT URL."""
+    target = presigned_put(key)
+    if is_b2():
+        try:
+            upload_url, token = await b2_upload_target()
+            import base64
+            import json
+            target = "b2:" + base64.urlsafe_b64encode(json.dumps({"u": upload_url, "t": token, "k": key}).encode()).decode()
+        except Exception as exc:
+            print(f"B2 업로드 주소 받기 실패, 서명 링크로 대신합니다: {type(exc).__name__}: {exc}")
+    return f"{link(UPLOAD_PAGE_KEY, PAGE_LINK_SECONDS)}#{quote(target, safe='')}|{quote(retention, safe='')}"
 
 
 # ---------------------------------------------------------------- video conversion (optional, off by default)

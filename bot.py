@@ -2051,11 +2051,11 @@ UPLOAD_WATCH_DELAYS = [5, 5, 10, 10, 15, 15, 20, 20, 30, 30, 30, 30, 30, 30, 30,
 _upload_locks = {}
 
 
-def start_browser_upload(guild_id, channel_id, user_id, name=""):
+async def start_browser_upload(guild_id, channel_id, user_id, name=""):
     """A pending upload and the page link where the user picks the file (any size up to FILE_MAX_BYTES)."""
     key = storage.new_key(guild_id, "upload")
     row = save_file_row(guild_id, channel_id, user_id, name.strip()[:MAX_NAME_LENGTH], key, "", 0, status="pending")
-    return row, storage.upload_page_link(key, retention_text())
+    return row, await storage.upload_page_link(key, retention_text())
 
 
 def browser_upload_text(link):
@@ -2261,7 +2261,7 @@ async def upload_command(ctx, *, name: str = ""):
         await upload_attachments(ctx, ctx.message.attachments, name)
         return
     # No attachment: big files go through the web page, sent by DM so nobody else can use the link.
-    row, link = start_browser_upload(ctx.guild.id, ctx.channel.id, ctx.author.id, name)
+    row, link = await start_browser_upload(ctx.guild.id, ctx.channel.id, ctx.author.id, name)
     try:
         dm = await ctx.author.send(browser_upload_text(link), view=browser_upload_view(row["id"]))
     except discord.HTTPException:
@@ -2327,9 +2327,29 @@ async def upload_command_error(ctx, error):
         await report_error(ctx, error)
 
 
+ORPHAN_SWEEP_SECONDS = 6 * 60 * 60
+_last_orphan_sweep = [0.0]
+
+
+async def sweep_orphans():
+    """Remove objects under files/ that the bot's list doesn't know (older than 2 hours). B2's browser
+    upload token is good for 24 hours and any file name, so this stops it being used to park other files."""
+    _last_orphan_sweep[0] = time.time()
+    with connect_db() as conn:
+        known = {r["key"] for r in conn.execute("SELECT key FROM files")}
+    orphans = await storage.orphan_keys(known, min_age_seconds=2 * 60 * 60)
+    if orphans and await storage.delete(orphans):
+        print(f"목록에 없는 저장소 파일 {len(orphans)}개를 지웠습니다.")
+
+
 @tasks.loop(minutes=10)
 async def clean_files():
     """Delete files older than 7 days (and unfinished browser uploads) from storage and the list."""
+    if time.time() - _last_orphan_sweep[0] > ORPHAN_SWEEP_SECONDS:
+        try:
+            await sweep_orphans()
+        except Exception as exc:
+            print(f"저장소 정리 오류: {type(exc).__name__}: {exc}")
     try:
         with connect_db() as conn:
             rows = [dict(r) for r in conn.execute("SELECT id, key FROM files WHERE expires_at < ?", (time.time(),))]
@@ -2617,7 +2637,8 @@ async def help_run_upload(interaction):
 
 
 async def help_run_web_upload(interaction):
-    row, link = start_browser_upload(interaction.guild.id, interaction.channel.id, interaction.user.id)
+    await interaction.response.defer()  # getting a B2 upload address can take over Discord's 3 seconds
+    row, link = await start_browser_upload(interaction.guild.id, interaction.channel.id, interaction.user.id)
     await show_help(interaction, page="files", selected="upload", details=browser_upload_text(link),
                     extra_items=[UploadDoneButton(row["id"])])
     watch_upload(row["id"], lambda message: interaction.edit_original_response(
