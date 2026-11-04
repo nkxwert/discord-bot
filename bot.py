@@ -10,7 +10,7 @@ import ipaddress
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import aiohttp
@@ -556,6 +556,7 @@ OWNER_COMMANDS = [
     ("£DB", "로컬 DB와 파일 저장소 상태(응답 시간, 용량, 파일 수 등)를 봅니다."),
     ("£DB 파일 [서버ID]", "올라간 파일을 번호와 함께 봅니다. 서버ID를 붙이면 그 서버만 봅니다."),
     ("£DB 삭제 <번호...>", "번호로 파일을 지웁니다. 여러 개는 띄어서 적습니다. (예: `£DB 삭제 12 15`)"),
+    ("£DB 만료 <번호> <기간>", "파일 하나의 만료일을 지금부터 그 기간 뒤로 바꿉니다. (예: `£DB 만료 12 3일`)"),
     ("£DB 서버삭제 <서버ID>", "그 서버에 올라간 파일을 전부 지웁니다. 확인 버튼을 한 번 더 누릅니다."),
     ("£DB 기간 [기간]", "자동 삭제 기간을 보거나 바꿉니다. 새로 올리는 파일부터 적용됩니다. (예: `£DB 기간 3일`, `£DB 기간 12시간`)"),
     ("£DB 정리", "기간이 지난 파일을 바로 지우고, 목록에 없이 저장소에만 남은 파일도 정리합니다."),
@@ -604,7 +605,7 @@ async def owner_db(message, args):
         return
     handlers = {"파일": owner_db_files, "삭제": owner_db_delete, "서버삭제": owner_db_delete_guild,
                 "기간": owner_db_retention, "정리": owner_db_cleanup, "관리자": owner_db_admins,
-                "테스트": owner_db_test, "한도": owner_db_limits}
+                "테스트": owner_db_test, "한도": owner_db_limits, "만료": owner_db_expiry}
     handler = handlers.get(sub)
     if handler is None:
         await message.reply("알 수 없는 명령어입니다. `£도움말`을 확인해 주세요.", mention_author=False)
@@ -644,6 +645,16 @@ async def owner_db_files(message, args):
     embed = discord.Embed(title=f"파일 {len(rows)}개", description=text, color=discord.Color.blurple())
     embed.set_footer(text="£DB 삭제 <번호>로 지우기")
     await message.reply(embed=embed, mention_author=False)
+
+
+async def owner_db_expiry(message, args):
+    seconds = parse_duration(" ".join(args[1:])) if len(args) > 1 else None
+    if not args or not args[0].lstrip("#").isdigit() or seconds is None:
+        await message.reply("사용법: `£DB 만료 <번호> <지금부터 기간>` (예: `£DB 만료 12 3일`, `£DB 만료 12 6시간`)",
+                            mention_author=False)
+        return
+    _, text = await set_file_expiry(int(args[0].lstrip("#")), time.time() + seconds)
+    await message.reply(text, mention_author=False)
 
 
 async def owner_db_delete(message, args):
@@ -2587,6 +2598,36 @@ async def can_manage_file(user, row):
     return row["uploaded_by"] == user.id or await is_file_admin(user)
 
 
+FILE_EXPIRY_MIN_SECONDS = 5 * 60
+
+
+async def set_file_expiry(row_id, expires_at):
+    """(ok, message): change when one file is deleted (£DB 만료 and the dashboard). Its short link keeps
+    its address and gets a fresh storage link that lasts until the new time."""
+    with connect_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id = ? AND status = 'ready'", (row_id,)).fetchone()
+    if not row:
+        return False, f"#{row_id} 파일이 없습니다."
+    row = dict(row)
+    now = time.time()
+    latest = now + file_retention_max()
+    if expires_at < now + FILE_EXPIRY_MIN_SECONDS:
+        return False, "만료일은 지금부터 5분 뒤 이후로 정해 주세요."
+    if expires_at > latest + 60:
+        reason = "비공개 저장소의 링크는 최대 7일까지만 쓸 수 있습니다. " if not storage.PUBLIC_URL else ""
+        return False, f"{reason}지금부터 {human_duration(file_retention_max())} 안으로 정해 주세요. (최대 <t:{int(latest)}:f>)"
+    expires_at = min(expires_at, latest)
+    row["expires_at"] = expires_at
+    note = ""
+    if row.get("url") and not await shortlinks.update(row["url"], file_link(row), expires_at):
+        note = "\n-# 단축 링크는 바꾸지 못해서, 이미 올라간 링크는 원래 만료일까지만 열립니다."
+    with connect_db() as conn:
+        conn.execute("UPDATE files SET expires_at = ? WHERE id = ?", (expires_at, row_id))
+    if not storage.PUBLIC_URL and not note:
+        note = "\n-# 채팅에 이미 올라간 미리보기는 원래 만료일 뒤에 안 보일 수 있습니다. [원본 열기]·[링크 복사]는 새 만료일까지 열립니다."
+    return True, (f"**{discord.utils.escape_markdown(row['name'])}** 만료일을 <t:{int(expires_at)}:f>(으)로 바꿨습니다." + note)
+
+
 async def remove_file(row):
     """Delete from storage and the list; False if storage refused (the row is kept so cleanup retries)."""
     if not await storage.delete([row["key"]]):
@@ -3354,10 +3395,15 @@ DASHBOARD_IDLE_SNAPSHOT_SECONDS = 30 * 60  # so the page opens with fairly recen
 DASHBOARD_MAX_FILES = 300
 
 
+KST = timezone(timedelta(hours=9))
+
+
 def plain_text(text):
-    """Discord markdown → plain text for the web page."""
+    """Discord markdown → plain text for the web page (<t:...> times in Korean time)."""
     text = re.sub(r"^-# ", "", text, flags=re.M)
-    return text.replace("**", "").replace("`", "")
+    text = re.sub(r"<t:(\d+)(?::\w)?>", lambda m: datetime.fromtimestamp(int(m[1]), KST).strftime("%Y-%m-%d %H:%M"), text)
+    text = text.replace("**", "").replace("`", "")
+    return re.sub(r"\\([*_`~|>\\])", r"\1", text)
 
 
 def json_limit(value):
@@ -3380,7 +3426,8 @@ async def dashboard_snapshot():
             "latencyMs": round(bot.latency * 1000) if bot.latency == bot.latency else None,  # NaN before connecting
             "memory": {"current": current, "peak": peak, "limit": env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024},
         },
-        "retention": {"seconds": file_retention(), "text": retention_text(), "maxText": human_duration(retention_max)},
+        "retention": {"seconds": file_retention(), "text": retention_text(), "maxText": human_duration(retention_max),
+                      "maxSeconds": retention_max},
         "limits": {"quota": json_limit(default_limit("quota")), "max": json_limit(default_limit("max")),
                    "hardMax": FILE_MAX_HARD, "totalQuota": FILE_TOTAL_QUOTA},
         "storage": {"configured": storage.configured()},
@@ -3394,7 +3441,7 @@ async def dashboard_snapshot():
             "SELECT COALESCE(SUM(status = 'ready'), 0), COALESCE(SUM(status = 'pending'), 0) FROM files").fetchone()
         next_expiry = conn.execute("SELECT MIN(expires_at) FROM files WHERE status = 'ready'").fetchone()[0]
         files = [dict(r) for r in conn.execute(
-            "SELECT id, guild_id, name, size, uploaded_by, expires_at, status FROM files "
+            "SELECT id, guild_id, name, key, url, size, uploaded_by, expires_at, status FROM files "
             "ORDER BY uploaded_at DESC LIMIT ?", (DASHBOARD_MAX_FILES,))]
     snapshot["filesTotal"] = ready + pending
     guild_ids = [g.id for g in sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)]
@@ -3414,6 +3461,8 @@ async def dashboard_snapshot():
             "id": row["id"], "guildId": str(row["guild_id"]), "guild": guild.name if guild else str(row["guild_id"]),
             "name": row["name"] or "(이름 없음)", "size": row["size"], "uploader": str(row["uploaded_by"]),
             "uploaderName": user_name(row["uploaded_by"]), "expiresAt": int(row["expires_at"]), "status": row["status"],
+            # where the file is stored: its short link, else a storage link made now (opens until it expires)
+            "url": open_link(row) if row["status"] == "ready" and storage.configured() else None,
         })
     try:
         owners = await admin_user_ids()
@@ -3443,7 +3492,7 @@ async def dashboard_job(job):
     """Do one dashboard job; {"id", "ok", "message", "data"?} for NKOTE. The bot checks every value itself."""
     kind, args = job.get("type"), job.get("args") or {}
     ok, message, data = True, "", None
-    needs_storage = kind in ("delete_files", "delete_guild_files", "cleanup", "test")
+    needs_storage = kind in ("delete_files", "delete_guild_files", "cleanup", "test", "set_expiry")
     try:
         if needs_storage and not storage.configured():
             ok, message = False, FILE_NOT_CONFIGURED
@@ -3468,6 +3517,12 @@ async def dashboard_job(job):
             removed = [row for row in rows if await remove_file(row)]
             ok = len(removed) == len(rows)
             message = f"파일 {len(removed)}개를 삭제했습니다." + ("" if ok else f" {len(rows) - len(removed)}개는 저장소 오류로 지우지 못했습니다.")
+        elif kind == "set_expiry":
+            row_id, when = args.get("id"), args.get("expiresAt")
+            if not str(row_id).isdigit() or not isinstance(when, (int, float)):
+                ok, message = False, "파일이나 날짜를 알 수 없습니다."
+            else:
+                ok, message = await set_file_expiry(int(row_id), float(when))
         elif kind == "delete_guild_files":
             guild_id = dashboard_guild_id(args.get("guildId"))
             ok, message = await delete_guild_files(guild_id) if guild_id else (False, "서버를 알 수 없습니다.")
