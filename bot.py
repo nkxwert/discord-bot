@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from mcstatus import JavaServer
 from dotenv import load_dotenv
@@ -26,6 +27,7 @@ import easter_eggs
 import shortlinks
 import stats
 import storage
+import textcon
 
 load_dotenv()
 
@@ -1142,6 +1144,8 @@ def command_list_embed():
     embed.add_field(name="!파일삭제 <이름>", value="내가 올린 파일을 지웁니다.", inline=False)
     embed.add_field(name="!운세", value="오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     embed.add_field(name="!일침", value="정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다.", inline=False)
+    embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
+                    value=f"글자를 디시 글자콘처럼 그림으로 만들어 올립니다 (최대 {textcon.MAX_CHARS}자). 메시지를 넣으면 같이 보냅니다.", inline=False)
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
     embed.add_field(name="​", value="─" * 24, inline=False)
     embed.add_field(
@@ -1863,6 +1867,9 @@ class UserAnswerButton(discord.ui.DynamicItem[discord.ui.Button], template=r"dev
 
 @bot.tree.error
 async def on_app_command_error(interaction, error):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(f"{math.ceil(error.retry_after)}초 후에 다시 사용할 수 있습니다.", ephemeral=True)
+        return
     original = getattr(error, "original", error)
     trace = "".join(traceback.format_exception(type(original), original, original.__traceback__))
     print(f"슬래시 명령어 오류:\n{trace}")
@@ -3377,6 +3384,24 @@ HELP_ACTIONS = {
     "run_hypixel": help_open_form(HypixelModal),
     "run_valorant": help_open_form(ValorantModal),
 }
+
+
+@bot.tree.command(name="글자콘", description="글자를 디시 글자콘처럼 그림으로 만들어 올립니다")
+@app_commands.rename(text="글자", message="메시지")
+@app_commands.describe(text=f"그림으로 만들 글자 (최대 {textcon.MAX_CHARS}자)", message="글자콘과 같이 보낼 메시지 (선택)")
+@app_commands.checks.cooldown(1, 3.0)
+async def textcon_slash(interaction: discord.Interaction, text: app_commands.Range[str, 1, textcon.MAX_CHARS],
+                        message: app_commands.Range[str, 1, 1800] | None = None):
+    """Like /unflip: the optional message goes along with the picture, in one message."""
+    try:
+        text = textcon.clean(text)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)  # drawing shares the card threads, which may be busy
+    png = await asyncio.to_thread(textcon.render, text)
+    await interaction.followup.send(content=message, file=discord.File(io.BytesIO(png), "글자콘.png"),
+                                    allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="도움말", description="버튼으로 명령어를 보고 바로 사용합니다")
