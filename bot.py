@@ -2232,6 +2232,28 @@ async def add_song_player(row):
     return row
 
 
+def later_add_players(message, rows, errors=(), header=None):
+    """After the card is up, make the players of its songs in the background and put them into the same
+    card. (Converting a song takes a few CPU-seconds, which on a small host can be tens of seconds; the
+    card shouldn't wait for that.)"""
+    songs = [row for row in rows if row.get("player_pending")]
+    if not songs or message is None:
+        return
+
+    async def work():
+        for row in songs:
+            await add_song_player(row)
+            row["player_pending"] = False
+        try:
+            await message.edit(view=file_layout(rows, errors, header))
+        except (discord.HTTPException, AttributeError) as exc:
+            print(f"노래 플레이어를 카드에 넣지 못했습니다: {type(exc).__name__}: {exc}")
+
+    task = asyncio.get_running_loop().create_task(work())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 def file_link(row):
     """Made fresh each time: on a private bucket it is a presigned link that lasts until the file expires."""
     return storage.link(row["key"], row["expires_at"] - time.time())
@@ -2273,6 +2295,8 @@ def file_layout(rows, errors=(), header=None):
         if player:  # a song: its MP4 player, which Discord plays in the chat
             card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(
                 storage.link(player, row["expires_at"] - time.time()))))
+        elif row.get("player_pending"):
+            card.add_item(discord.ui.TextDisplay("-# 🎵 재생 준비 중… 지금은 [원본 열기]로 들을 수 있어요"))
         elif media:  # the storage link itself: Discord may not preview through a redirect
             card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(file_link(row))))
         buttons = discord.ui.ActionRow()
@@ -2377,8 +2401,8 @@ async def upload_attachments(ctx, attachments, name=""):
                 errors.append(f"`{attachment.filename}`: {too_big_message(ctx.guild.id)}")
                 continue
             try:
-                rows.append(await add_song_player(await store_attachment(
-                    ctx.guild.id, ctx.channel.id, ctx.author.id, attachment, name if len(attachments) == 1 else "")))
+                rows.append(await store_attachment(ctx.guild.id, ctx.channel.id, ctx.author.id, attachment,
+                                                   name if len(attachments) == 1 else ""))
             except storage.StorageError as exc:
                 if exc.__cause__:
                     notify_admin("파일 저장소 오류", f"{type(exc.__cause__).__name__}: {exc.__cause__}", describe_ctx(ctx))
@@ -2391,7 +2415,11 @@ async def upload_attachments(ctx, attachments, name=""):
     (rows, errors), notice = await run_with_notice(ctx, work(), progress)
     # The preview is a different kind of message (components v2), so it is posted fresh instead of
     # editing the waiting notice into it.
-    await send_files(ctx_sender(ctx), rows, errors, getattr(ctx, "header", None))
+    header = getattr(ctx, "header", None)
+    for row in rows:
+        row["player_pending"] = is_song(row) and storage.configured()
+    message = await send_files(ctx_sender(ctx), rows, errors, header)
+    later_add_players(message, rows, errors, header)
     if notice:
         try:
             await notice.delete()
@@ -2484,10 +2512,9 @@ async def finish_upload(row_id):
             conn.commit()
             done = dict(conn.execute("SELECT * FROM files WHERE id = ?", (row_id,)).fetchone())
     _upload_locks.pop(row_id, None)
-    if is_song(done):
-        await upload_placeholder(done, "🎵 재생 준비 중...")
-        await add_song_player(done)
-    await post_upload(done)
+    done["player_pending"] = is_song(done) and storage.configured()
+    message = await post_upload(done)
+    later_add_players(message, [done], (), upload_header(done))
     return "done", f"✅ **{discord.utils.escape_markdown(name)}** 올리기를 마쳤습니다. 채널에 올렸습니다."
 
 
@@ -2532,7 +2559,7 @@ async def post_upload(row):
         await add_short_links([row])
         try:
             await placeholder.edit(view=file_layout([row], header=upload_header(row)))
-            return
+            return placeholder
         except discord.HTTPException as exc:
             print(f"업로드 결과로 바꾸기 실패, 새로 보냅니다: {type(exc).__name__}: {exc}")
             try:
@@ -2543,7 +2570,7 @@ async def post_upload(row):
     if channel is None:
         return
     try:
-        await send_files(channel.send, [row], header=upload_header(row))
+        return await send_files(channel.send, [row], header=upload_header(row))
     except discord.HTTPException as exc:
         print(f"업로드 결과 전송 실패: {type(exc).__name__}: {exc}")
 

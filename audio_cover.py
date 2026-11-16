@@ -21,12 +21,20 @@ def _font(size, family):
     return cards.font(size, "kr")  # Galmuri: kana, symbols and the like that Black Han Sans lacks
 
 
-def _has(face, ch):
+@lru_cache(maxsize=8)
+def _blank(size, family):
+    mask = _font(size, family).getmask("\U0010FFFD")
+    return mask.size, bytes(mask)
+
+
+@lru_cache(maxsize=2048)
+def _has(size, family, ch):
+    """Whether the font draws this letter (checked once per letter: drawing a cover used to redo it
+    hundreds of times while wrapping the title, which took seconds)."""
     if ch.isspace():
         return True
-    mask = face.getmask(ch)
-    blank = face.getmask("\U0010FFFD")
-    return bool(mask.getbbox()) and (mask.size, bytes(mask)) != (blank.size, bytes(blank))
+    mask = _font(size, family).getmask(ch)
+    return bool(mask.getbbox()) and (mask.size, bytes(mask)) != _blank(size, family)
 
 
 def _runs(text, size):
@@ -34,7 +42,7 @@ def _runs(text, size):
     main, other = _font(size, "main"), _font(size, "other")
     runs = []
     for ch in text:
-        face = main if _has(main, ch) else other if _has(other, ch) else None
+        face = main if _has(size, "main", ch) else other if _has(size, "other", ch) else None
         if face is None:
             continue
         if runs and runs[-1][1] is face:
@@ -126,8 +134,7 @@ def render(title, art_path, out_path):
     draw = ImageDraw.Draw(image)
     max_width = WIDTH - text_x - 36
     # Letters neither font has (kanji, emoji ...) are left out; tidy what that leaves at the ends.
-    main, other = _font(40, "main"), _font(40, "other")
-    title = "".join(ch for ch in " ".join(title.split()) if _has(main, ch) or _has(other, ch))
+    title = "".join(ch for ch in " ".join(title.split()) if _has(40, "main", ch) or _has(40, "other", ch))
     title = " ".join(title.split()).strip(" -_·|~.,()[]") or "노래"
     lines = _wrap(title, 40, max_width, 3)
     block = 34 + 14 + len(lines) * 52
