@@ -859,9 +859,17 @@ async def make_song_player(key, title, player_key, render_cover):
         return False
     async with _preview_lock:
         folder = tempfile.mkdtemp(prefix="maco-song-")
+        steps, clock = [], [time.monotonic()]
+
+        def took(label):  # step timings for the log, to see what is slow on the host
+            now = time.monotonic()
+            steps.append(f"{label} {now - clock[0]:.1f}s")
+            clock[0] = now
+
         try:
             source = os.path.join(folder, "song")
             await download_to(key, source)
+            took("받기")
             duration, codec, has_art = await _probe(ffmpeg, source)
             if codec is None:
                 return False
@@ -874,6 +882,7 @@ async def make_song_player(key, title, player_key, render_cover):
                     art = None
             cover = os.path.join(folder, "cover.png")
             await asyncio.to_thread(render_cover, title, art, cover)
+            took("그림")
             still = os.path.join(folder, "still.mp4")
             code, err = await _run_capture(
                 # one frame lasting 10 seconds: the repeated picture then adds only ~2KB/s to the song
@@ -883,6 +892,7 @@ async def make_song_player(key, title, player_key, render_cover):
             if code != 0:
                 print(f"노래 플레이어 그림 실패: {err[-300:]}")
                 return False
+            took("첫 프레임")
             player = os.path.join(folder, "player.mp4")
             sound = ["-c:a", "copy"] if codec == "aac" else ["-c:a", "aac", "-b:a", "192k"]
             # Cut exactly at the song's end; setts shortens the last 10-second picture frame to fit, or the
@@ -896,7 +906,10 @@ async def make_song_player(key, title, player_key, render_cover):
             if code != 0 or not os.path.exists(player):
                 print(f"노래 플레이어 만들기 실패: {err[-300:] or '시간 초과'}")
                 return False
+            took("소리 변환")
             await put_path(player_key, player, "player.mp4", "video/mp4")
+            took("올리기")
+            print(f"노래 플레이어 완료 ({' · '.join(steps)})")
             return True
         finally:
             shutil.rmtree(folder, ignore_errors=True)
