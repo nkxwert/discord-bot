@@ -20,6 +20,7 @@ from discord.ext import commands, tasks
 from mcstatus import JavaServer
 from dotenv import load_dotenv
 
+import audio_cover
 import cards
 import dashboard
 import net
@@ -301,6 +302,9 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_guild ON files(guild_id, status)")
+        # A song's MP4 player (its sound + a still picture), so Discord can play it in the chat.
+        if "player_key" not in [row["name"] for row in conn.execute("PRAGMA table_info(files)")]:
+            conn.execute("ALTER TABLE files ADD COLUMN player_key TEXT")
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.commit()
@@ -755,10 +759,10 @@ async def owner_db_delete_guild(message, args):
 async def delete_guild_files(guild_id):
     """(ok, message) after deleting every file of a server (£DB 서버삭제 and the dashboard)."""
     with connect_db() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT id, key, url FROM files WHERE guild_id = ?", (guild_id,))]
+        rows = [dict(r) for r in conn.execute("SELECT id, key, url, player_key FROM files WHERE guild_id = ?", (guild_id,))]
     if not rows:
         return True, f"{guild_label(guild_id)}에 올라간 파일이 없습니다."
-    if not await storage.delete([r["key"] for r in rows]):
+    if not await storage.delete([k for r in rows for k in row_keys(r)]):
         return False, "지우지 못했습니다. 저장소 연결을 확인해 주세요."
     with connect_db() as conn:
         conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
@@ -982,7 +986,7 @@ async def run_cleanup():
         expired = conn.execute("SELECT COUNT(*) FROM files WHERE expires_at < ?", (time.time(),)).fetchone()[0]
     await clean_files.coro()
     with connect_db() as conn:
-        known = {r["key"] for r in conn.execute("SELECT key FROM files")}
+        known = stored_keys(conn)
     orphans = await storage.orphan_keys(known)
     if orphans is None:
         return False, f"기간이 지난 파일 {expired}개를 정리했습니다. 저장소 목록은 확인하지 못했습니다."
@@ -1075,7 +1079,8 @@ async def db_status_embed():
         f"{connection}\n`{host}` · 버킷 `{bucket}` · {mode}\n"
         f"단축 링크 {f'`{shortlinks.host()}`' if shortlinks.configured() else '설정 안 됨 (긴 링크 사용)'}\n"
         f"자동 삭제 {'🟢 동작 중' if clean_files.is_running() else '🔴 멈춤'} · "
-        f"영상 변환(ffmpeg) {'있음' if storage.can_convert() else '없음'}"
+        f"영상 변환(ffmpeg) {'있음' if storage.can_convert() else '없음'} · "
+        f"노래 재생 {'🟢 가능' if storage.ffmpeg_path() else '🔴 ffmpeg 없음 (imageio-ffmpeg 설치 필요)'}"
     ))
     percent = used / total * 100 if total else 0
     embed.add_field(name="💾 용량", inline=False, value=(
@@ -1155,7 +1160,7 @@ def command_list_embed():
         value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
-    embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 미리보기로 보여 줍니다(영상은 바로 재생). 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
+    embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 미리보기로 보여 줍니다(영상과 노래는 바로 재생). 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
                     f"{retention_text()} 후 자동 삭제됩니다.", inline=False)
     embed.add_field(name="!파일 [이름]", value="내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다.", inline=False)
     embed.add_field(name="!파일삭제 <이름>", value="내가 올린 파일을 지웁니다.", inline=False)
@@ -2185,6 +2190,48 @@ async def store_file(guild_id, channel_id, user_id, filename, data, name=""):
     return save_file_row(guild_id, channel_id, user_id, name, key, content_type, len(data))
 
 
+def row_keys(row):
+    """Everything stored for a file: the file itself and, for a song, its MP4 player."""
+    return [row["key"]] + ([row["player_key"]] if row.get("player_key") else [])
+
+
+def stored_keys(conn):
+    keys = set()
+    for row in conn.execute("SELECT key, player_key FROM files"):
+        keys.add(row["key"])
+        if row["player_key"]:
+            keys.add(row["player_key"])
+    return keys
+
+
+def is_song(row):
+    return storage.is_audio(row.get("content_type"), row.get("name"))
+
+
+async def add_song_player(row):
+    """For a song: make its MP4 player (album art or Maco + title, with the song's sound) so it plays in the
+    chat at any size. Updates row; on failure the card simply has no player (the 원본 열기 button still plays
+    it in the browser). Only the song counts towards the storage limits."""
+    if not is_song(row) or row.get("player_key") or not storage.configured():
+        return row
+    player_key = f"{row['key']}.player.mp4"
+    try:
+        made = await storage.make_song_player(row["key"], row["name"], player_key, audio_cover.render)
+    except Exception as exc:
+        print(f"노래 플레이어 만들기 오류: {type(exc).__name__}: {exc}")
+        notify_admin("노래 플레이어 만들기 오류", f"{type(exc).__name__}: {exc}", f"파일 #{row['id']}",
+                     traceback.format_exc())
+        made = False
+    if not made:
+        if not storage.ffmpeg_path():
+            notify_admin("노래 플레이어를 만들 수 없음", "ffmpeg가 없습니다. requirements.txt의 imageio-ffmpeg를 설치해 주세요.")
+        return row
+    with connect_db() as conn:
+        conn.execute("UPDATE files SET player_key = ? WHERE id = ?", (player_key, row["id"]))
+    row["player_key"] = player_key
+    return row
+
+
 def file_link(row):
     """Made fresh each time: on a private bucket it is a presigned link that lasts until the file expires."""
     return storage.link(row["key"], row["expires_at"] - time.time())
@@ -2220,9 +2267,13 @@ def file_layout(rows, errors=(), header=None):
     for row in rows:
         url = open_link(row)
         media = (row["content_type"] or "").startswith(("image/", "video/"))
+        player = row.get("player_key")
         card = discord.ui.Container(accent_colour=discord.Colour.green())
-        card.add_item(discord.ui.TextDisplay(f"📁 {file_title(row)}"))
-        if media:  # the storage link itself: Discord may not preview through a redirect
+        card.add_item(discord.ui.TextDisplay(f"{'🎵' if is_song(row) else '📁'} {file_title(row)}"))
+        if player:  # a song: its MP4 player, which Discord plays in the chat
+            card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(
+                storage.link(player, row["expires_at"] - time.time()))))
+        elif media:  # the storage link itself: Discord may not preview through a redirect
             card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(file_link(row))))
         buttons = discord.ui.ActionRow()
         if len(url) <= 512:  # Discord's limit for a link button
@@ -2326,8 +2377,8 @@ async def upload_attachments(ctx, attachments, name=""):
                 errors.append(f"`{attachment.filename}`: {too_big_message(ctx.guild.id)}")
                 continue
             try:
-                rows.append(await store_attachment(ctx.guild.id, ctx.channel.id, ctx.author.id, attachment,
-                                                   name if len(attachments) == 1 else ""))
+                rows.append(await add_song_player(await store_attachment(
+                    ctx.guild.id, ctx.channel.id, ctx.author.id, attachment, name if len(attachments) == 1 else "")))
             except storage.StorageError as exc:
                 if exc.__cause__:
                     notify_admin("파일 저장소 오류", f"{type(exc.__cause__).__name__}: {exc.__cause__}", describe_ctx(ctx))
@@ -2433,6 +2484,9 @@ async def finish_upload(row_id):
             conn.commit()
             done = dict(conn.execute("SELECT * FROM files WHERE id = ?", (row_id,)).fetchone())
     _upload_locks.pop(row_id, None)
+    if is_song(done):
+        await upload_placeholder(done, "🎵 재생 준비 중...")
+        await add_song_player(done)
     await post_upload(done)
     return "done", f"✅ **{discord.utils.escape_markdown(name)}** 올리기를 마쳤습니다. 채널에 올렸습니다."
 
@@ -2654,7 +2708,7 @@ async def set_file_expiry(row_id, expires_at):
 
 async def remove_file(row):
     """Delete from storage and the list; False if storage refused (the row is kept so cleanup retries)."""
-    if not await storage.delete([row["key"]]):
+    if not await storage.delete(row_keys(row)):
         return False
     await shortlinks.delete(row.get("url"))
     with connect_db() as conn:
@@ -2784,7 +2838,7 @@ async def sweep_orphans():
     upload token is good for 24 hours and any file name, so this stops it being used to park other files."""
     _last_orphan_sweep[0] = time.time()
     with connect_db() as conn:
-        known = {r["key"] for r in conn.execute("SELECT key FROM files")}
+        known = stored_keys(conn)
     orphans = await storage.orphan_keys(known, min_age_seconds=2 * 60 * 60)
     if orphans and await storage.delete(orphans):
         print(f"목록에 없는 저장소 파일 {len(orphans)}개를 지웠습니다.")
@@ -2800,10 +2854,11 @@ async def clean_files():
             print(f"저장소 정리 오류: {type(exc).__name__}: {exc}")
     try:
         with connect_db() as conn:
-            rows = [dict(r) for r in conn.execute("SELECT id, key FROM files WHERE expires_at < ?", (time.time(),))]
+            rows = [dict(r) for r in conn.execute("SELECT id, key, player_key FROM files WHERE expires_at < ?",
+                                                  (time.time(),))]
         if not rows:
             return
-        if await storage.delete([r["key"] for r in rows]):
+        if await storage.delete([k for r in rows for k in row_keys(r)]):
             with connect_db() as conn:
                 conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
                 conn.commit()
@@ -2838,7 +2893,7 @@ HELP_COMMANDS = {
                 "예: `!H전적 hypixel bw`"),
     "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부 · 첨부 없이 쓰면 웹 업로드 링크\n"
                "**🌐 올리기**를 누르면 업로드 페이지가 바로 열리고, 올리면 **자동으로 채널에 올라갑니다**.\n"
-               "사진은 바로 보이고 영상은 채팅창에서 바로 재생됩니다. 작은 파일은 **📎 첨부**로도 올릴 수 있습니다.\n"
+               "사진은 바로 보이고 영상과 노래는 채팅창에서 바로 재생됩니다. 작은 파일은 **📎 첨부**로도 올릴 수 있습니다.\n"
                "올린 파일은 봇의 파일 저장소에 올라가며 **{보관} 후 자동으로 삭제**됩니다."),
     "files": ("목록", "!파일", "`!파일 [이름]`\n내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다."),
     "filedelete": ("삭제", "!파일삭제", "`!파일삭제 <이름>`\n내가 올린 파일을 지웁니다."),

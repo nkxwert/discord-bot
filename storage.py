@@ -794,3 +794,109 @@ async def convert_url(url, filename):
 
 async def convert_stored(key, filename):
     return await _convert(lambda path: download_to(key, path), filename)
+
+
+# ---------------------------------------------------------------- song players
+# Discord plays links to videos right in the chat (any size), but not links to songs. So each song gets a
+# companion MP4: one still picture (its album art, or Maco and the title) and the song's sound. Made with
+# ffmpeg in two steps so memory stays low on a 128MB host: the picture becomes a one-frame video (the heavy
+# H.264 encoder runs for a moment), then that frame is repeated next to the sound without re-encoding it.
+
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac"}
+PREVIEW_TIMEOUT_SECONDS = 300
+_ffmpeg = []
+_preview_lock = asyncio.Lock()  # one song at a time, so two ffmpeg processes never add up
+
+
+def is_audio(content_type, filename=""):
+    return (content_type or "").startswith("audio/") or os.path.splitext(filename or "")[1].lower() in AUDIO_EXTENSIONS
+
+
+def ffmpeg_path():
+    """The host's ffmpeg if it has one, else the copy that comes with the imageio-ffmpeg package, else None."""
+    if not _ffmpeg:
+        found = shutil.which("ffmpeg")
+        if not found:
+            try:
+                import imageio_ffmpeg
+                found = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                found = None
+        _ffmpeg.append(found)
+    return _ffmpeg[0]
+
+
+async def _run_capture(*args, timeout):
+    """(return code, stderr text), or (None, "") on timeout."""
+    process = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, err = await asyncio.wait_for(process.communicate(), timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        return None, ""
+    return process.returncode, err.decode(errors="replace")
+
+
+async def _probe(ffmpeg, source):
+    """(duration in seconds or None, audio codec or None, has album art)."""
+    _, text = await _run_capture(ffmpeg, "-hide_banner", "-i", source, timeout=30)
+    match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    duration = int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3]) if match else None
+    codec = re.search(r"Stream #\S+.*?: Audio: (\w+)", text)
+    art = re.search(r"Stream #\S+.*?: Video: .*\(attached pic\)", text)
+    return duration, codec[1] if codec else None, bool(art)
+
+
+async def make_song_player(key, title, player_key, render_cover):
+    """Build the MP4 player for the stored song at key and upload it to player_key. True when done, False
+    when ffmpeg is missing or the file isn't a song it can read. render_cover(title, art_path, out_path)
+    draws the picture."""
+    ffmpeg = ffmpeg_path()
+    if not ffmpeg:
+        return False
+    async with _preview_lock:
+        folder = tempfile.mkdtemp(prefix="maco-song-")
+        try:
+            source = os.path.join(folder, "song")
+            await download_to(key, source)
+            duration, codec, has_art = await _probe(ffmpeg, source)
+            if codec is None:
+                return False
+            art = None
+            if has_art:
+                art = os.path.join(folder, "art.png")
+                code, _ = await _run_capture(ffmpeg, "-y", "-v", "error", "-threads", "1", "-i", source, "-an",
+                                             "-map", "0:v:0", "-frames:v", "1", art, timeout=30)
+                if code != 0 or not os.path.exists(art):
+                    art = None
+            cover = os.path.join(folder, "cover.png")
+            await asyncio.to_thread(render_cover, title, art, cover)
+            still = os.path.join(folder, "still.mp4")
+            code, err = await _run_capture(
+                # one frame lasting 10 seconds: the repeated picture then adds only ~2KB/s to the song
+                ffmpeg, "-y", "-v", "error", "-threads", "1", "-i", cover, "-frames:v", "1", "-r", "0.1",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-crf", "30", "-pix_fmt", "yuv420p",
+                "-x264-params", "rc-lookahead=0:sync-lookahead=0:bframes=0:threads=1", still, timeout=60)
+            if code != 0:
+                print(f"노래 플레이어 그림 실패: {err[-300:]}")
+                return False
+            player = os.path.join(folder, "player.mp4")
+            sound = ["-c:a", "copy"] if codec == "aac" else ["-c:a", "aac", "-b:a", "192k"]
+            # Cut exactly at the song's end; setts shortens the last 10-second picture frame to fit, or the
+            # player would run up to 10 silent seconds longer than the song.
+            length = (["-bsf:v", f"setts=duration='min(DURATION,{duration:.3f}/TB-PTS)'", "-t", f"{duration:.3f}"]
+                      if duration else ["-shortest"])
+            code, err = await _run_capture(
+                ffmpeg, "-y", "-v", "error", "-threads", "1", "-stream_loop", "-1", "-i", still, "-i", source,
+                "-map", "0:v", "-map", "1:a:0", "-c:v", "copy", *sound, *length, "-movflags", "+faststart", player,
+                timeout=PREVIEW_TIMEOUT_SECONDS)
+            if code != 0 or not os.path.exists(player):
+                print(f"노래 플레이어 만들기 실패: {err[-300:] or '시간 초과'}")
+                return False
+            await put_path(player_key, player, "player.mp4", "video/mp4")
+            return True
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
