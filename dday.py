@@ -10,6 +10,8 @@ from datetime import date, datetime, time, timedelta, timezone
 KST = timezone(timedelta(hours=9))
 DEFAULT_TEMPLATE = "{이름}까지 {일} 남았습니다. ({D})"
 COUNT_UP_TEMPLATE = "{이름} {D} ({일}째)"
+DEFAULT_CELEBRATE = "🎉 오늘이 **{이름}**입니다! ({D})"
+CELEBRATE_FIELDS = ("이름", "D")  # on the day there is no time left to show
 FIELDS = ("이름", "D", "년", "월", "일", "시", "분", "초")
 SUFFIX = {"년": "년", "월": "개월", "일": "일", "시": "시간", "분": "분", "초": "초"}
 SECONDS = {"일": 86400, "시": 3600, "분": 60, "초": 1}
@@ -69,12 +71,12 @@ def parse_alert(text):
     return f"{int(m[1]):02d}:{int(m[2] or m[3] or 0):02d}"
 
 
-def check_template(template):
+def check_template(template, fields=FIELDS):
     """The template, or ValueError naming a field that doesn't exist."""
     for field in re.findall(r"\{([^{}]*)\}", template):
-        if field not in FIELDS:
+        if field not in fields:
             raise ValueError(f"문구에 없는 칸 {{{field}}}이(가) 있습니다. 쓸 수 있는 칸: "
-                             + " ".join("{" + f + "}" for f in FIELDS))
+                             + " ".join("{" + f + "}" for f in fields))
     return template
 
 
@@ -120,7 +122,7 @@ def split(start, end, used):
     return values
 
 
-def render(template, name, target, now=None, count_up=False):
+def render(template, name, target, now=None, count_up=False, celebrate=None):
     """The message for this moment: the template before the day, a celebration on the day, D+ after.
     count_up: a D-Day made for a day already past (사귄 날 ...): the template is filled with the time since."""
     now = (now or now_kst()).astimezone(KST)
@@ -146,7 +148,7 @@ def render(template, name, target, now=None, count_up=False):
             text = text.replace("{" + field + "}", "" if value is None else f"{value}{SUFFIX[field]}")
         return re.sub(r"[ \t]{2,}", " ", text).strip()
     if left == 0:
-        return f"🎉 오늘이 **{name}**입니다! (D-DAY)"
+        return (celebrate or DEFAULT_CELEBRATE).replace("{이름}", name).replace("{D}", d_label(0))
     return f"**{name}** · {d_label(left)} ({-left}일 지났습니다)"
 
 

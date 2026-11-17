@@ -333,6 +333,8 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ddays_guild ON ddays(guild_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ddays_alert ON ddays(next_alert)")
+        if "celebrate" not in [row["name"] for row in conn.execute("PRAGMA table_info(ddays)")]:
+            conn.execute("ALTER TABLE ddays ADD COLUMN celebrate TEXT")  # the message on the day itself
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.commit()
@@ -3087,7 +3089,8 @@ HELP_COMMANDS = {
     "fortune": ("운세", "!운세", "`!운세`\n오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다."),
     "ilchim": ("일침", "!일침", "`!일침`\n정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다."),
     "dday": ("D-Day", "!dday", "`!dday [이름]`\n이 서버의 D-Day 목록을 보거나, 이름을 붙이면 그 날까지 남은 시간을 봅니다.\n"
-             "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
+             "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
+             "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
@@ -3680,7 +3683,8 @@ def dday_target(row):
 def dday_message(row):
     count_up = bool(row["count_up"])  # the date was already past when it was saved: counts the days since
     default = dday.COUNT_UP_TEMPLATE if count_up else dday.DEFAULT_TEMPLATE
-    return dday.render(row["template"] or default, row["name"], dday_target(row), count_up=count_up)
+    return dday.render(row["template"] or default, row["name"], dday_target(row), count_up=count_up,
+                       celebrate=row.get("celebrate"))
 
 
 def dday_line(row, mine=False):
@@ -3834,7 +3838,59 @@ class DdayAfter(discord.ui.DynamicItem[discord.ui.Select], template=r"maco:ddaya
             await show_dday_page(interaction, "⚠️ 만든 사람만 바꿀 수 있습니다.")
         else:
             await show_dday_page(interaction, f"✅ **{discord.utils.escape_markdown(row['name'])}** · 날짜가 지나면: "
-                                              f"{dday.AFTER_MODES[mode]}", extra_items=[DdayAfter(self.dday_id, mode)])
+                                              f"{dday.AFTER_MODES[mode]}", extra_items=dday_extras(self.dday_id, mode))
+
+
+def dday_extras(dday_id, after):
+    """Shown under a D-Day just made or edited: what happens after the day, and its celebration message
+    (neither fits the form, which holds 5 fields)."""
+    return [DdayCelebrateButton(dday_id), DdayAfter(dday_id, after)]
+
+
+class DdayCelebrateButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:ddaycel:(?P<id>\d+)"):
+    def __init__(self, dday_id):
+        super().__init__(discord.ui.Button(label="축하 문구", emoji="🎉", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"maco:ddaycel:{dday_id}", row=2))
+        self.dday_id = dday_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction):
+        with connect_db() as conn:
+            row = conn.execute("SELECT * FROM ddays WHERE id = ?", (self.dday_id,)).fetchone()
+        if not row:
+            await show_dday_page(interaction, "⚠️ 이미 지워진 D-Day입니다.")
+        elif row["created_by"] != interaction.user.id:
+            await show_dday_page(interaction, "⚠️ 만든 사람만 바꿀 수 있습니다.")
+        else:
+            await interaction.response.send_modal(DdayCelebrateModal(dict(row)))
+
+
+class DdayCelebrateModal(SafeModal):
+    """The message on the day itself (also the alert sent that day)."""
+
+    def __init__(self, row):
+        super().__init__(title="D-Day 축하 문구")
+        self.row = row
+        self.text = discord.ui.TextInput(required=False, max_length=200, placeholder=dday.DEFAULT_CELEBRATE,
+                                         default=row.get("celebrate"))
+        self.add_item(discord.ui.Label(text="당일에 보여 줄 문구 (비우면 기본 문구)", component=self.text,
+                                       description="칸: {이름} {D}"))
+
+    async def on_submit(self, interaction):
+        try:
+            text = dday.check_template(self.text.value.strip(), dday.CELEBRATE_FIELDS) or None
+        except ValueError as exc:
+            await show_dday_page(interaction, f"⚠️ {exc}", extra_items=dday_extras(self.row["id"], self.row["after"]))
+            return
+        with connect_db() as conn:
+            conn.execute("UPDATE ddays SET celebrate = ? WHERE id = ? AND created_by = ?",
+                         (text, self.row["id"], interaction.user.id))
+        preview = (text or dday.DEFAULT_CELEBRATE).replace("{이름}", self.row["name"]).replace("{D}", "D-DAY")
+        await show_dday_page(interaction, f"✅ **{discord.utils.escape_markdown(self.row['name'])}** 당일 문구를 "
+                                          f"정했습니다.\n> {preview}", extra_items=dday_extras(self.row["id"], self.row["after"]))
 
 
 class DdayModal(SafeModal):
@@ -3909,8 +3965,8 @@ class DdayModal(SafeModal):
         alert_text = f" · 매일 {alert}에 <#{picked}>로 알림" if alert else ""
         await show_dday_page(
             interaction, f"✅ **{discord.utils.escape_markdown(name)}** D-Day를 {'고쳤' if self.row else '만들었'}습니다"
-                         f"{alert_text}.\n> {dday_message(row)}\n아래에서 날짜가 지난 뒤를 정할 수 있습니다.",
-            extra_items=[DdayAfter(dday_id, after)])
+                         f"{alert_text}.\n> {dday_message(row)}\n아래에서 **🎉 축하 문구**(당일 문구)와 날짜가 지난 뒤를 정할 수 있습니다.",
+            extra_items=dday_extras(dday_id, after))
 
 
 async def send_dday_alert(row):
@@ -4308,7 +4364,7 @@ async def setup_hook():
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton,
-                          DdayPick, DdayAfter, SongDisplayButton)
+                          DdayPick, DdayAfter, DdayCelebrateButton, SongDisplayButton)
     await load_help_emojis()
     if dashboard.configured():
         task = asyncio.get_running_loop().create_task(dashboard_loop())
