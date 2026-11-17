@@ -6,6 +6,8 @@ import time
 import sqlite3
 import asyncio
 import io
+import shutil
+import tempfile
 import ipaddress
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +25,7 @@ from dotenv import load_dotenv
 import audio_cover
 import cards
 import dashboard
+import dday
 import net
 import easter_eggs
 import shortlinks
@@ -303,8 +306,33 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_guild ON files(guild_id, status)")
         # A song's MP4 player (its sound + a still picture), so Discord can play it in the chat.
-        if "player_key" not in [row["name"] for row in conn.execute("PRAGMA table_info(files)")]:
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(files)")]
+        if "player_key" not in columns:
             conn.execute("ALTER TABLE files ADD COLUMN player_key TEXT")
+        # A song posted as a plain attachment (Discord's own audio bar): that message, deleted with the file.
+        if "bar_channel_id" not in columns:
+            conn.execute("ALTER TABLE files ADD COLUMN bar_channel_id INTEGER")
+            conn.execute("ALTER TABLE files ADD COLUMN bar_message_id INTEGER")
+        # D-Days: per server, visible to everyone, edited only by the person who made them.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ddays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                target REAL NOT NULL,
+                has_time INTEGER NOT NULL DEFAULT 0,
+                template TEXT,
+                alert_time TEXT,
+                channel_id INTEGER,
+                after TEXT NOT NULL DEFAULT 'stop',
+                count_up INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                next_alert REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ddays_guild ON ddays(guild_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ddays_alert ON ddays(next_alert)")
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.commit()
@@ -505,6 +533,10 @@ async def on_ready():
         clean_files.start()
     if not monitor_servers.is_running():
         monitor_servers.start()
+    if not dday_alerts.is_running():
+        dday_alerts.start()
+    if not tidy_memory.is_running():
+        tidy_memory.start()
     print(f"로그인 완료: {bot.user} (ID: {bot.user.id})")
 
 
@@ -759,7 +791,8 @@ async def owner_db_delete_guild(message, args):
 async def delete_guild_files(guild_id):
     """(ok, message) after deleting every file of a server (£DB 서버삭제 and the dashboard)."""
     with connect_db() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT id, key, url, player_key FROM files WHERE guild_id = ?", (guild_id,))]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, key, url, player_key, bar_channel_id, bar_message_id FROM files WHERE guild_id = ?", (guild_id,))]
     if not rows:
         return True, f"{guild_label(guild_id)}에 올라간 파일이 없습니다."
     if not await storage.delete([k for r in rows for k in row_keys(r)]):
@@ -768,6 +801,7 @@ async def delete_guild_files(guild_id):
         conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
     for row in rows:
         await shortlinks.delete(row.get("url"))
+        await delete_bar_message(row)
     return True, f"{guild_label(guild_id)}의 파일 {len(rows)}개를 삭제했습니다."
 
 
@@ -1160,12 +1194,14 @@ def command_list_embed():
         value="발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.",
         inline=False,
     )
-    embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 미리보기로 보여 줍니다(영상과 노래는 바로 재생). 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
+    embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 미리보기로 보여 줍니다(영상은 바로 재생, 노래는 바 형태·영상 형태 중 고름). 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
                     f"{retention_text()} 후 자동 삭제됩니다.", inline=False)
     embed.add_field(name="!파일 [이름]", value="내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다.", inline=False)
     embed.add_field(name="!파일삭제 <이름>", value="내가 올린 파일을 지웁니다.", inline=False)
     embed.add_field(name="!운세", value="오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     embed.add_field(name="!일침", value="정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다.", inline=False)
+    embed.add_field(name="!dday [이름]", value="이 서버의 D-Day 목록을 보거나 그 날까지 남은 시간을 봅니다. "
+                                              "만들기·편집·삭제는 `/도움말` → 기타 → D-Day에서 합니다.", inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
                     value=f"글자를 디시 글자콘처럼 그림으로 만들어 올립니다 (최대 {textcon.MAX_CHARS}자). 메시지를 넣으면 같이 보냅니다.", inline=False)
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
@@ -2297,6 +2333,16 @@ def file_layout(rows, errors=(), header=None):
                 storage.link(player, row["expires_at"] - time.time()))))
         elif row.get("player_pending"):
             card.add_item(discord.ui.TextDisplay("-# 🎵 재생 준비 중… 지금은 [원본 열기]로 들을 수 있어요"))
+        elif is_song(row) and storage.configured():
+            limit = attach_limit(row)
+            card.add_item(discord.ui.TextDisplay(
+                "-# 🎵 어떻게 보여 줄까요? (올린 사람이 고를 수 있어요)\n"
+                f"-# **바 형태**: 디스코드 음악 재생 바, 바로 올라가요 ({human_size(limit)} 이하) · "
+                "**영상 형태**: 크기 제한 없이 재생, 큰 파일은 만드는 데 시간이 걸려요"))
+            choice = discord.ui.ActionRow()
+            choice.add_item(SongDisplayButton("bar", row["id"], disabled=row["size"] > limit))
+            choice.add_item(SongDisplayButton("video", row["id"]))
+            card.add_item(choice)
         elif media:  # the storage link itself: Discord may not preview through a redirect
             card.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(file_link(row))))
         buttons = discord.ui.ActionRow()
@@ -2312,6 +2358,121 @@ def file_layout(rows, errors=(), header=None):
     for error in errors:
         view.add_item(discord.ui.TextDisplay(f"⚠️ {error}"[:1900]))
     return view
+
+
+def attach_limit(row):
+    """The largest file the bot can attach in this server (Discord: 10MB, more with boosts)."""
+    guild = bot.get_guild(row["guild_id"]) if row.get("guild_id") else None
+    return guild.filesize_limit if guild else discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
+
+
+async def delete_bar_message(row):
+    """Remove a song's bar message (its Discord copy), best effort."""
+    if row.get("bar_message_id"):
+        try:
+            await bot.http.delete_message(row["bar_channel_id"], row["bar_message_id"])
+        except discord.HTTPException:
+            pass
+
+
+def card_rows_and_header(message):
+    """(files on this card message, its top line) to redraw it: rows from the buttons' ids, the header from the
+    first text if it is a small "-#" line."""
+    ids, header = [], None
+    for index, component in enumerate(message.components):
+        if index == 0 and isinstance(component, discord.components.TextDisplay) and component.content.startswith("-# "):
+            header = component.content
+    for match in re.finditer(r"maco:copy:(\d+)", str([c.to_dict() for c in message.components])):
+        if int(match[1]) not in ids:
+            ids.append(int(match[1]))
+    with connect_db() as conn:
+        found = {r["id"]: dict(r) for r in conn.execute(
+            f"SELECT * FROM files WHERE id IN ({','.join('?' * len(ids))})", ids)} if ids else {}
+    return [found[i] for i in ids if i in found], header
+
+
+class SongDisplayButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:song:(?P<how>bar|video):(?P<row_id>\d+)"):
+    """바 형태 / 영상 형태 on a song's card. Only the uploader (or a file admin) chooses; works after a restart."""
+
+    def __init__(self, how, row_id, disabled=False):
+        label = "바 형태 (빠르게)" if how == "bar" else "영상 형태"
+        super().__init__(discord.ui.Button(
+            label=label, emoji="🎵" if how == "bar" else "🎬", disabled=disabled, custom_id=f"maco:song:{how}:{row_id}",
+            style=discord.ButtonStyle.primary if how == "bar" else discord.ButtonStyle.secondary,
+        ))
+        self.how, self.row_id = how, row_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["how"], int(match["row_id"]))
+
+    async def callback(self, interaction):
+        with connect_db() as conn:
+            row = conn.execute("SELECT * FROM files WHERE id = ? AND status = 'ready'", (self.row_id,)).fetchone()
+        if not row:
+            await interaction.response.send_message("삭제됐거나 기간이 지난 파일입니다.", ephemeral=True)
+            return
+        row = dict(row)
+        if not await can_manage_file(interaction.user, row):
+            await interaction.response.send_message("올린 사람만 고를 수 있습니다.", ephemeral=True)
+            return
+        rows, header = card_rows_and_header(interaction.message)
+        rows = rows or [row]
+        if self.how == "video":
+            for r in rows:
+                if r["id"] == row["id"]:
+                    r["player_pending"] = True
+            await interaction.response.edit_message(view=file_layout(rows, header=header))
+            later_add_players(interaction.message, rows, (), header)
+            return
+        if row["size"] > attach_limit(row):
+            await interaction.response.send_message(
+                f"이 서버에서는 {human_size(attach_limit(row))}보다 큰 파일을 첨부할 수 없어서 바 형태로 올릴 수 없습니다. "
+                "영상 형태를 골라 주세요.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        posted = await post_song_bar(interaction.message.channel, row, header)
+        if not posted:
+            await interaction.followup.send("바 형태로 올리지 못했습니다. 잠시 후 다시 시도하거나 영상 형태를 골라 주세요.",
+                                            ephemeral=True)
+            return
+        rest = [r for r in rows if r["id"] != row["id"]]
+        try:
+            if rest:
+                await interaction.message.edit(view=file_layout(rest, header=header))
+            else:
+                await interaction.message.delete()
+        except discord.HTTPException:
+            pass
+
+
+async def post_song_bar(channel, row, header=None):
+    """Post the song itself as an attachment, so Discord shows its audio bar, with the usual buttons.
+    Goes through a temporary file, never memory. Returns the message, or None on failure."""
+    folder = tempfile.mkdtemp(prefix="maco-bar-")
+    try:
+        filename = storage.clean_filename(os.path.basename(row["key"])) or "song.mp3"
+        path = os.path.join(folder, filename)
+        await storage.download_to(row["key"], path)
+        await add_short_links([row])
+        view = discord.ui.View(timeout=None)
+        url = open_link(row)
+        if len(url) <= 512:
+            view.add_item(discord.ui.Button(label="원본 열기", emoji="⬇️", url=url))
+        view.add_item(CopyLinkButton(row["id"]))
+        text = f"🎵 {file_title(row)}"
+        message = await channel.send(f"{header}\n{text}" if header else text, file=discord.File(path, filename=filename),
+                                     view=view, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:
+        print(f"노래 바 형태 올리기 실패: {type(exc).__name__}: {exc}")
+        return None
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    await delete_bar_message(row)  # posted again: keep a single copy
+    with connect_db() as conn:
+        conn.execute("UPDATE files SET bar_channel_id = ?, bar_message_id = ? WHERE id = ?",
+                     (message.channel.id, message.id, row["id"]))
+    return message
 
 
 class CopyLinkButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:copy:(?P<row_id>\d+)"):
@@ -2416,10 +2577,7 @@ async def upload_attachments(ctx, attachments, name=""):
     # The preview is a different kind of message (components v2), so it is posted fresh instead of
     # editing the waiting notice into it.
     header = getattr(ctx, "header", None)
-    for row in rows:
-        row["player_pending"] = is_song(row) and storage.configured()
-    message = await send_files(ctx_sender(ctx), rows, errors, header)
-    later_add_players(message, rows, errors, header)
+    await send_files(ctx_sender(ctx), rows, errors, header)  # a song's card asks how to show it
     if notice:
         try:
             await notice.delete()
@@ -2512,9 +2670,7 @@ async def finish_upload(row_id):
             conn.commit()
             done = dict(conn.execute("SELECT * FROM files WHERE id = ?", (row_id,)).fetchone())
     _upload_locks.pop(row_id, None)
-    done["player_pending"] = is_song(done) and storage.configured()
-    message = await post_upload(done)
-    later_add_players(message, [done], (), upload_header(done))
+    await post_upload(done)
     return "done", f"✅ **{discord.utils.escape_markdown(name)}** 올리기를 마쳤습니다. 채널에 올렸습니다."
 
 
@@ -2738,6 +2894,7 @@ async def remove_file(row):
     if not await storage.delete(row_keys(row)):
         return False
     await shortlinks.delete(row.get("url"))
+    await delete_bar_message(row)
     with connect_db() as conn:
         conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
         conn.commit()
@@ -2881,11 +3038,14 @@ async def clean_files():
             print(f"저장소 정리 오류: {type(exc).__name__}: {exc}")
     try:
         with connect_db() as conn:
-            rows = [dict(r) for r in conn.execute("SELECT id, key, player_key FROM files WHERE expires_at < ?",
-                                                  (time.time(),))]
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, key, player_key, bar_channel_id, bar_message_id FROM files WHERE expires_at < ?",
+                (time.time(),))]
         if not rows:
             return
         if await storage.delete([k for r in rows for k in row_keys(r)]):
+            for row in rows:
+                await delete_bar_message(row)
             with connect_db() as conn:
                 conn.executemany("DELETE FROM files WHERE id = ?", [(r["id"],) for r in rows])
                 conn.commit()
@@ -2906,7 +3066,7 @@ HELP_CATEGORIES = {
     "uptime": ("🖥️", "서버 업타임", ["add", "uptime", "list", "delete"]),
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
-    "etc": ("🎲", "기타", ["fortune", "ilchim"]),
+    "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -2920,12 +3080,15 @@ HELP_COMMANDS = {
                 "예: `!H전적 hypixel bw`"),
     "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부 · 첨부 없이 쓰면 웹 업로드 링크\n"
                "**🌐 올리기**를 누르면 업로드 페이지가 바로 열리고, 올리면 **자동으로 채널에 올라갑니다**.\n"
-               "사진은 바로 보이고 영상과 노래는 채팅창에서 바로 재생됩니다. 작은 파일은 **📎 첨부**로도 올릴 수 있습니다.\n"
+               "사진은 바로 보이고 영상은 채팅창에서 바로 재생되며, 노래는 **바 형태**(빠르게)·**영상 형태** 중 고를 수 있습니다. 작은 파일은 **📎 첨부**로도 올릴 수 있습니다.\n"
                "올린 파일은 봇의 파일 저장소에 올라가며 **{보관} 후 자동으로 삭제**됩니다."),
     "files": ("목록", "!파일", "`!파일 [이름]`\n내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다."),
     "filedelete": ("삭제", "!파일삭제", "`!파일삭제 <이름>`\n내가 올린 파일을 지웁니다."),
     "fortune": ("운세", "!운세", "`!운세`\n오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다."),
     "ilchim": ("일침", "!일침", "`!일침`\n정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다."),
+    "dday": ("D-Day", "!dday", "`!dday [이름]`\n이 서버의 D-Day 목록을 보거나, 이름을 붙이면 그 날까지 남은 시간을 봅니다.\n"
+             "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
+             "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -2939,7 +3102,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -3488,6 +3651,342 @@ class FileDeleteModal(HelpModal):
         await ctx.reply(f"**{row['name']}** 파일을 삭제했습니다.")
 
 
+# ---------------------------------------------------------------- D-Day
+
+DDAY_MAX_PER_GUILD = 25  # also what one select menu can list
+DDAY_MAX_PER_USER = 10
+DDAY_NAME_LENGTH = 30
+
+
+def guild_ddays(guild_id, user_id=None):
+    with connect_db() as conn:
+        if user_id is None:
+            rows = conn.execute("SELECT * FROM ddays WHERE guild_id = ? ORDER BY target", (guild_id,))
+        else:
+            rows = conn.execute("SELECT * FROM ddays WHERE guild_id = ? AND created_by = ? ORDER BY target",
+                                (guild_id, user_id))
+        return [dict(r) for r in rows]
+
+
+def find_dday(guild_id, name):
+    key = name.strip().lower()
+    return next((d for d in guild_ddays(guild_id) if d["name"].lower() == key), None)
+
+
+def dday_target(row):
+    return datetime.fromtimestamp(row["target"], dday.KST)
+
+
+def dday_message(row):
+    count_up = bool(row["count_up"])  # the date was already past when it was saved: counts the days since
+    default = dday.COUNT_UP_TEMPLATE if count_up else dday.DEFAULT_TEMPLATE
+    return dday.render(row["template"] or default, row["name"], dday_target(row), count_up=count_up)
+
+
+def dday_line(row, mine=False):
+    left = dday.days_left(dday_target(row))
+    line = (f"• **{discord.utils.escape_markdown(row['name'])}** · `{dday.d_label(left)}` · "
+            f"{dday.target_text(dday_target(row), row['has_time'])}")
+    if row["alert_time"] and row["next_alert"]:
+        line += f" · 🔔 {row['alert_time']} <#{row['channel_id']}>"
+    return line + (" · ✏️ 내 D-Day" if mine else f" · <@{row['created_by']}>")
+
+
+def dday_list_text(guild_id, user_id=None, limit=3500):
+    rows = guild_ddays(guild_id)
+    if not rows:
+        return None
+    text = ""
+    for i, row in enumerate(rows):
+        line = dday_line(row, mine=row["created_by"] == user_id)
+        if len(text) + len(line) > limit:
+            text += f"… 외 {len(rows) - i}개"
+            break
+        text += line + "\n"
+    return text
+
+
+@bot.command(name="dday", aliases=["디데이", "d-day"])
+@commands.guild_only()
+async def dday_command(ctx, *, name: str = ""):
+    if not name:
+        text = dday_list_text(ctx.guild.id)
+        if not text:
+            await ctx.reply("이 서버에는 D-Day가 없습니다. `/도움말` → 기타 → D-Day에서 만들 수 있습니다.", mention_author=False)
+            return
+        embed = discord.Embed(title="📅 D-Day", description=text, color=discord.Color.green())
+        embed.set_footer(text="!dday <이름>으로 남은 시간 보기 · 만들기·편집·삭제는 /도움말 → 기타 → D-Day")
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+    row = find_dday(ctx.guild.id, name)
+    if not row:
+        await ctx.reply(f"`{name}` D-Day가 없습니다. `!dday`로 목록을 확인해 주세요.", mention_author=False)
+        return
+    await ctx.reply(dday_message(row), mention_author=False)
+
+
+def dday_buttons():
+    return [HelpButton("dday_new", "만들기", "➕", discord.ButtonStyle.success, row=2),
+            HelpButton("dday_edit", "편집", "✏️", discord.ButtonStyle.secondary, row=2),
+            HelpButton("dday_del", "삭제", "🗑️", discord.ButtonStyle.secondary, row=2)]
+
+
+async def show_dday_page(interaction, notice=None, extra_items=()):
+    if interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    text = dday_list_text(interaction.guild.id, interaction.user.id, limit=2500)
+    await show_help(interaction, page="etc", selected="dday",
+                    details=f"**이 서버의 D-Day**\n{text}" if text else "이 서버에는 아직 D-Day가 없습니다.",
+                    notice=notice, extra_items=[*dday_buttons(), *extra_items])
+
+
+async def dday_open_form(interaction, row=None):
+    if interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    if row is None:
+        if len(guild_ddays(interaction.guild.id)) >= DDAY_MAX_PER_GUILD:
+            await show_dday_page(interaction, f"⚠️ 한 서버에 D-Day는 {DDAY_MAX_PER_GUILD}개까지 만들 수 있습니다.")
+            return
+        if len(guild_ddays(interaction.guild.id, interaction.user.id)) >= DDAY_MAX_PER_USER:
+            await show_dday_page(interaction, f"⚠️ 한 사람이 D-Day를 {DDAY_MAX_PER_USER}개까지 만들 수 있습니다.")
+            return
+    await interaction.response.send_modal(DdayModal(interaction.channel, row))
+
+
+async def dday_choose(interaction, what):
+    """Edit/delete: only one's own D-Days. One of them goes straight on; several get a menu."""
+    if interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    mine = guild_ddays(interaction.guild.id, interaction.user.id)
+    if not mine:
+        await show_dday_page(interaction, "⚠️ 내가 만든 D-Day가 없습니다. (편집·삭제는 만든 사람만 할 수 있습니다)")
+        return
+    if what == "edit" and len(mine) == 1:
+        await dday_open_form(interaction, mine[0])
+        return
+    await show_dday_page(interaction, "편집할 D-Day를 골라 주세요." if what == "edit" else "삭제할 D-Day를 골라 주세요.",
+                         extra_items=[DdayPick(what, mine)])
+
+
+class DdayPick(discord.ui.DynamicItem[discord.ui.Select], template=r"maco:ddaypick:(?P<what>edit|del)"):
+    """Menu of one's own D-Days on the help message, for 편집 or 삭제."""
+
+    def __init__(self, what, rows=()):
+        options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"]),
+                                        description=dday.target_text(dday_target(r), r["has_time"]))
+                   for r in rows][:25] or [discord.SelectOption(label="-", value="0")]
+        super().__init__(discord.ui.Select(
+            custom_id=f"maco:ddaypick:{what}", options=options, row=3,
+            placeholder="편집할 D-Day" if what == "edit" else "삭제할 D-Day (바로 지워집니다)",
+        ))
+        self.what = what
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["what"])
+
+    async def callback(self, interaction):
+        chosen = (interaction.data or {}).get("values") or ["0"]
+        with connect_db() as conn:
+            row = conn.execute("SELECT * FROM ddays WHERE id = ?", (int(chosen[0]),)).fetchone()
+        row = dict(row) if row else None
+        if not row or row["guild_id"] != getattr(interaction.guild, "id", None):
+            await show_dday_page(interaction, "⚠️ 이미 지워진 D-Day입니다.")
+            return
+        if row["created_by"] != interaction.user.id:
+            await show_dday_page(interaction, "⚠️ 만든 사람만 편집하거나 지울 수 있습니다.")
+            return
+        if self.what == "edit":
+            await dday_open_form(interaction, row)
+            return
+        with connect_db() as conn:
+            conn.execute("DELETE FROM ddays WHERE id = ?", (row["id"],))
+        await show_dday_page(interaction, f"🗑️ **{discord.utils.escape_markdown(row['name'])}** D-Day를 지웠습니다.")
+
+
+class DdayAfter(discord.ui.DynamicItem[discord.ui.Select], template=r"maco:ddayafter:(?P<id>\d+)"):
+    """What happens once the day comes: shown right after making or editing (a form holds only 5 fields)."""
+
+    def __init__(self, dday_id, current="stop"):
+        super().__init__(discord.ui.Select(
+            custom_id=f"maco:ddayafter:{dday_id}", row=3, placeholder="날짜가 지나면",
+            options=[discord.SelectOption(label=f"날짜가 지나면: {label}", value=key, default=key == current)
+                     for key, label in dday.AFTER_MODES.items()],
+        ))
+        self.dday_id = dday_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction):
+        mode = ((interaction.data or {}).get("values") or ["stop"])[0]
+        with connect_db() as conn:
+            row = conn.execute("SELECT * FROM ddays WHERE id = ?", (self.dday_id,)).fetchone()
+            if row and row["created_by"] == interaction.user.id and mode in dday.AFTER_MODES:
+                conn.execute("UPDATE ddays SET after = ? WHERE id = ?", (mode, self.dday_id))
+        if not row:
+            await show_dday_page(interaction, "⚠️ 이미 지워진 D-Day입니다.")
+        elif row["created_by"] != interaction.user.id:
+            await show_dday_page(interaction, "⚠️ 만든 사람만 바꿀 수 있습니다.")
+        else:
+            await show_dday_page(interaction, f"✅ **{discord.utils.escape_markdown(row['name'])}** · 날짜가 지나면: "
+                                              f"{dday.AFTER_MODES[mode]}", extra_items=[DdayAfter(self.dday_id, mode)])
+
+
+class DdayModal(SafeModal):
+    """만들기 / 편집. Five fields (a form's limit): name, date, message, alert time, alert channel."""
+
+    def __init__(self, channel, row=None):
+        super().__init__(title="D-Day 편집" if row else "D-Day 만들기")
+        self.row = row
+        target = dday_target(row) if row else None
+        self.name = discord.ui.TextInput(max_length=DDAY_NAME_LENGTH, placeholder="수능", default=row["name"] if row else None)
+        self.date = discord.ui.TextInput(
+            max_length=30, placeholder="2027-11-18  (시각도: 2027-11-18 08:40)",
+            default=(target.strftime("%Y-%m-%d %H:%M") if row["has_time"] else target.strftime("%Y-%m-%d")) if row else None)
+        self.template = discord.ui.TextInput(
+            required=False, max_length=200, placeholder=dday.DEFAULT_TEMPLATE, default=row["template"] if row else None)
+        self.alert = discord.ui.TextInput(
+            required=False, max_length=10, placeholder="00:00  (비우면 알림 없음)", default=row["alert_time"] if row else None)
+        channel_id = (row["channel_id"] if row and row["channel_id"] else getattr(channel, "id", None))
+        self.channel = discord.ui.ChannelSelect(
+            required=False, placeholder="알림 보낼 채널 (비우면 이 채널)",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            default_values=[discord.Object(id=channel_id)] if channel_id else [],
+        )
+        self.add_item(discord.ui.Label(text="이름", component=self.name))
+        self.add_item(discord.ui.Label(text="날짜 (한국 시간)", component=self.date))
+        self.add_item(discord.ui.Label(text="표시 문구 (선택)", component=self.template,
+                                       description="칸: {이름} {D} {년} {월} {일} {시} {분} {초}"))
+        self.add_item(discord.ui.Label(text="자동 알림 시각 (선택)", component=self.alert,
+                                       description="매일 이 시각에 남은 날을 보냅니다"))
+        self.add_item(discord.ui.Label(text="알림 채널", component=self.channel))
+
+    async def on_submit(self, interaction):
+        guild = interaction.guild
+        name = " ".join(self.name.value.split())
+        try:
+            if not name:
+                raise ValueError("이름을 적어 주세요.")
+            target, has_time = dday.parse_target(self.date.value)
+            template = dday.check_template(self.template.value.strip()) or None
+            alert = dday.parse_alert(self.alert.value)
+        except ValueError as exc:
+            await show_dday_page(interaction, f"⚠️ {exc}")
+            return
+        same = find_dday(guild.id, name)
+        if same and (not self.row or same["id"] != self.row["id"]):
+            await show_dday_page(interaction, f"⚠️ 이 서버에 `{name}` D-Day가 이미 있습니다. 다른 이름을 써 주세요.")
+            return
+        picked = self.channel.values[0].id if self.channel.values else getattr(interaction.channel, "id", None)
+        channel = guild.get_channel(picked) if picked else None
+        if alert:
+            perms = channel.permissions_for(guild.me) if channel else None
+            if not perms or not (perms.view_channel and perms.send_messages):
+                await show_dday_page(interaction, "⚠️ 마코가 그 채널에 글을 쓸 수 없습니다. 다른 채널을 고르거나 권한을 켜 주세요.")
+                return
+        next_at = dday.next_alert(alert) if alert else None
+        count_up = int(dday.days_left(target) < 0)
+        values = (name, target.timestamp(), int(has_time), template, alert, picked if alert else None, next_at, count_up)
+        with connect_db() as conn:
+            if self.row:
+                conn.execute("UPDATE ddays SET name = ?, target = ?, has_time = ?, template = ?, alert_time = ?, "
+                             "channel_id = ?, next_alert = ?, count_up = ? WHERE id = ? AND created_by = ?",
+                             (*values, self.row["id"], interaction.user.id))
+                dday_id, after = self.row["id"], self.row["after"]
+            else:
+                after = "count" if count_up else "stop"  # a past date: counting D+ is the point
+                dday_id = conn.execute(
+                    "INSERT INTO ddays(name, target, has_time, template, alert_time, channel_id, next_alert, count_up, "
+                    "guild_id, after, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (*values, guild.id, after, interaction.user.id, time.time())).lastrowid
+        with connect_db() as conn:
+            row = dict(conn.execute("SELECT * FROM ddays WHERE id = ?", (dday_id,)).fetchone())
+        alert_text = f" · 매일 {alert}에 <#{picked}>로 알림" if alert else ""
+        await show_dday_page(
+            interaction, f"✅ **{discord.utils.escape_markdown(name)}** D-Day를 {'고쳤' if self.row else '만들었'}습니다"
+                         f"{alert_text}.\n> {dday_message(row)}\n아래에서 날짜가 지난 뒤를 정할 수 있습니다.",
+            extra_items=[DdayAfter(dday_id, after)])
+
+
+async def send_dday_alert(row):
+    """Post one D-Day alert and plan the next (or end/delete it once the day has come, as its owner chose)."""
+    target = dday_target(row)
+    left = dday.days_left(target)
+    channel = bot.get_channel(row["channel_id"]) if row["channel_id"] else None
+    if channel is None and row["channel_id"]:
+        try:
+            channel = await bot.fetch_channel(row["channel_id"])
+        except discord.HTTPException:
+            channel = None
+    sent = False
+    if channel is not None:
+        try:
+            await channel.send(f"-# ⏰ D-Day 알림 · <@{row['created_by']}>님이 만든 D-Day\n{dday_message(row)}")
+            sent = True
+        except discord.HTTPException as exc:
+            print(f"D-Day 알림 실패 ({row['name']}): {type(exc).__name__}: {exc}")
+    finished = left <= 0 and row["after"] in ("stop", "delete")
+    with connect_db() as conn:
+        if channel is None:  # the channel is gone: stop instead of retrying every minute
+            conn.execute("UPDATE ddays SET next_alert = NULL WHERE id = ?", (row["id"],))
+        elif finished and row["after"] == "delete" and sent:
+            conn.execute("DELETE FROM ddays WHERE id = ?", (row["id"],))
+        elif finished:
+            conn.execute("UPDATE ddays SET next_alert = NULL WHERE id = ?", (row["id"],))
+        else:
+            # The next one after now: an alert missed while the bot was off is sent once, not once per day.
+            conn.execute("UPDATE ddays SET next_alert = ? WHERE id = ?", (dday.next_alert(row["alert_time"]), row["id"]))
+
+
+@tasks.loop(seconds=60)
+async def dday_alerts():
+    try:
+        with connect_db() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM ddays WHERE next_alert IS NOT NULL AND next_alert <= ?", (time.time(),))]
+        for row in rows:
+            await send_dday_alert(row)
+    except Exception as exc:
+        print(f"D-Day 알림 오류: {type(exc).__name__}: {exc}")
+        notify_admin("D-Day 알림 오류", f"{type(exc).__name__}: {exc}", "", traceback.format_exc())
+
+
+@tasks.loop(minutes=10)
+async def tidy_memory():
+    """Drop in-memory entries nothing will use again. Each is small, but these only ever grew: an unused
+    upload link, a finished upload's lock or "⏳" message, an old feedback cooldown."""
+    try:
+        now = time.time()
+        with connect_db() as conn:
+            pending = {r["id"] for r in conn.execute("SELECT id FROM files WHERE status = 'pending'")}
+        for key in [k for k, v in _upload_links.items() if now - v["at"] > UPLOAD_LINK_REUSE_SECONDS]:
+            del _upload_links[key]
+        for table in (_link_interactions, _placeholders):
+            for row_id in [i for i in table if i not in pending]:
+                del table[row_id]
+        for row_id in [i for i, lock in _upload_locks.items() if i not in pending and not lock.locked()]:
+            del _upload_locks[row_id]
+        for user_id in [u for u, at in _feedback_last_sent.items() if now - at > FEEDBACK_COOLDOWN_SECONDS]:
+            del _feedback_last_sent[user_id]
+    except Exception as exc:
+        print(f"메모리 정리 오류: {type(exc).__name__}: {exc}")
+
+
+@tidy_memory.before_loop
+async def before_tidy_memory():
+    await bot.wait_until_ready()
+
+
+@dday_alerts.before_loop
+async def before_dday_alerts():
+    await bot.wait_until_ready()
+
+
 HELP_ACTIONS = {
     "home": lambda interaction: show_help(interaction),
     "commands": lambda interaction: show_help(interaction, page="commands"),
@@ -3502,6 +4001,10 @@ HELP_ACTIONS = {
     "run_filedelete": help_run_filedelete,
     "run_fortune": help_run_random_line("fortune"),
     "run_ilchim": help_run_random_line("ilchim"),
+    "run_dday": lambda interaction: show_dday_page(interaction),
+    "dday_new": lambda interaction: dday_open_form(interaction),
+    "dday_edit": lambda interaction: dday_choose(interaction, "edit"),
+    "dday_del": lambda interaction: dday_choose(interaction, "del"),
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,
@@ -3804,7 +4307,8 @@ async def dashboard_loop():
 async def setup_hook():
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
-    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton)
+    bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton,
+                          DdayPick, DdayAfter, SongDisplayButton)
     await load_help_emojis()
     if dashboard.configured():
         task = asyncio.get_running_loop().create_task(dashboard_loop())
