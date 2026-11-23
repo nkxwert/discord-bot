@@ -35,7 +35,7 @@ FAMOUS = {
     # 아시아
     "KOR", "JPN", "CHN", "TWN", "PRK", "MNG", "VNM", "THA", "PHL", "IDN", "MYS", "SGP", "IND", "PAK", "BGD",
     "NPL", "KHM", "LKA", "KAZ", "UZB", "AFG",
-    # 중동
+    # 아시아 (서아시아)
     "TUR", "IRN", "IRQ", "SAU", "ARE", "ISR", "QAT", "SYR",
     # 유럽
     "GBR", "FRA", "DEU", "ITA", "ESP", "PRT", "NLD", "BEL", "CHE", "AUT", "SWE", "NOR", "DNK", "FIN", "ISL",
