@@ -1032,6 +1032,30 @@ async def run_cleanup():
                   + ("\n⚠️ 일부를 지우지 못했습니다." if orphans and not removed else ""))
 
 
+def container_memory():
+    """(container total, file cache) in bytes from the cgroup, or None where it can't be read.
+    Hosting panels usually show the container total, which includes the file cache: files the system read
+    or wrote recently (the bot's DB, logs ...) kept in spare RAM, freed as soon as a program needs it."""
+    for usage_path, stat_path, cache_key in (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "file"),  # cgroup v2
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.stat", "total_cache"),  # v1
+    ):
+        try:
+            with open(usage_path) as f:
+                total = int(f.read().strip())
+            stats = {}
+            with open(stat_path) as f:
+                for line in f:
+                    key, _, value = line.partition(" ")
+                    stats[key] = int(value)
+            cache = stats.get(cache_key, stats.get("cache"))
+            if cache is not None:
+                return total, cache
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def memory_usage():
     """(current or None, peak or None) memory of this process in bytes. Some hosts' /proc lacks the
     peak line (or /proc entirely), so each value falls back on its own."""
@@ -1069,7 +1093,14 @@ async def db_status_embed():
         parts.append(f"지금 **{human_size(current)}** / {human_size(limit)} ({current / limit * 100:.0f}%)")
     if peak is not None:
         parts.append(f"켜진 뒤 최대 {human_size(peak)}")
-    embed.add_field(name="🧠 메모리", inline=False, value=" · ".join(parts) or "이 호스팅에서는 확인할 수 없습니다")
+    text = "봇 프로세스 " + " · ".join(parts) if parts else "이 호스팅에서는 확인할 수 없습니다"
+    container = container_memory()
+    if container:
+        total, cache = container
+        text += (f"\n컨테이너 전체 {human_size(total)} (그중 파일 캐시 {human_size(cache)})\n"
+                 "-# 호스팅 패널은 보통 컨테이너 전체를 보여 줍니다. 파일 캐시는 최근 읽고 쓴 파일(DB, 로그 등)을 남는 램에 "
+                 "둔 것으로, 다른 프로그램이 램을 필요로 하면 바로 비워집니다.")
+    embed.add_field(name="🧠 메모리", inline=False, value=text)
     if current is not None and current > limit * 0.9:
         embed.color = discord.Color.orange()
 
