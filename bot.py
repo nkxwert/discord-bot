@@ -1266,6 +1266,8 @@ def command_list_embed():
                     value="나라 맞히기: 채널의 모두가 함께 비밀 나라를 맞힙니다. 추측할 때마다 대륙·인구·면적·거리·방향 힌트가 표로 나옵니다. "
                           "어려움은 잘 알려지지 않은 나라를 10번 안에 맞힙니다.",
                     inline=False)
+    embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
+                    inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
                     value=f"글자를 디시 글자콘처럼 그림으로 만들어 올립니다 (최대 {textcon.MAX_CHARS}자). 메시지를 넣으면 같이 보냅니다.", inline=False)
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
@@ -3131,7 +3133,7 @@ HELP_CATEGORIES = {
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
     "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
-    "game": ("🎮", "게임", ["nara", "nara_hard", "nara_rank"]),
+    "game": ("🎮", "게임", ["nara"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -3155,15 +3157,12 @@ HELP_COMMANDS = {
              "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
-    "nara": ("보통 시작", "!나라시작", "`!나라시작` · `!추측 <나라>` · `!포기` · `!나라순위`\n"
-             "봇이 몰래 고른 **잘 알려진 나라**를 채널의 모두가 함께 맞힙니다. 횟수 제한은 없고, 진행 중인 판이 있으면 이어서 합니다.\n"
-             "추측할 때마다 표가 올라옵니다: 대륙·반구·내륙국은 같으면 🟩, 인구·면적은 ▲(정답이 더 큼)/▼에 비슷하면 🟨, "
-             "거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다."),
-    "nara_hard": ("어려움 시작", "!나라시작 어려움", "`!나라시작 어려움`\n"
-                  "**잘 알려지지 않은 나라**가 정답이고, **10번 안에** 맞혀야 합니다.\n"
-                  "인구·면적은 ▲/▼만, 거리는 **가까움(2,000km 이내)/멀음**만 나오고 **방향은 숨깁니다**. "
-                  "대륙·반구·내륙국은 그대로 나옵니다."),
-    "nara_rank": ("순위", "!나라순위", "`!나라순위`\n이 서버에서 나라를 맞힌 순위를 봅니다. 보통과 어려움 승리를 따로 셉니다."),
+    "nara": ("나라 맞히기", "!나라시작", "`!나라시작 [보통|어려움]` · `!추측 <나라>` · `!포기` · `!나라순위` · `!정보 <나라>`\n"
+             "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다. 진행 중인 판이 있으면 이어서 합니다.\n"
+             "**🌍 보통**: 잘 알려진 나라, 횟수 제한 없음. 대륙·반구·내륙국은 같으면 🟩, 인구·면적은 ▲(정답이 더 큼)/▼에 "
+             "비슷하면 🟨, 거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다.\n"
+             "**🔥 어려움**: 잘 알려지지 않은 나라를 **10번 안에**. 인구·면적은 ▲/▼만, 거리는 가까움(2,000km 이내)/멀음만, 방향은 숨깁니다.\n"
+             "**📖 나라 정보**: 나라 하나의 소개와 수도·인구·면적·언어 등을 봅니다."),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -3177,7 +3176,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "nara_hard": "🔥", "nara_rank": "🏆", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -4204,10 +4203,7 @@ async def nara_guess_command(ctx, *, name: str = ""):
         return
     country = nara.find(name)
     if country is None:
-        hints = nara.suggest(name)
-        hint = f" 혹시 {', '.join(f'**{h}**' for h in hints)}인가요?" if hints else ""
-        await ctx.reply(f"`{name[:50]}`라는 나라를 찾지 못했습니다.{hint}\n-# 이 추측은 횟수에 들어가지 않습니다.",
-                        mention_author=False)
+        await ctx.reply(f"{nara_not_found(name)}\n-# 이 추측은 횟수에 들어가지 않습니다.", mention_author=False)
         return
     async with nara_lock(ctx.channel.id):
         game = nara_game(ctx.channel.id)
@@ -4299,7 +4295,7 @@ def help_run_nara(level):
         if interaction.guild is None or interaction.channel is None:
             await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
             return
-        await show_help(interaction, page="game", selected="nara_hard" if level == nara.HARD else "nara")
+        await show_nara_page(interaction)
         ctx = HelpContext(interaction, f"나라 맞히기 · {nara.LEVEL_NAMES[level]}")
         await run_from_help(ctx, nara_start(interaction.channel, interaction.guild, interaction.user, level))
     return handler
@@ -4310,8 +4306,109 @@ async def help_run_nara_rank(interaction):
         await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
         return
     ranking = nara_ranking_text(interaction.guild.id)
-    await show_help(interaction, page="game", selected="nara_rank",
-                    details=f"**이 서버 순위**\n{ranking}" if ranking else "아직 이 서버에서 나라를 맞힌 사람이 없습니다.")
+    await show_nara_page(interaction,
+                         details=f"**이 서버 순위**\n{ranking}" if ranking else "아직 이 서버에서 나라를 맞힌 사람이 없습니다.")
+
+
+def nara_buttons():
+    return [HelpButton("nara_normal", "보통 시작", "🌍", discord.ButtonStyle.success, row=2),
+            HelpButton("nara_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
+            HelpButton("nara_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2),
+            HelpButton("nara_info", "나라 정보", "📖", discord.ButtonStyle.secondary, row=2)]
+
+
+async def show_nara_page(interaction, details=None, notice=None):
+    """/도움말 → 게임 → 나라 맞히기: the game's own buttons (difficulty, ranking, country info)."""
+    await show_help(interaction, page="game", selected="nara", details=details, notice=notice,
+                    extra_items=nara_buttons())
+
+
+# !정보: a country's summary from Korean Wikipedia (fetched when asked, kept a day) and the bundled numbers.
+WIKI_SUMMARY_URL = "https://ko.wikipedia.org/api/rest_v1/page/summary/{}"
+WIKI_USER_AGENT = "maco-discord-bot/1.0 (Discord bot; country info command)"
+WIKI_CACHE_SECONDS = 24 * 60 * 60
+_wiki_cache = {}  # title -> (fetched at, summary); at most 60
+
+
+async def wiki_summary(title):
+    """{'extract', 'thumbnail', 'url'} for a Korean Wikipedia article, or None if it can't be fetched now."""
+    cached = _wiki_cache.get(title)
+    if cached and time.time() - cached[0] < WIKI_CACHE_SECONDS:
+        return cached[1]
+    try:
+        async with net.session().get(WIKI_SUMMARY_URL.format(quote(title.replace(" ", "_"), safe="")),
+                                     headers={"User-Agent": WIKI_USER_AGENT},
+                                     timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+    summary = {
+        "extract": data.get("extract") or "",
+        "thumbnail": (data.get("thumbnail") or {}).get("source"),
+        "url": ((data.get("content_urls") or {}).get("desktop") or {}).get("page"),
+    }
+    _wiki_cache.pop(title, None)
+    if len(_wiki_cache) >= 60:
+        _wiki_cache.pop(next(iter(_wiki_cache)))
+    _wiki_cache[title] = (time.time(), summary)
+    return summary
+
+
+def nara_not_found(name):
+    hints = nara.suggest(name)
+    hint = f" 혹시 {', '.join(f'**{h}**' for h in hints)}인가요?" if hints else ""
+    return f"`{name[:50]}`라는 나라를 찾지 못했습니다.{hint}"
+
+
+async def nara_info_embed(country):
+    summary = await wiki_summary(country["wiki"])
+    text = nara.intro(summary["extract"]) if summary else ""
+    embed = discord.Embed(title=f"{country['flag']} {country['ko']} ({country['en']})",
+                          description=text or "-# (위키백과 소개를 지금 불러오지 못했습니다)",
+                          url=summary["url"] if summary and summary["url"] else None, color=discord.Color.green())
+    for name, value in nara.info_fields(country):
+        embed.add_field(name=name, value=value, inline=True)
+    if summary and summary["thumbnail"]:
+        embed.set_thumbnail(url=summary["thumbnail"])
+    embed.set_footer(text="출처: 위키백과 (소개), World Bank (인구), world-countries · Wikidata")
+    return embed
+
+
+@bot.command(name="정보", aliases=["나라정보"])
+async def nara_info_command(ctx, *, name: str = ""):
+    name = name.strip()
+    if not name:
+        await ctx.reply("`!정보 <나라 이름>`처럼 써 주세요. 예: `!정보 이집트`", mention_author=False)
+        return
+    country = nara.find(name)
+    if country is None:
+        await ctx.reply(nara_not_found(name), mention_author=False)
+        return
+    async with ctx.typing():
+        embed = await nara_info_embed(country)
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+class NaraInfoModal(SafeModal, title="나라 정보"):
+    def __init__(self):
+        super().__init__()
+        self.country = discord.ui.TextInput(max_length=60, placeholder="이집트")
+        self.add_item(discord.ui.Label(text="나라 이름", component=self.country))
+
+    async def on_submit(self, interaction):
+        name = self.country.value.strip()
+        country = nara.find(name)
+        if country is None:
+            await show_nara_page(interaction, notice=nara_not_found(name))
+            return
+        await show_nara_page(interaction)
+        ctx = HelpContext(interaction, f"나라 정보 · {country['ko']}")
+
+        async def post():
+            await ctx.reply(embed=await nara_info_embed(country))
+        await run_from_help(ctx, post())
 
 
 HELP_ACTIONS = {
@@ -4333,9 +4430,11 @@ HELP_ACTIONS = {
     "dday_edit": lambda interaction: dday_choose(interaction, "edit"),
     "dday_del": lambda interaction: dday_choose(interaction, "del"),
     "page_game": lambda interaction: help_open_page(interaction, "game"),
-    "run_nara": help_run_nara(nara.NORMAL),
-    "run_nara_hard": help_run_nara(nara.HARD),
-    "run_nara_rank": help_run_nara_rank,
+    "run_nara": lambda interaction: show_nara_page(interaction),
+    "nara_normal": help_run_nara(nara.NORMAL),
+    "nara_hard": help_run_nara(nara.HARD),
+    "nara_rank": help_run_nara_rank,
+    "nara_info": lambda interaction: interaction.response.send_modal(NaraInfoModal()),
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,

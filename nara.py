@@ -185,7 +185,9 @@ def korean_number(n):
 
 
 def area_text(km2):
-    return f"{korean_number(km2)}㎢" if km2 >= 10_000 else f"{km2:,.0f}㎢"
+    if km2 >= 10_000:
+        return f"{korean_number(km2)}㎢"
+    return f"{km2:,.0f}㎢" if km2 >= 10 else f"{km2:g}㎢"
 
 
 def summary(code):
@@ -349,3 +351,59 @@ def render_board(rows, answer=None, total=None, level=NORMAL):
     image.save(out, "PNG", optimize=True)
     image.close()
     return out.getvalue()
+
+
+# ------------------------------------------------------------------ !정보
+
+KOREA_AREA = 100_210
+OUTSIDE_NAMES = {"HKG": "홍콩", "MAC": "마카오", "ESH": "서사하라", "GUF": "프랑스령 기아나", "GIB": "지브롤터"}
+
+
+def area_compare(km2):
+    """'한국의 약 10배' / '한국의 약 1/5' / '한국과 비슷'"""
+    ratio = km2 / KOREA_AREA
+    if 0.8 <= ratio <= 1.25:
+        return "한국과 비슷"
+    if ratio > 1:
+        return f"한국의 약 {ratio:,.0f}배" if ratio >= 10 else f"한국의 약 {ratio:.1f}배"
+    return f"한국의 약 1/{1 / ratio:,.0f}"
+
+
+def border_names(c):
+    data = countries()
+    return [data[b]["ko"] if b in data else OUTSIDE_NAMES.get(b, b) for b in c["borders"]]
+
+
+def short_list(items, limit=4):
+    if not items:
+        return "정보 없음"
+    shown = ", ".join(items[:limit])
+    return f"{shown} 외 {len(items) - limit}개" if len(items) > limit else shown
+
+
+def intro(extract, limit=420):
+    """The first few sentences of a Wikipedia summary, cut at a sentence end within limit characters."""
+    text = " ".join((extract or "").split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("다. "))
+    return cut[:end + 1] if end > limit // 3 else cut.rstrip() + "…"
+
+
+def info_fields(c):
+    """[(name, value)] for the !정보 embed."""
+    density = c["population"] / c["area"] if c["area"] else 0
+    return [
+        ("대륙", c["continent"]),
+        ("수도", c["capital"]),
+        ("인구", f"약 {korean_number(c['population'])}명"),
+        ("면적", f"{c['area']:,.0f}㎢" if c["code"] == "KOR" else
+                 f"{c['area']:,.0f}㎢\n({area_compare(c['area'])})" if c["area"] >= 10 else
+                 f"{c['area']:g}㎢\n({area_compare(c['area'])})"),
+        ("인구 밀도", f"{density:,.0f}명/㎢"),
+        ("바다", "없음 (내륙국)" if c["landlocked"] else "접함"),
+        ("언어", short_list(c["languages"])),
+        ("통화", short_list(c["currencies"], 3)),
+        ("이웃 나라", short_list(border_names(c), 8) if c["borders"] else "없음 (육지 국경 없음)"),
+    ]
