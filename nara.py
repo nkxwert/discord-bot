@@ -24,7 +24,7 @@ BOARD_ROWS = 15  # guesses drawn on the board; older ones are summarised in one 
 # Difficulty. 보통: the answer is a well-known country and every hint is exact.
 # 어려움: the answer is one of the other, lesser-known countries; population and area say only
 # bigger/smaller, distance only near/far (HARD_NEAR_KM), and there are HARD_MAX_GUESSES guesses.
-# Continent, hemisphere, landlocked and the direction arrow stay, so someone who knows the map can solve it.
+# and the direction is hidden. Continent, hemisphere and landlocked stay.
 NORMAL, HARD = "normal", "hard"
 LEVEL_NAMES = {NORMAL: "보통", HARD: "어려움"}
 LEVEL_WORDS = {"": NORMAL, "보통": NORMAL, "normal": NORMAL, "쉬움": NORMAL, "어려움": HARD, "hard": HARD,
@@ -313,6 +313,8 @@ def render_board(rows, answer=None, total=None, level=NORMAL):
             _tile(draw, x, y, w, GREEN_T)
             cx, cy = x + w / 2, y + CELL_H / 2
             draw.line(((cx - 12, cy), (cx - 3, cy + 9), (cx + 13, cy - 9)), fill=WHITE, width=5, joint="curve")
+        elif level == HARD:
+            _tile(draw, x, y, w, PANEL, "?", 22)
         elif row["direction"] is None:
             _tile(draw, x, y, w, GRAY_T, "·", 22)
         else:
@@ -337,7 +339,7 @@ def render_board(rows, answer=None, total=None, level=NORMAL):
         y += 50 + GAP
     if level == HARD:
         legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  가까움: 수도끼리 {HARD_NEAR_KM:,}km 이내  ·  "
-                  f"방향은 수도 기준  ·  {HARD_MAX_GUESSES}번 안에 맞히기")
+                  f"방향은 숨김  ·  {HARD_MAX_GUESSES}번 안에 맞히기")
     else:
         legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  노란색: 인구·면적 ±{round(CLOSE_RATIO * 100)}% 이내, "
                   f"거리 {NEAR_KM:,}km 이내  ·  거리·방향은 수도 기준")
