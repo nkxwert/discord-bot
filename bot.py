@@ -1259,8 +1259,8 @@ def command_list_embed():
     embed.add_field(name="!dday [이름]", value="이 서버의 D-Day 목록을 보거나 그 날까지 남은 시간을 봅니다. "
                                               "만들기·편집·삭제는 `/도움말` → 기타 → D-Day에서 합니다.", inline=False)
     embed.add_field(name="!나라시작 · !추측 <나라> · !포기 · !나라순위",
-                    value="나라 맞히기: 채널의 모두가 함께 비밀 나라를 맞힙니다. 추측할 때마다 대륙·인구·면적·거리·방향 힌트가 표로 나옵니다. "
-                          "`!guess`도 됩니다.", inline=False)
+                    value="나라 맞히기: 채널의 모두가 함께 비밀 나라를 맞힙니다. 추측할 때마다 대륙·인구·면적·거리·방향 힌트가 표로 나옵니다.",
+                    inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
                     value=f"글자를 디시 글자콘처럼 그림으로 만들어 올립니다 (최대 {textcon.MAX_CHARS}자). 메시지를 넣으면 같이 보냅니다.", inline=False)
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
@@ -3149,7 +3149,7 @@ HELP_COMMANDS = {
              "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
-    "nara": ("나라 맞히기", "!나라시작", "`!나라시작` · `!추측 <나라>` (`!guess`도 됨) · `!포기` · `!나라순위`\n"
+    "nara": ("나라 맞히기", "!나라시작", "`!나라시작` · `!추측 <나라>` · `!포기` · `!나라순위`\n"
              "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다. 횟수 제한은 없고, 진행 중인 판이 있으면 그 판을 이어서 합니다.\n"
              "추측할 때마다 표에 한 줄씩 쌓입니다: 대륙·반구·내륙국은 같으면 🟩, 인구·면적은 ▲(정답이 더 큼)/▼와 비슷하면 🟨, "
              "거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다."),
@@ -4125,17 +4125,12 @@ def nara_game(channel_id):
         return conn.execute("SELECT * FROM nara_games WHERE channel_id = ?", (channel_id,)).fetchone()
 
 
-async def nara_post_board(channel, answer, guesses, content, old_message_id=None, finished=False):
-    """Post the board (the last BOARD_ROWS guesses) under content, then delete the previous board so the
-    newest one is always at the bottom of the chat. Returns the new message."""
+async def nara_post_board(channel, answer, guesses, content, finished=False):
+    """Post the board (the last BOARD_ROWS guesses) under content. Earlier boards stay in the chat.
+    Returns the new message."""
     rows = [nara.compare(code, answer) for code, _ in guesses[-nara.BOARD_ROWS:]]
     png = await asyncio.to_thread(nara.render_board, rows, answer if finished else None, len(guesses))
     message = await channel.send(content, file=discord.File(io.BytesIO(png), NARA_FILE))
-    if old_message_id:
-        try:
-            await channel.get_partial_message(old_message_id).delete()
-        except discord.HTTPException:
-            pass  # already deleted by someone
     return message
 
 
@@ -4148,13 +4143,13 @@ async def nara_start(channel, guild, user):
             guesses = json.loads(game["guesses"])
             content = (f"{header}\n이 채널에서 진행 중인 판을 이어서 합니다. (지금까지 추측 {len(guesses)}번)\n"
                        "`!추측 <나라>`로 추측하세요. 포기: `!포기`")
-            message = await nara_post_board(channel, game["answer"], guesses, content, game["board_message_id"])
+            message = await nara_post_board(channel, game["answer"], guesses, content)
             with connect_db() as conn:
                 conn.execute("UPDATE nara_games SET board_message_id = ? WHERE channel_id = ?", (message.id, channel.id))
             return
         answer = nara.pick()
         content = (f"{header}\n🌍 **나라 맞히기** 새 판! 봇이 나라 하나를 골랐습니다.\n"
-                   "누구나 `!추측 <나라>`로 추측할 수 있습니다 (`!guess`도 됨). 횟수 제한 없음 · 포기: `!포기`")
+                   "누구나 `!추측 <나라>`로 추측할 수 있습니다. 횟수 제한 없음 · 포기: `!포기`")
         message = await nara_post_board(channel, answer, [], content)
         with connect_db() as conn:
             conn.execute(
@@ -4199,7 +4194,7 @@ async def nara_guess_command(ctx, *, name: str = ""):
         if code == answer:
             content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{country['ko']}**입니다. "
                        f"(모두 합쳐 추측 {len(guesses)}번)\n-# {nara.summary(answer)} · 새 판: `!나라시작` · 순위: `!나라순위`")
-            await nara_post_board(ctx.channel, answer, guesses, content, game["board_message_id"], finished=True)
+            await nara_post_board(ctx.channel, answer, guesses, content, finished=True)
             with connect_db() as conn:
                 conn.execute("DELETE FROM nara_games WHERE channel_id = ?", (ctx.channel.id,))
                 conn.execute(
@@ -4209,7 +4204,7 @@ async def nara_guess_command(ctx, *, name: str = ""):
                 )
             return
         content = f"{header}\n-# `!추측 <나라>`로 계속 · 포기: `!포기`"
-        message = await nara_post_board(ctx.channel, answer, guesses, content, game["board_message_id"])
+        message = await nara_post_board(ctx.channel, answer, guesses, content)
         with connect_db() as conn:
             conn.execute("UPDATE nara_games SET guesses = ?, board_message_id = ? WHERE channel_id = ?",
                          (json.dumps(guesses), message.id, ctx.channel.id))
@@ -4227,7 +4222,7 @@ async def nara_giveup_command(ctx):
         content = (f"-# {ctx.author.mention}님이 포기했습니다 · 나라 맞히기\n"
                    f"정답은 **{nara.countries()[answer]['ko']}**였습니다. (추측 {len(guesses)}번)\n"
                    f"-# {nara.summary(answer)} · 새 판: `!나라시작`")
-        await nara_post_board(ctx.channel, answer, guesses, content, game["board_message_id"], finished=True)
+        await nara_post_board(ctx.channel, answer, guesses, content, finished=True)
         with connect_db() as conn:
             conn.execute("DELETE FROM nara_games WHERE channel_id = ?", (ctx.channel.id,))
 
