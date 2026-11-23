@@ -3198,7 +3198,7 @@ HELP_COMMANDS = {
     "flag": ("국기 맞히기", "!국기시작", "`!국기시작 [쉬움|보통|어려움] [문제 수]` · `!국기 <나라>` · `!힌트` · `!국기스킵` · "
              "`!국기중지` · `!국기순위`\n"
              "국기 그림이 올라오면 채널의 누구나 `!국기 <나라>`로 답하고, **가장 먼저 맞힌 사람**의 맞힌 개수가 기록됩니다. "
-             "시간 제한·횟수 제한은 없고, 틀리면 ❌가 달립니다. `!힌트`는 초성(예: ㅍㄹㅅ)을 알려 줍니다.\n"
+             "시간 제한·횟수 제한은 없고, 틀리면 ❌, 맞았지만 한발 늦으면 ⏱️가 달립니다. `!힌트`는 초성(예: ㅍㄹㅅ)을 알려 줍니다.\n"
              "**🟢 쉬움**: 잘 알려진 나라 · **🌍 보통**: 모든 나라 · **🔥 어려움**: 덜 알려진 나라, 비슷하게 생긴 국기가 자주 나옴\n"
              "문제 수를 안 쓰면 10문제입니다(최대 50)."),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
@@ -4459,6 +4459,8 @@ class NaraInfoModal(SafeModal, title="나라 정보"):
 
 FLAG_FILE = "국기.png"  # always this name, so the file name never gives the answer away
 FLAG_RECENT = 30  # countries asked lately in a channel's quiz, not asked again soon
+FLAG_LATE_SECONDS = 15
+_flag_just_answered = {}  # channel id -> (country, when): a right answer typed a moment too late gets ⏱️, not ❌
 
 
 def flag_game(channel_id):
@@ -4549,12 +4551,17 @@ async def flag_guess_command(ctx, *, name: str = ""):
     async with nara_lock(f"flag:{ctx.channel.id}"):
         game = flag_game(ctx.channel.id)
         if game is None or country["code"] != game["answer"]:
+            last = _flag_just_answered.get(ctx.channel.id)
+            late = last and last[0] == country["code"] and time.monotonic() - last[1] < FLAG_LATE_SECONDS
             try:
-                await ctx.message.add_reaction("❌")
+                await ctx.message.add_reaction("⏱️" if late else "❌")
             except discord.HTTPException:
                 pass
             return
         level = game["level"]
+        if len(_flag_just_answered) >= 300:
+            _flag_just_answered.clear()
+        _flag_just_answered[ctx.channel.id] = (game["answer"], time.monotonic())
         scores = json.loads(game["scores"])
         uid = str(ctx.author.id)
         scores[uid] = scores.get(uid, 0) + 1
