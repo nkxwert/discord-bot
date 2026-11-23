@@ -12,3 +12,4 @@
 
 This file is a Database (countries.json) made available under the Open Database License (ODbL 1.0),
 built from world-countries (ODbL) and World Bank data (CC BY 4.0).
+- 국기 맞히기의 국기 그림(`assets/flags/*.png`, 가로 640px): [flagcdn.com](https://flagcdn.com/) (국기 그림은 퍼블릭 도메인)

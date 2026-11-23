@@ -29,6 +29,7 @@ import dashboard
 import dday
 import net
 import easter_eggs
+import flagquiz
 import nara
 import shortlinks
 import stats
@@ -362,6 +363,32 @@ def init_db():
             conn.execute("ALTER TABLE nara_games ADD COLUMN level TEXT NOT NULL DEFAULT 'normal'")
         if "hard_wins" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_scores)")]:
             conn.execute("ALTER TABLE nara_scores ADD COLUMN hard_wins INTEGER NOT NULL DEFAULT 0")
+        # 국기 맞히기: one quiz per channel and how many flags each person has got, per difficulty.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS flag_games (
+                channel_id INTEGER PRIMARY KEY,
+                guild_id INTEGER,
+                level TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                number INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                recent TEXT NOT NULL DEFAULT '[]',
+                scores TEXT NOT NULL DEFAULT '{}',
+                hinted INTEGER NOT NULL DEFAULT 0,
+                started_by INTEGER NOT NULL,
+                started_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS flag_scores (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                easy INTEGER NOT NULL DEFAULT 0,
+                normal INTEGER NOT NULL DEFAULT 0,
+                hard INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.commit()
@@ -1266,6 +1293,9 @@ def command_list_embed():
                     value="나라 맞히기: 채널의 모두가 함께 비밀 나라를 맞힙니다. 추측할 때마다 대륙·인구·면적·거리·방향 힌트가 표로 나옵니다. "
                           "어려움은 잘 알려지지 않은 나라를 10번 안에 맞힙니다.",
                     inline=False)
+    embed.add_field(name="!국기시작 [쉬움|보통|어려움] [문제 수] · !국기 <나라> · !힌트 · !국기순위",
+                    value="국기 맞히기: 국기를 보고 가장 먼저 나라를 맞힌 사람의 개수가 기록됩니다. `!힌트`는 초성, "
+                          "`!국기스킵`은 넘기기, `!국기중지`는 그만하기입니다.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -3133,7 +3163,7 @@ HELP_CATEGORIES = {
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
     "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
-    "game": ("🎮", "게임", ["nara"]),
+    "game": ("🎮", "게임", ["nara", "flag"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -3163,6 +3193,12 @@ HELP_COMMANDS = {
              "비슷하면 🟨, 거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다.\n"
              "**🔥 어려움**: 잘 알려지지 않은 나라를 **10번 안에**. 인구·면적은 ▲/▼만, 거리는 가까움(2,000km 이내)/멀음만, 방향은 숨깁니다.\n"
              "**📖 나라 정보**: 나라 하나의 소개와 수도·인구·면적·언어 등을 봅니다."),
+    "flag": ("국기 맞히기", "!국기시작", "`!국기시작 [쉬움|보통|어려움] [문제 수]` · `!국기 <나라>` · `!힌트` · `!국기스킵` · "
+             "`!국기중지` · `!국기순위`\n"
+             "국기 그림이 올라오면 채널의 누구나 `!국기 <나라>`로 답하고, **가장 먼저 맞힌 사람**의 맞힌 개수가 기록됩니다. "
+             "시간 제한·횟수 제한은 없고, 틀리면 ❌가 달립니다. `!힌트`는 초성(예: ㅍㄹㅅ)을 알려 줍니다.\n"
+             "**🟢 쉬움**: 잘 알려진 나라 · **🌍 보통**: 모든 나라 · **🔥 어려움**: 덜 알려진 나라, 비슷하게 생긴 국기가 자주 나옴\n"
+             "문제 수를 안 쓰면 10문제입니다(최대 50)."),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -3176,7 +3212,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -4411,6 +4447,219 @@ class NaraInfoModal(SafeModal, title="나라 정보"):
         await run_from_help(ctx, post())
 
 
+# ---------------------------------------------------------------- 국기 맞히기
+
+FLAG_FILE = "국기.png"  # always this name, so the file name never gives the answer away
+FLAG_RECENT = 30  # countries asked lately in a channel's quiz, not asked again soon
+
+
+def flag_game(channel_id):
+    with connect_db() as conn:
+        return conn.execute("SELECT * FROM flag_games WHERE channel_id = ?", (channel_id,)).fetchone()
+
+
+def flag_question_text(level, number, total):
+    return (f"🚩 **국기 맞히기 · {flagquiz.LEVEL_NAMES[level]}** · 문제 {number}/{total}\n"
+            "`!국기 <나라>`로 답하세요 · 힌트: `!힌트` · 넘기기: `!국기스킵` · 그만: `!국기중지`")
+
+
+async def flag_post_question(channel, game, header=None):
+    text = flag_question_text(game["level"], game["number"], game["total"])
+    content = f"{header}\n{text}" if header else text
+    await channel.send(content, file=discord.File(flagquiz.flag_path(game["answer"]), FLAG_FILE))
+
+
+def flag_session_text(scores):
+    """This quiz's scorers, best first: '🥇 @a 3개 · 🥈 @b 1개'"""
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    return " · ".join(f"{medals.get(i, f'{i}.')} <@{uid}> {n}개" for i, (uid, n) in enumerate(ranked, 1))
+
+
+async def flag_next(channel, game, header):
+    """Move on after a question is answered or skipped: the next flag, or the end of the quiz."""
+    scores = json.loads(game["scores"])
+    if game["number"] >= game["total"]:
+        with connect_db() as conn:
+            conn.execute("DELETE FROM flag_games WHERE channel_id = ?", (channel.id,))
+        result = flag_session_text(scores) or "맞힌 사람이 없습니다."
+        await channel.send(f"{header}\n🏁 **{game['total']}문제 끝!** 이번에 맞힌 개수: {result}\n"
+                           "-# 새로 하기: `!국기시작 [쉬움|보통|어려움] [문제 수]` · 순위: `!국기순위`")
+        return
+    recent = json.loads(game["recent"])
+    answer = flagquiz.pick(game["level"], recent)
+    recent = (recent + [answer])[-FLAG_RECENT:]
+    with connect_db() as conn:
+        conn.execute("UPDATE flag_games SET answer = ?, number = number + 1, recent = ?, hinted = 0 "
+                     "WHERE channel_id = ?", (answer, json.dumps(recent), channel.id))
+    await flag_post_question(channel, flag_game(channel.id), header)
+
+
+async def flag_start(channel, guild, user, level=flagquiz.NORMAL, count=flagquiz.DEFAULT_COUNT):
+    async with nara_lock(f"flag:{channel.id}"):
+        game = flag_game(channel.id)
+        header = f"-# {user.mention}님의 요청 · 국기 맞히기"
+        if game:
+            await flag_post_question(channel, game, f"{header}\n진행 중인 퀴즈를 이어서 합니다.")
+            return
+        answer = flagquiz.pick(level)
+        with connect_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO flag_games(channel_id, guild_id, level, answer, number, total, recent, scores, "
+                "hinted, started_by, started_at) VALUES (?, ?, ?, ?, 1, ?, ?, '{}', 0, ?, ?)",
+                (channel.id, guild.id if guild else None, level, answer, count, json.dumps([answer]), user.id, time.time()),
+            )
+        await flag_post_question(channel, flag_game(channel.id), header)
+
+
+@bot.command(name="국기시작", aliases=["국기맞히기"])
+@commands.guild_only()
+async def flag_start_command(ctx, *, options: str = ""):
+    parsed = flagquiz.parse_start(options)
+    if parsed is None:
+        await ctx.reply(f"`!국기시작 [쉬움|보통|어려움] [문제 수 1~{flagquiz.MAX_COUNT}]`처럼 써 주세요. "
+                        "예: `!국기시작 어려움 20`", mention_author=False)
+        return
+    await flag_start(ctx.channel, ctx.guild, ctx.author, *parsed)
+
+
+@bot.command(name="국기")
+@commands.guild_only()
+async def flag_guess_command(ctx, *, name: str = ""):
+    name = name.strip()
+    game = flag_game(ctx.channel.id)
+    if game is None:
+        await ctx.reply("이 채널에는 진행 중인 국기 퀴즈가 없습니다. `!국기시작`으로 시작해 주세요.", mention_author=False)
+        return
+    if not name:
+        await flag_post_question(ctx.channel, game)
+        return
+    country = nara.find(name)
+    if country is None:
+        await ctx.reply(nara_not_found(name), mention_author=False)
+        return
+    async with nara_lock(f"flag:{ctx.channel.id}"):
+        game = flag_game(ctx.channel.id)
+        if game is None or country["code"] != game["answer"]:
+            try:
+                await ctx.message.add_reaction("❌")
+            except discord.HTTPException:
+                pass
+            return
+        level = game["level"]
+        scores = json.loads(game["scores"])
+        uid = str(ctx.author.id)
+        scores[uid] = scores.get(uid, 0) + 1
+        with connect_db() as conn:
+            conn.execute("UPDATE flag_games SET scores = ? WHERE channel_id = ?", (json.dumps(scores), ctx.channel.id))
+            conn.execute(
+                f"INSERT INTO flag_scores(guild_id, user_id, {level}) VALUES (?, ?, 1) "
+                f"ON CONFLICT(guild_id, user_id) DO UPDATE SET {level} = {level} + 1",
+                (ctx.guild.id, ctx.author.id),
+            )
+            total = conn.execute(f"SELECT {level} FROM flag_scores WHERE guild_id = ? AND user_id = ?",
+                                 (ctx.guild.id, ctx.author.id)).fetchone()[0]
+        header = (f"🎉 {ctx.author.mention}님 정답! **{country['ko']}** {country['flag']}\n"
+                  f"-# {ctx.author.mention}님의 {flagquiz.LEVEL_NAMES[level]} 누적 {total}개")
+        await flag_next(ctx.channel, flag_game(ctx.channel.id), header)
+
+
+@bot.command(name="힌트")
+@commands.guild_only()
+async def flag_hint_command(ctx):
+    game = flag_game(ctx.channel.id)
+    if game is None:
+        await ctx.reply("이 채널에는 진행 중인 국기 퀴즈가 없습니다.", mention_author=False)
+        return
+    name = nara.countries()[game["answer"]]["ko"]
+    await ctx.reply(f"💡 초성 힌트: **{flagquiz.chosung(name)}** ({len(name.replace(' ', ''))}글자)", mention_author=False)
+
+
+@bot.command(name="국기스킵", aliases=["국기패스", "국기넘기기"])
+@commands.guild_only()
+async def flag_skip_command(ctx):
+    async with nara_lock(f"flag:{ctx.channel.id}"):
+        game = flag_game(ctx.channel.id)
+        if game is None:
+            await ctx.reply("이 채널에는 진행 중인 국기 퀴즈가 없습니다.", mention_author=False)
+            return
+        c = nara.countries()[game["answer"]]
+        await flag_next(ctx.channel, game, f"-# {ctx.author.mention}님이 넘겼습니다 · 정답은 {c['flag']} **{c['ko']}**{nara.josa(c['ko'], '이었', '였')}습니다.")
+
+
+@bot.command(name="국기중지", aliases=["국기그만"])
+@commands.guild_only()
+async def flag_stop_command(ctx):
+    async with nara_lock(f"flag:{ctx.channel.id}"):
+        game = flag_game(ctx.channel.id)
+        if game is None:
+            await ctx.reply("이 채널에는 진행 중인 국기 퀴즈가 없습니다.", mention_author=False)
+            return
+        with connect_db() as conn:
+            conn.execute("DELETE FROM flag_games WHERE channel_id = ?", (ctx.channel.id,))
+        c = nara.countries()[game["answer"]]
+        result = flag_session_text(json.loads(game["scores"])) or "맞힌 사람이 없습니다."
+        await ctx.channel.send(f"-# {ctx.author.mention}님이 퀴즈를 멈췄습니다 · 마지막 정답은 {c['flag']} **{c['ko']}**{nara.josa(c['ko'], '이었', '였')}습니다.\n"
+                               f"🏁 이번에 맞힌 개수: {result}")
+
+
+def flag_ranking_text(guild_id, limit=10):
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT user_id, easy, normal, hard FROM flag_scores WHERE guild_id = ? AND easy + normal + hard > 0 "
+            "ORDER BY hard DESC, normal DESC, easy DESC LIMIT ?",
+            (guild_id, limit),
+        ).fetchall()
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · 쉬움 {r['easy']}개 · 보통 {r['normal']}개 · "
+                     f"어려움 {r['hard']}개" for i, r in enumerate(rows, 1))
+
+
+@bot.command(name="국기순위", aliases=["국기랭킹"])
+@commands.guild_only()
+async def flag_ranking_command(ctx):
+    text = flag_ranking_text(ctx.guild.id)
+    if not text:
+        await ctx.reply("아직 이 서버에서 국기를 맞힌 사람이 없습니다. `!국기시작`으로 시작해 보세요!", mention_author=False)
+        return
+    embed = discord.Embed(title="🏆 국기 맞히기 순위", description=text, color=discord.Color.green())
+    embed.set_footer(text="맞힌 개수 · 어려움이 많은 순, 같으면 보통·쉬움 순")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+def flag_buttons():
+    return [HelpButton("flag_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
+            HelpButton("flag_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
+            HelpButton("flag_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
+            HelpButton("flag_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2)]
+
+
+async def show_flag_page(interaction, details=None, notice=None):
+    """/도움말 → 게임 → 국기 맞히기."""
+    await show_help(interaction, page="game", selected="flag", details=details, notice=notice,
+                    extra_items=flag_buttons())
+
+
+def help_run_flag(level):
+    async def handler(interaction):
+        if interaction.guild is None or interaction.channel is None:
+            await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+            return
+        await show_flag_page(interaction)
+        ctx = HelpContext(interaction, f"국기 맞히기 · {flagquiz.LEVEL_NAMES[level]}")
+        await run_from_help(ctx, flag_start(interaction.channel, interaction.guild, interaction.user, level))
+    return handler
+
+
+async def help_run_flag_rank(interaction):
+    if interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    ranking = flag_ranking_text(interaction.guild.id)
+    await show_flag_page(interaction,
+                         details=f"**이 서버 순위**\n{ranking}" if ranking else "아직 이 서버에서 국기를 맞힌 사람이 없습니다.")
+
+
 HELP_ACTIONS = {
     "home": lambda interaction: show_help(interaction),
     "commands": lambda interaction: show_help(interaction, page="commands"),
@@ -4435,6 +4684,11 @@ HELP_ACTIONS = {
     "nara_hard": help_run_nara(nara.HARD),
     "nara_rank": help_run_nara_rank,
     "nara_info": lambda interaction: interaction.response.send_modal(NaraInfoModal()),
+    "run_flag": lambda interaction: show_flag_page(interaction),
+    "flag_easy": help_run_flag(flagquiz.EASY),
+    "flag_normal": help_run_flag(flagquiz.NORMAL),
+    "flag_hard": help_run_flag(flagquiz.HARD),
+    "flag_rank": help_run_flag_rank,
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,
