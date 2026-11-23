@@ -363,6 +363,8 @@ def init_db():
             conn.execute("ALTER TABLE nara_games ADD COLUMN level TEXT NOT NULL DEFAULT 'normal'")
         if "hard_wins" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_scores)")]:
             conn.execute("ALTER TABLE nara_scores ADD COLUMN hard_wins INTEGER NOT NULL DEFAULT 0")
+        if "easy_wins" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_scores)")]:
+            conn.execute("ALTER TABLE nara_scores ADD COLUMN easy_wins INTEGER NOT NULL DEFAULT 0")
         # 국기 맞히기: one quiz per channel and how many flags each person has got, per difficulty.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS flag_games (
@@ -1289,9 +1291,9 @@ def command_list_embed():
     embed.add_field(name="!일침", value="정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     embed.add_field(name="!dday [이름]", value="이 서버의 D-Day 목록을 보거나 그 날까지 남은 시간을 봅니다. "
                                               "만들기·편집·삭제는 `/도움말` → 기타 → D-Day에서 합니다.", inline=False)
-    embed.add_field(name="!나라시작 [보통|어려움] · !추측 <나라> · !포기 · !나라순위",
+    embed.add_field(name="!나라시작 [쉬움|보통|어려움] · !추측 <나라> · !포기 · !나라순위",
                     value="나라 맞히기: 채널의 모두가 함께 비밀 나라를 맞힙니다. 추측할 때마다 대륙·인구·면적·거리·방향 힌트가 표로 나옵니다. "
-                          "어려움은 잘 알려지지 않은 나라를 10번 안에 맞힙니다.",
+                          "쉬움은 잘 알려진 나라, 보통은 모든 나라, 어려움은 잘 알려지지 않은 나라를 10번 안에 맞힙니다.",
                     inline=False)
     embed.add_field(name="!국기시작 [쉬움|보통|어려움] [문제 수] · !국기 <나라> · !힌트 · !국기순위",
                     value="국기 맞히기: 국기를 보고 가장 먼저 나라를 맞힌 사람의 개수가 기록됩니다. `!힌트`는 초성, "
@@ -3187,10 +3189,10 @@ HELP_COMMANDS = {
              "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
-    "nara": ("나라 맞히기", "!나라시작", "`!나라시작 [보통|어려움]` · `!추측 <나라>` · `!포기` · `!나라순위` · `!정보 <나라>`\n"
+    "nara": ("나라 맞히기", "!나라시작", "`!나라시작 [쉬움|보통|어려움]` · `!추측 <나라>` · `!포기` · `!나라순위` · `!정보 <나라>`\n"
              "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다. 진행 중인 판이 있으면 이어서 합니다.\n"
-             "**🌍 보통**: 잘 알려진 나라, 횟수 제한 없음. 대륙·반구·내륙국은 같으면 🟩, 인구·면적은 ▲(정답이 더 큼)/▼에 "
-             "비슷하면 🟨, 거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다.\n"
+             "**🟢 쉬움**: 잘 알려진 나라 · **🌍 보통**: 모든 나라 중 무작위. 둘 다 횟수 제한 없음. 대륙·반구·내륙국은 같으면 🟩, "
+             "인구·면적은 ▲(정답이 더 큼)/▼에 비슷하면 🟨, 거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다.\n"
              "**🔥 어려움**: 잘 알려지지 않은 나라를 **10번 안에**. 인구·면적은 ▲/▼만, 거리는 가까움(2,000km 이내)/멀음만, 방향은 숨깁니다.\n"
              "**📖 나라 정보**: 나라 하나의 소개와 수도·인구·면적·언어 등을 봅니다."),
     "flag": ("국기 맞히기", "!국기시작", "`!국기시작 [쉬움|보통|어려움] [문제 수]` · `!국기 <나라>` · `!힌트` · `!국기스킵` · "
@@ -4206,10 +4208,11 @@ async def nara_start(channel, guild, user, level=nara.NORMAL):
             await nara_post_board(channel, game, guesses, content)
             return
         game = {"answer": nara.pick(level), "level": level}
-        if level == nara.HARD:
-            intro = "🔥 **나라 맞히기 · 어려움** 새 판! 잘 알려지지 않은 나라 하나를 골랐습니다."
-        else:
-            intro = "🌍 **나라 맞히기 · 보통** 새 판! 잘 알려진 나라 하나를 골랐습니다."
+        intro = {
+            nara.EASY: "🟢 **나라 맞히기 · 쉬움** 새 판! 잘 알려진 나라 하나를 골랐습니다.",
+            nara.NORMAL: "🌍 **나라 맞히기 · 보통** 새 판! 나라 하나를 골랐습니다.",
+            nara.HARD: "🔥 **나라 맞히기 · 어려움** 새 판! 잘 알려지지 않은 나라 하나를 골랐습니다.",
+        }[level]
         content = f"{header}\n{intro}\n누구나 `!추측 <나라>`로 추측할 수 있습니다. {nara_rules(level)}"
         message = await nara_post_board(channel, game, [], content)
         with connect_db() as conn:
@@ -4225,7 +4228,7 @@ async def nara_start(channel, guild, user, level=nara.NORMAL):
 async def nara_start_command(ctx, *, level: str = ""):
     chosen = nara.level_of(level)
     if chosen is None:
-        await ctx.reply("난이도는 `보통` 또는 `어려움`입니다. 예: `!나라시작 어려움`", mention_author=False)
+        await ctx.reply("난이도는 `쉬움`, `보통`, `어려움`입니다. 예: `!나라시작 쉬움`", mention_author=False)
         return
     await nara_start(ctx.channel, ctx.guild, ctx.author, chosen)
 
@@ -4260,7 +4263,7 @@ async def nara_guess_command(ctx, *, name: str = ""):
             content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{answer_name}**입니다. "
                        f"(모두 합쳐 추측 {len(guesses)}번)\n-# {nara.summary(answer)} · 새 판: `!나라시작` · 순위: `!나라순위`")
             await nara_post_board(ctx.channel, game, guesses, content, finished=True)
-            column = "hard_wins" if level == nara.HARD else "wins"
+            column = {nara.EASY: "easy_wins", nara.NORMAL: "wins", nara.HARD: "hard_wins"}[level]
             with connect_db() as conn:
                 conn.execute("DELETE FROM nara_games WHERE channel_id = ?", (ctx.channel.id,))
                 conn.execute(
@@ -4301,12 +4304,13 @@ async def nara_giveup_command(ctx):
 def nara_ranking_text(guild_id, limit=10):
     with connect_db() as conn:
         rows = conn.execute(
-            "SELECT user_id, wins, hard_wins FROM nara_scores WHERE guild_id = ? AND wins + hard_wins > 0 "
-            "ORDER BY hard_wins DESC, wins DESC LIMIT ?",
+            "SELECT user_id, easy_wins, wins, hard_wins FROM nara_scores WHERE guild_id = ? "
+            "AND easy_wins + wins + hard_wins > 0 ORDER BY hard_wins DESC, wins DESC, easy_wins DESC LIMIT ?",
             (guild_id, limit),
         ).fetchall()
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · 보통 {r['wins']}승 · 어려움 {r['hard_wins']}승"
+    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · 쉬움 {r['easy_wins']}승 · "
+                     f"보통 {r['wins']}승 · 어려움 {r['hard_wins']}승"
                      for i, r in enumerate(rows, 1))
 
 
@@ -4316,7 +4320,7 @@ async def nara_ranking_send(target):
         await target.reply("아직 이 서버에서 나라를 맞힌 사람이 없습니다. `!나라시작`으로 시작해 보세요!", mention_author=False)
         return
     embed = discord.Embed(title="🏆 나라 맞히기 순위", description=text, color=discord.Color.green())
-    embed.set_footer(text="어려움 승리가 많은 순, 같으면 보통 승리 순")
+    embed.set_footer(text="어려움 승리가 많은 순, 같으면 보통·쉬움 승리 순")
     await target.reply(embed=embed, mention_author=False)
 
 
@@ -4347,7 +4351,8 @@ async def help_run_nara_rank(interaction):
 
 
 def nara_buttons():
-    return [HelpButton("nara_normal", "보통 시작", "🌍", discord.ButtonStyle.success, row=2),
+    return [HelpButton("nara_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
+            HelpButton("nara_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
             HelpButton("nara_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
             HelpButton("nara_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2),
             HelpButton("nara_info", "나라 정보", "📖", discord.ButtonStyle.secondary, row=2)]
@@ -4680,6 +4685,7 @@ HELP_ACTIONS = {
     "dday_del": lambda interaction: dday_choose(interaction, "del"),
     "page_game": lambda interaction: help_open_page(interaction, "game"),
     "run_nara": lambda interaction: show_nara_page(interaction),
+    "nara_easy": help_run_nara(nara.EASY),
     "nara_normal": help_run_nara(nara.NORMAL),
     "nara_hard": help_run_nara(nara.HARD),
     "nara_rank": help_run_nara_rank,
