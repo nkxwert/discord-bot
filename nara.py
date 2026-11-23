@@ -21,14 +21,14 @@ CLOSE_RATIO = 0.25  # population/area within ±25% counts as close (yellow)
 NEAR_KM = 1500  # capitals this close count as near (yellow distance)
 BOARD_ROWS = 15  # guesses drawn on the board; older ones are summarised in one line
 
-# Difficulty. 보통: the answer is a well-known country and every hint is exact.
+# Difficulty. 쉬움: the answer is a well-known country (FAMOUS); 보통: any country. Both show every hint exactly.
 # 어려움: the answer is one of the other, lesser-known countries; population and area say only
 # bigger/smaller, distance only near/far (HARD_NEAR_KM), and there are HARD_MAX_GUESSES guesses.
 # and the direction is hidden. Continent, hemisphere and landlocked stay.
-NORMAL, HARD = "normal", "hard"
-LEVEL_NAMES = {NORMAL: "보통", HARD: "어려움"}
-LEVEL_WORDS = {"": NORMAL, "보통": NORMAL, "normal": NORMAL, "쉬움": NORMAL, "어려움": HARD, "hard": HARD,
-               "어렵게": HARD, "하드": HARD}
+EASY, NORMAL, HARD = "easy", "normal", "hard"
+LEVEL_NAMES = {EASY: "쉬움", NORMAL: "보통", HARD: "어려움"}
+LEVEL_WORDS = {"": NORMAL, "보통": NORMAL, "normal": NORMAL, "쉬움": EASY, "쉽게": EASY, "easy": EASY,
+               "어려움": HARD, "hard": HARD, "어렵게": HARD, "하드": HARD}
 HARD_MAX_GUESSES = 10
 HARD_NEAR_KM = 2000
 FAMOUS = {
@@ -114,7 +114,7 @@ def josa(word, with_final, without_final):
 
 
 def level_of(text):
-    """NORMAL/HARD for what was typed after !나라시작, or None if it isn't a difficulty."""
+    """EASY/NORMAL/HARD for what was typed after !나라시작, or None if it isn't a difficulty."""
     return LEVEL_WORDS.get(text.strip().lower())
 
 
@@ -123,7 +123,10 @@ def max_guesses(level):
 
 
 def pick(level=NORMAL, rng=random):
-    pool = [code for code in countries() if (code in FAMOUS) == (level == NORMAL)]
+    if level == NORMAL:
+        pool = list(countries())
+    else:
+        pool = [code for code in countries() if (code in FAMOUS) == (level == EASY)]
     return rng.choice(sorted(pool))
 
 
@@ -243,7 +246,7 @@ def _amount_tile(draw, x, y, w, info, value_text, level):
     if info["result"] == "same":
         _tile(draw, x, y, w, GREEN_T, value_text, _fit(value_text, 18, w - 12))
         return
-    color = YELLOW_T if info["close"] and level == NORMAL else GRAY_T
+    color = YELLOW_T if info["close"] and level != HARD else GRAY_T
     mark = "▲" if info["result"] == "up" else "▼"
     _tile(draw, x, y, w, color, f"{value_text} {mark}", _fit(f"{value_text} {mark}", 18, w - 12))
 
@@ -267,7 +270,7 @@ def render_board(rows, answer=None, total=None, level=NORMAL):
     badge = LEVEL_NAMES[level]
     badge_w = cards.font(18, "kr").getlength(badge) + 24
     bx = PAD + title_w + 14
-    draw.rounded_rectangle((bx, PAD + 8, bx + badge_w, PAD + 40), radius=8, fill=RED_T if level == HARD else GREEN_T)
+    draw.rounded_rectangle((bx, PAD + 8, bx + badge_w, PAD + 40), radius=8, fill={EASY: GREEN_T, NORMAL: (88, 101, 242), HARD: RED_T}[level])
     draw.text((bx + badge_w / 2, PAD + 24), badge, font=cards.font(18, "kr"), fill=WHITE, anchor="mm")
     count = f"추측 {total}/{HARD_MAX_GUESSES}" if level == HARD else f"추측 {total}번"
     draw.text((width - PAD, PAD + 14), count, font=cards.font(22, "kr"), fill=MUTED, anchor="ra")
