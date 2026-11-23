@@ -52,7 +52,15 @@ FAMOUS = {
 @lru_cache(maxsize=1)
 def countries():
     with open(DATA_PATH, encoding="utf-8") as f:
-        return {c["code"]: c for c in json.load(f)}
+        data = {c["code"]: c for c in json.load(f)}
+    if not has_info(data):
+        print("assets/countries.json이 예전 버전입니다: !정보와 국기 이모지가 빠집니다. 새 파일로 바꿔 주세요.")
+    return data
+
+
+def has_info(data=None):
+    """False for the countries.json from before !정보 (no capital, languages, flag, ...)."""
+    return all("capital" in c for c in (data or countries()).values())
 
 
 def normalize(text):

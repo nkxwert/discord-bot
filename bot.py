@@ -4406,7 +4406,7 @@ def nara_not_found(name):
 async def nara_info_embed(country):
     summary = await wiki_summary(country["wiki"])
     text = nara.intro(summary["extract"]) if summary else ""
-    embed = discord.Embed(title=f"{country['flag']} {country['ko']} ({country['en']})",
+    embed = discord.Embed(title=f"{country.get('flag', '')} {country['ko']} ({country['en']})",
                           description=text or "-# (위키백과 소개를 지금 불러오지 못했습니다)",
                           url=summary["url"] if summary and summary["url"] else None, color=discord.Color.green())
     for name, value in nara.info_fields(country):
@@ -4426,6 +4426,9 @@ async def nara_info_command(ctx, *, name: str = ""):
     country = nara.find(name)
     if country is None:
         await ctx.reply(nara_not_found(name), mention_author=False)
+        return
+    if not nara.has_info():
+        await ctx.reply("봇의 나라 데이터 파일(assets/countries.json)이 예전 버전이라 정보를 보여 줄 수 없습니다.", mention_author=False)
         return
     async with ctx.typing():
         embed = await nara_info_embed(country)
@@ -4564,7 +4567,7 @@ async def flag_guess_command(ctx, *, name: str = ""):
             )
             total = conn.execute(f"SELECT {level} FROM flag_scores WHERE guild_id = ? AND user_id = ?",
                                  (ctx.guild.id, ctx.author.id)).fetchone()[0]
-        header = (f"🎉 {ctx.author.mention}님 정답! **{country['ko']}** {country['flag']}\n"
+        header = (f"🎉 {ctx.author.mention}님 정답! **{country['ko']}** {country.get('flag', '')}\n"
                   f"-# {ctx.author.mention}님의 {flagquiz.LEVEL_NAMES[level]} 누적 {total}개")
         await flag_next(ctx.channel, flag_game(ctx.channel.id), header)
 
@@ -4589,7 +4592,7 @@ async def flag_skip_command(ctx):
             await ctx.reply("이 채널에는 진행 중인 국기 퀴즈가 없습니다.", mention_author=False)
             return
         c = nara.countries()[game["answer"]]
-        await flag_next(ctx.channel, game, f"-# {ctx.author.mention}님이 넘겼습니다 · 정답은 {c['flag']} **{c['ko']}**{nara.josa(c['ko'], '이었', '였')}습니다.")
+        await flag_next(ctx.channel, game, f"-# {ctx.author.mention}님이 넘겼습니다 · 정답은 {c.get('flag', '')} **{c['ko']}**{nara.josa(c['ko'], '이었', '였')}습니다.")
 
 
 @bot.command(name="국기중지", aliases=["국기그만"])
@@ -4604,7 +4607,7 @@ async def flag_stop_command(ctx):
             conn.execute("DELETE FROM flag_games WHERE channel_id = ?", (ctx.channel.id,))
         c = nara.countries()[game["answer"]]
         result = flag_session_text(json.loads(game["scores"])) or "맞힌 사람이 없습니다."
-        await ctx.channel.send(f"-# {ctx.author.mention}님이 퀴즈를 멈췄습니다 · 마지막 정답은 {c['flag']} **{c['ko']}**{nara.josa(c['ko'], '이었', '였')}습니다.\n"
+        await ctx.channel.send(f"-# {ctx.author.mention}님이 퀴즈를 멈췄습니다 · 마지막 정답은 {c.get('flag', '')} **{c['ko']}**{nara.josa(c['ko'], '이었', '였')}습니다.\n"
                                f"🏁 이번에 맞힌 개수: {result}")
 
 
