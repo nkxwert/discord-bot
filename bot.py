@@ -6,6 +6,7 @@ import time
 import sqlite3
 import asyncio
 import io
+import json
 import shutil
 import tempfile
 import ipaddress
@@ -28,6 +29,7 @@ import dashboard
 import dday
 import net
 import easter_eggs
+import nara
 import shortlinks
 import stats
 import storage
@@ -335,6 +337,27 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ddays_alert ON ddays(next_alert)")
         if "celebrate" not in [row["name"] for row in conn.execute("PRAGMA table_info(ddays)")]:
             conn.execute("ALTER TABLE ddays ADD COLUMN celebrate TEXT")  # the message on the day itself
+        # 나라 맞히기: one game per channel (kept over restarts) and each server's winners.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nara_games (
+                channel_id INTEGER PRIMARY KEY,
+                guild_id INTEGER,
+                answer TEXT NOT NULL,
+                guesses TEXT NOT NULL DEFAULT '[]',
+                started_by INTEGER NOT NULL,
+                started_at REAL NOT NULL,
+                board_message_id INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nara_scores (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                wins INTEGER NOT NULL DEFAULT 0,
+                best INTEGER,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.commit()
@@ -1235,6 +1258,9 @@ def command_list_embed():
     embed.add_field(name="!일침", value="정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     embed.add_field(name="!dday [이름]", value="이 서버의 D-Day 목록을 보거나 그 날까지 남은 시간을 봅니다. "
                                               "만들기·편집·삭제는 `/도움말` → 기타 → D-Day에서 합니다.", inline=False)
+    embed.add_field(name="!나라시작 · !추측 <나라> · !포기 · !나라순위",
+                    value="나라 맞히기: 채널의 모두가 함께 비밀 나라를 맞힙니다. 추측할 때마다 대륙·인구·면적·거리·방향 힌트가 표로 나옵니다. "
+                          "`!guess`도 됩니다.", inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
                     value=f"글자를 디시 글자콘처럼 그림으로 만들어 올립니다 (최대 {textcon.MAX_CHARS}자). 메시지를 넣으면 같이 보냅니다.", inline=False)
     # Divider between the feature commands and contacting the developer (embeds have no real separator).
@@ -3099,7 +3125,7 @@ HELP_CATEGORIES = {
     "uptime": ("🖥️", "서버 업타임", ["add", "uptime", "list", "delete"]),
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
-    "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
+    "etc": ("🎲", "기타", ["fortune", "ilchim", "dday", "nara"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -3123,6 +3149,10 @@ HELP_COMMANDS = {
              "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
+    "nara": ("나라 맞히기", "!나라시작", "`!나라시작` · `!추측 <나라>` (`!guess`도 됨) · `!포기` · `!나라순위`\n"
+             "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다. 횟수 제한은 없고, 진행 중인 판이 있으면 그 판을 이어서 합니다.\n"
+             "추측할 때마다 표에 한 줄씩 쌓입니다: 대륙·반구·내륙국은 같으면 🟩, 인구·면적은 ▲(정답이 더 큼)/▼와 비슷하면 🟨, "
+             "거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다."),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -3136,7 +3166,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -4074,6 +4104,168 @@ async def before_dday_alerts():
     await bot.wait_until_ready()
 
 
+# ---------------------------------------------------------------- 나라 맞히기
+
+NARA_FILE = "나라맞히기.png"
+_nara_locks = {}  # channel id -> lock, so two guesses at once don't both post a board
+
+
+def nara_lock(channel_id):
+    lock = _nara_locks.get(channel_id)
+    if lock is None:
+        if len(_nara_locks) >= 300:
+            for key in [k for k, v in _nara_locks.items() if not v.locked()]:
+                del _nara_locks[key]
+        lock = _nara_locks[channel_id] = asyncio.Lock()
+    return lock
+
+
+def nara_game(channel_id):
+    with connect_db() as conn:
+        return conn.execute("SELECT * FROM nara_games WHERE channel_id = ?", (channel_id,)).fetchone()
+
+
+async def nara_post_board(channel, answer, guesses, content, old_message_id=None, finished=False):
+    """Post the board (the last BOARD_ROWS guesses) under content, then delete the previous board so the
+    newest one is always at the bottom of the chat. Returns the new message."""
+    rows = [nara.compare(code, answer) for code, _ in guesses[-nara.BOARD_ROWS:]]
+    png = await asyncio.to_thread(nara.render_board, rows, answer if finished else None, len(guesses))
+    message = await channel.send(content, file=discord.File(io.BytesIO(png), NARA_FILE))
+    if old_message_id:
+        try:
+            await channel.get_partial_message(old_message_id).delete()
+        except discord.HTTPException:
+            pass  # already deleted by someone
+    return message
+
+
+async def nara_start(channel, guild, user):
+    """Start a game in this channel, or show the one already going on there."""
+    async with nara_lock(channel.id):
+        game = nara_game(channel.id)
+        header = f"-# {user.mention}님의 요청 · 나라 맞히기"
+        if game:
+            guesses = json.loads(game["guesses"])
+            content = (f"{header}\n이 채널에서 진행 중인 판을 이어서 합니다. (지금까지 추측 {len(guesses)}번)\n"
+                       "`!추측 <나라>`로 추측하세요. 포기: `!포기`")
+            message = await nara_post_board(channel, game["answer"], guesses, content, game["board_message_id"])
+            with connect_db() as conn:
+                conn.execute("UPDATE nara_games SET board_message_id = ? WHERE channel_id = ?", (message.id, channel.id))
+            return
+        answer = nara.pick()
+        content = (f"{header}\n🌍 **나라 맞히기** 새 판! 봇이 나라 하나를 골랐습니다.\n"
+                   "누구나 `!추측 <나라>`로 추측할 수 있습니다 (`!guess`도 됨). 횟수 제한 없음 · 포기: `!포기`")
+        message = await nara_post_board(channel, answer, [], content)
+        with connect_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO nara_games(channel_id, guild_id, answer, guesses, started_by, started_at, "
+                "board_message_id) VALUES (?, ?, ?, '[]', ?, ?, ?)",
+                (channel.id, guild.id if guild else None, answer, user.id, time.time(), message.id),
+            )
+
+
+@bot.command(name="나라시작", aliases=["나라맞히기", "나라"])
+@commands.guild_only()
+async def nara_start_command(ctx):
+    await nara_start(ctx.channel, ctx.guild, ctx.author)
+
+
+@bot.command(name="guess", aliases=["추측"])
+@commands.guild_only()
+async def nara_guess_command(ctx, *, name: str = ""):
+    name = name.strip()
+    if not name:
+        await ctx.reply("`!추측 <나라 이름>`처럼 써 주세요. 예: `!추측 프랑스`", mention_author=False)
+        return
+    country = nara.find(name)
+    if country is None:
+        hints = nara.suggest(name)
+        hint = f" 혹시 {', '.join(f'**{h}**' for h in hints)}인가요?" if hints else ""
+        await ctx.reply(f"`{name[:50]}`라는 나라를 찾지 못했습니다.{hint}\n-# 이 추측은 횟수에 들어가지 않습니다.",
+                        mention_author=False)
+        return
+    async with nara_lock(ctx.channel.id):
+        game = nara_game(ctx.channel.id)
+        if game is None:
+            await ctx.reply("이 채널에는 진행 중인 판이 없습니다. `!나라시작`으로 시작해 주세요.", mention_author=False)
+            return
+        guesses = json.loads(game["guesses"])
+        code, answer = country["code"], game["answer"]
+        if any(done == code for done, _ in guesses):
+            await ctx.reply(f"**{country['ko']}**{nara.josa(country['ko'], '은', '는')} 이미 추측한 나라입니다.", mention_author=False)
+            return
+        guesses.append([code, ctx.author.id])
+        header = f"-# {ctx.author.mention}님의 추측 · {country['ko']}"
+        if code == answer:
+            content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{country['ko']}**입니다. "
+                       f"(모두 합쳐 추측 {len(guesses)}번)\n-# {nara.summary(answer)} · 새 판: `!나라시작` · 순위: `!나라순위`")
+            await nara_post_board(ctx.channel, answer, guesses, content, game["board_message_id"], finished=True)
+            with connect_db() as conn:
+                conn.execute("DELETE FROM nara_games WHERE channel_id = ?", (ctx.channel.id,))
+                conn.execute(
+                    "INSERT INTO nara_scores(guild_id, user_id, wins, best) VALUES (?, ?, 1, ?) "
+                    "ON CONFLICT(guild_id, user_id) DO UPDATE SET wins = wins + 1, best = MIN(COALESCE(best, ?), ?)",
+                    (ctx.guild.id, ctx.author.id, len(guesses), len(guesses), len(guesses)),
+                )
+            return
+        content = f"{header}\n-# `!추측 <나라>`로 계속 · 포기: `!포기`"
+        message = await nara_post_board(ctx.channel, answer, guesses, content, game["board_message_id"])
+        with connect_db() as conn:
+            conn.execute("UPDATE nara_games SET guesses = ?, board_message_id = ? WHERE channel_id = ?",
+                         (json.dumps(guesses), message.id, ctx.channel.id))
+
+
+@bot.command(name="포기", aliases=["나라포기"])
+@commands.guild_only()
+async def nara_giveup_command(ctx):
+    async with nara_lock(ctx.channel.id):
+        game = nara_game(ctx.channel.id)
+        if game is None:
+            await ctx.reply("이 채널에는 진행 중인 나라 맞히기 판이 없습니다.", mention_author=False)
+            return
+        guesses, answer = json.loads(game["guesses"]), game["answer"]
+        content = (f"-# {ctx.author.mention}님이 포기했습니다 · 나라 맞히기\n"
+                   f"정답은 **{nara.countries()[answer]['ko']}**였습니다. (추측 {len(guesses)}번)\n"
+                   f"-# {nara.summary(answer)} · 새 판: `!나라시작`")
+        await nara_post_board(ctx.channel, answer, guesses, content, game["board_message_id"], finished=True)
+        with connect_db() as conn:
+            conn.execute("DELETE FROM nara_games WHERE channel_id = ?", (ctx.channel.id,))
+
+
+def nara_ranking_text(guild_id, limit=10):
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT user_id, wins, best FROM nara_scores WHERE guild_id = ? ORDER BY wins DESC, best ASC LIMIT ?",
+            (guild_id, limit),
+        ).fetchall()
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · **{r['wins']}승** · 최소 {r['best']}번 만에"
+                     for i, r in enumerate(rows, 1))
+
+
+@bot.command(name="나라순위", aliases=["나라랭킹"])
+@commands.guild_only()
+async def nara_ranking_command(ctx):
+    text = nara_ranking_text(ctx.guild.id)
+    if not text:
+        await ctx.reply("아직 이 서버에서 나라를 맞힌 사람이 없습니다. `!나라시작`으로 시작해 보세요!", mention_author=False)
+        return
+    embed = discord.Embed(title="🌍 나라 맞히기 순위", description=text, color=discord.Color.green())
+    embed.set_footer(text="맞힌 횟수 순 · 최소: 그 판에서 모두 합쳐 몇 번 만에 맞혔는지")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+async def help_run_nara(interaction):
+    if interaction.guild is None or interaction.channel is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    ranking = nara_ranking_text(interaction.guild.id, limit=5)
+    await show_help(interaction, page="etc", selected="nara",
+                    details=f"**이 서버 순위**\n{ranking}" if ranking else "아직 이 서버에서 나라를 맞힌 사람이 없습니다.")
+    ctx = HelpContext(interaction, "나라 맞히기")
+    await run_from_help(ctx, nara_start(interaction.channel, interaction.guild, interaction.user))
+
+
 HELP_ACTIONS = {
     "home": lambda interaction: show_help(interaction),
     "commands": lambda interaction: show_help(interaction, page="commands"),
@@ -4092,6 +4284,7 @@ HELP_ACTIONS = {
     "dday_new": lambda interaction: dday_open_form(interaction),
     "dday_edit": lambda interaction: dday_choose(interaction, "edit"),
     "dday_del": lambda interaction: dday_choose(interaction, "del"),
+    "run_nara": help_run_nara,
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,
