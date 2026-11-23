@@ -21,6 +21,33 @@ CLOSE_RATIO = 0.25  # population/area within ±25% counts as close (yellow)
 NEAR_KM = 1500  # capitals this close count as near (yellow distance)
 BOARD_ROWS = 15  # guesses drawn on the board; older ones are summarised in one line
 
+# Difficulty. 보통: the answer is a well-known country and every hint is exact.
+# 어려움: the answer is one of the other, lesser-known countries; population and area say only
+# bigger/smaller, distance only near/far (HARD_NEAR_KM), and there are HARD_MAX_GUESSES guesses.
+# Continent, hemisphere, landlocked and the direction arrow stay, so someone who knows the map can solve it.
+NORMAL, HARD = "normal", "hard"
+LEVEL_NAMES = {NORMAL: "보통", HARD: "어려움"}
+LEVEL_WORDS = {"": NORMAL, "보통": NORMAL, "normal": NORMAL, "쉬움": NORMAL, "어려움": HARD, "hard": HARD,
+               "어렵게": HARD, "하드": HARD}
+HARD_MAX_GUESSES = 10
+HARD_NEAR_KM = 2000
+FAMOUS = {
+    # 아시아
+    "KOR", "JPN", "CHN", "TWN", "PRK", "MNG", "VNM", "THA", "PHL", "IDN", "MYS", "SGP", "IND", "PAK", "BGD",
+    "NPL", "KHM", "LKA", "KAZ", "UZB", "AFG",
+    # 중동
+    "TUR", "IRN", "IRQ", "SAU", "ARE", "ISR", "QAT", "SYR",
+    # 유럽
+    "GBR", "FRA", "DEU", "ITA", "ESP", "PRT", "NLD", "BEL", "CHE", "AUT", "SWE", "NOR", "DNK", "FIN", "ISL",
+    "IRL", "POL", "CZE", "HUN", "GRC", "RUS", "UKR", "ROU", "HRV",
+    # 아프리카
+    "EGY", "ZAF", "NGA", "KEN", "ETH", "MAR", "GHA", "DZA", "TZA", "MDG",
+    # 아메리카
+    "USA", "CAN", "MEX", "CUB", "JAM", "BRA", "ARG", "CHL", "COL", "PER", "VEN", "URY", "BOL", "ECU",
+    # 오세아니아
+    "AUS", "NZL", "FJI",
+}
+
 
 @lru_cache(maxsize=1)
 def countries():
@@ -86,8 +113,18 @@ def josa(word, with_final, without_final):
     return with_final if 0 <= code < 11172 and code % 28 else without_final
 
 
-def pick(rng=random):
-    return rng.choice(sorted(countries()))
+def level_of(text):
+    """NORMAL/HARD for what was typed after !나라시작, or None if it isn't a difficulty."""
+    return LEVEL_WORDS.get(text.strip().lower())
+
+
+def max_guesses(level):
+    return HARD_MAX_GUESSES if level == HARD else None
+
+
+def pick(level=NORMAL, rng=random):
+    pool = [code for code in countries() if (code in FAMOUS) == (level == NORMAL)]
+    return rng.choice(sorted(pool))
 
 
 # ------------------------------------------------------------------ comparing a guess with the answer
@@ -200,18 +237,19 @@ def _arrow(draw, cx, cy, angle, length=34, color=WHITE):
     draw.polygon([tip, (base[0] - dy * 9, base[1] + dx * 9), (base[0] + dy * 9, base[1] - dx * 9)], fill=color)
 
 
-def _amount_tile(draw, x, y, w, info, value_text):
+def _amount_tile(draw, x, y, w, info, value_text, level):
     if info["result"] == "same":
         _tile(draw, x, y, w, GREEN_T, value_text, _fit(value_text, 18, w - 12))
         return
-    color = YELLOW_T if info["close"] else GRAY_T
+    color = YELLOW_T if info["close"] and level == NORMAL else GRAY_T
     mark = "▲" if info["result"] == "up" else "▼"
     _tile(draw, x, y, w, color, f"{value_text} {mark}", _fit(f"{value_text} {mark}", 18, w - 12))
 
 
-def render_board(rows, answer=None, total=None):
+def render_board(rows, answer=None, total=None, level=NORMAL):
     """PNG of the guesses so far (each from compare()), newest last. answer: code to show at the bottom when
-    the game has ended. total: how many guesses there were (more than the rows drawn when long)."""
+    the game has ended. total: how many guesses there were (more than the rows drawn when long).
+    level: HARD shows fewer details (see the top of this file)."""
     total = total or len(rows)
     hidden = total - len(rows)
     width = PAD * 2 + sum(w for _, w in COLUMNS) + GAP * (len(COLUMNS) - 1)
@@ -223,7 +261,14 @@ def render_board(rows, answer=None, total=None):
     image = Image.new("RGB", (width, height), BG)
     draw = ImageDraw.Draw(image)
     draw.text((PAD, PAD + 4), "나라 맞히기", font=cards.font(33, "kr"), fill=WHITE)
-    draw.text((width - PAD, PAD + 14), f"추측 {total}번", font=cards.font(22, "kr"), fill=MUTED, anchor="ra")
+    title_w = cards.font(33, "kr").getlength("나라 맞히기")
+    badge = LEVEL_NAMES[level]
+    badge_w = cards.font(18, "kr").getlength(badge) + 24
+    bx = PAD + title_w + 14
+    draw.rounded_rectangle((bx, PAD + 8, bx + badge_w, PAD + 40), radius=8, fill=RED_T if level == HARD else GREEN_T)
+    draw.text((bx + badge_w / 2, PAD + 24), badge, font=cards.font(18, "kr"), fill=WHITE, anchor="mm")
+    count = f"추측 {total}/{HARD_MAX_GUESSES}" if level == HARD else f"추측 {total}번"
+    draw.text((width - PAD, PAD + 14), count, font=cards.font(22, "kr"), fill=MUTED, anchor="ra")
 
     y = PAD + head_h
     x = PAD
@@ -252,15 +297,16 @@ def render_board(rows, answer=None, total=None):
         _tile(draw, x, y, w, GREEN_T if row["continent"] else RED_T, c["continent"], _fit(c["continent"], 18, w - 10))
         x += w + GAP
         w = next(cells)
-        _amount_tile(draw, x, y, w, row["population"], korean_number(c["population"]))
+        _amount_tile(draw, x, y, w, row["population"], korean_number(c["population"]), level)
         x += w + GAP
         w = next(cells)
-        _amount_tile(draw, x, y, w, row["area"], area_text(c["area"]))
+        _amount_tile(draw, x, y, w, row["area"], area_text(c["area"]), level)
         x += w + GAP
         w = next(cells)
         km = row["distance"]
-        color = GREEN_T if row["correct"] else YELLOW_T if km <= NEAR_KM else GRAY_T
-        _tile(draw, x, y, w, color, "정답" if row["correct"] else f"{km:,}km", _fit(f"{km:,}km", 18, w - 10))
+        near = km <= (HARD_NEAR_KM if level == HARD else NEAR_KM)
+        text = "정답" if row["correct"] else ("가까움" if near else "멀음") if level == HARD else f"{km:,}km"
+        _tile(draw, x, y, w, GREEN_T if row["correct"] else YELLOW_T if near else GRAY_T, text, _fit(text, 18, w - 10))
         x += w + GAP
         w = next(cells)
         if row["correct"]:
@@ -289,8 +335,12 @@ def render_board(rows, answer=None, total=None):
         text = f"정답: {a['ko']} ({a['en']})"
         draw.text((width / 2, y + 25), text, font=cards.font(_fit(text, 24, width - PAD * 4), "kr"), fill=WHITE, anchor="mm")
         y += 50 + GAP
-    legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  노란색: 인구·면적 ±{round(CLOSE_RATIO * 100)}% 이내, "
-              f"거리 {NEAR_KM:,}km 이내  ·  거리·방향은 수도 기준")
+    if level == HARD:
+        legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  가까움: 수도끼리 {HARD_NEAR_KM:,}km 이내  ·  "
+                  f"방향은 수도 기준  ·  {HARD_MAX_GUESSES}번 안에 맞히기")
+    else:
+        legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  노란색: 인구·면적 ±{round(CLOSE_RATIO * 100)}% 이내, "
+                  f"거리 {NEAR_KM:,}km 이내  ·  거리·방향은 수도 기준")
     draw.text((width / 2, y + 16), legend, font=cards.font(_fit(legend, 14, width - PAD * 2), "kr"), fill=MUTED, anchor="mm")
 
     out = io.BytesIO()
