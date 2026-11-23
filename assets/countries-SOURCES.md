@@ -1,0 +1,10 @@
+# countries.json 출처
+
+나라 맞히기(`nara.py`)가 쓰는 197개 나라(UN 회원국 + 대만, 코소보, 팔레스타인, 바티칸) 데이터입니다.
+
+- 나라 이름(한글·영어·별칭), 대륙, 면적, 내륙국 여부: [world-countries](https://github.com/mledoze/countries) (Mohammed Le Doze, ODbL 1.0)
+- 인구(가장 최근 해), 수도 좌표: [World Bank Open Data](https://data.worldbank.org/) (CC BY 4.0)
+- 대만·바티칸의 인구와 수도 좌표, 팔레스타인의 수도 좌표, 일부 한글 이름과 별칭은 직접 보탰습니다.
+
+This file is a Database (countries.json) made available under the Open Database License (ODbL 1.0),
+built from world-countries (ODbL) and World Bank data (CC BY 4.0).

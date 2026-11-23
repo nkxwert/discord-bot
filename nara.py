@@ -1,0 +1,299 @@
+"""나라 맞히기: guess a secret country; every guess shows how it compares with the answer.
+
+Pure game logic and the board picture; bot.py keeps the games (one per channel) and the scores.
+Country data: assets/countries.json (197 countries; see assets/countries-SOURCES.md), about 50KB in memory."""
+import io
+import json
+import math
+import random
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from functools import lru_cache
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+
+import cards
+
+DATA_PATH = Path(__file__).parent / "assets" / "countries.json"
+CLOSE_RATIO = 0.25  # population/area within ±25% counts as close (yellow)
+NEAR_KM = 1500  # capitals this close count as near (yellow distance)
+BOARD_ROWS = 15  # guesses drawn on the board; older ones are summarised in one line
+
+
+@lru_cache(maxsize=1)
+def countries():
+    with open(DATA_PATH, encoding="utf-8") as f:
+        return {c["code"]: c for c in json.load(f)}
+
+
+def normalize(text):
+    """Lower case, accents and spaces/punctuation removed: 'Côte d’Ivoire' -> 'cotedivoire'."""
+    text = unicodedata.normalize("NFKD", text.lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return unicodedata.normalize("NFC", re.sub(r"[\s.\-'’‘`,()·]", "", text))
+
+
+@lru_cache(maxsize=1)
+def _index():
+    index = {}
+    for code, c in countries().items():
+        for name in (c["ko"], *c["names"]):
+            index.setdefault(normalize(name), code)
+    return index
+
+
+def find(text):
+    """The country with this name (Korean, English, common aliases or code), or None."""
+    return countries().get(_index().get(normalize(text)))
+
+
+def _jamo(text):
+    """Hangul split into letters, so '프랑스' and '프랑서' are judged nearly the same."""
+    out = []
+    for ch in text:
+        code = ord(ch) - 0xAC00
+        if 0 <= code < 11172:
+            out += [chr(0x1100 + code // 588), chr(0x1161 + code % 588 // 28)]
+            if code % 28:
+                out.append(chr(0x11A7 + code % 28))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def suggest(text, limit=3):
+    """Korean names of the countries whose names look most like the text (for typos)."""
+    target = _jamo(normalize(text))
+    if not target:
+        return []
+    best = {}
+    for key, code in _index().items():
+        score = SequenceMatcher(None, target, _jamo(key)).ratio()
+        if key.startswith(normalize(text)) or normalize(text) in key:
+            score = max(score, 0.75)
+        if score > best.get(code, 0):
+            best[code] = score
+    ranked = sorted((s, code) for code, s in best.items() if s >= 0.6)[::-1]
+    # Only names nearly as close as the best one: '프량스' -> 프랑스, not 키프로스 as well.
+    return [countries()[code]["ko"] for s, code in ranked[:limit] if s >= ranked[0][0] - 0.08]
+
+
+def josa(word, with_final, without_final):
+    """The particle that fits the word: josa('프랑스', '은', '는') -> '는'"""
+    code = ord(word[-1]) - 0xAC00 if word else -1
+    return with_final if 0 <= code < 11172 and code % 28 else without_final
+
+
+def pick(rng=random):
+    return rng.choice(sorted(countries()))
+
+
+# ------------------------------------------------------------------ comparing a guess with the answer
+
+def distance_km(a, b):
+    lat1, lon1, lat2, lon2 = map(math.radians, (a["lat"], a["lon"], b["lat"], b["lon"]))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    return round(2 * 6371 * math.asin(min(1, math.sqrt(h))))
+
+
+def direction(a, b):
+    """Map direction from a's capital to b's, in degrees (0 = east, 90 = north), going the shorter way
+    round the date line; None for the same place."""
+    dlat = b["lat"] - a["lat"]
+    dlon = (b["lon"] - a["lon"] + 540) % 360 - 180
+    if abs(dlat) < 0.01 and abs(dlon) < 0.01:
+        return None
+    return round(math.degrees(math.atan2(dlat, dlon * math.cos(math.radians((a["lat"] + b["lat"]) / 2)))) / 45) * 45 % 360
+
+
+def _amount(guess, answer):
+    """'same', 'up' (the answer is bigger), 'down', with close=True within ±CLOSE_RATIO."""
+    if guess == answer:
+        return {"result": "same", "close": True}
+    return {"result": "up" if answer > guess else "down", "close": abs(answer - guess) <= CLOSE_RATIO * guess}
+
+
+def hemisphere(c):
+    return "북반구" if c["lat"] >= 0 else "남반구"
+
+
+def compare(guess_code, answer_code):
+    g, a = countries()[guess_code], countries()[answer_code]
+    return {
+        "code": guess_code,
+        "correct": guess_code == answer_code,
+        "continent": g["continent"] == a["continent"],
+        "population": _amount(g["population"], a["population"]),
+        "area": _amount(g["area"], a["area"]),
+        "distance": distance_km(g, a),
+        "direction": direction(g, a),
+        "hemisphere": hemisphere(g) == hemisphere(a),
+        "landlocked": g["landlocked"] == a["landlocked"],
+    }
+
+
+# ------------------------------------------------------------------ text
+
+def korean_number(n):
+    """5168만, 1억 4351만, 800"""
+    n = round(n)
+    if n >= 100_000_000:
+        eok, man = divmod(n, 100_000_000)
+        return f"{eok}억 {man // 10_000}만" if man >= 10_000 else f"{eok}억"
+    if n >= 10_000:
+        return f"{n // 10_000:,}만"
+    return f"{n:,}"
+
+
+def area_text(km2):
+    return f"{korean_number(km2)}㎢" if km2 >= 10_000 else f"{km2:,.0f}㎢"
+
+
+def summary(code):
+    """One line about the answer, for when it is revealed."""
+    c = countries()[code]
+    return (f"{c['continent']} · 인구 {korean_number(c['population'])}명 · 면적 {area_text(c['area'])} · "
+            f"{'내륙국' if c['landlocked'] else '바다에 닿은 나라'}")
+
+
+# ------------------------------------------------------------------ board picture
+
+BG = (43, 45, 49)
+PANEL = (30, 31, 34)
+GREEN_T = (59, 165, 93)
+YELLOW_T = (201, 160, 40)
+RED_T = (165, 60, 60)
+GRAY_T = (78, 80, 88)
+WHITE = (242, 243, 245)
+MUTED = (148, 155, 164)
+COLUMNS = [("나라", 190), ("대륙", 112), ("인구", 130), ("면적", 130), ("거리", 120), ("방향", 76), ("반구", 92),
+           ("내륙국", 92)]
+CELL_H, GAP, PAD = 56, 6, 20
+
+
+def _tile(draw, x, y, w, color, text=None, size=20, sub=None):
+    draw.rounded_rectangle((x, y, x + w, y + CELL_H), radius=8, fill=color)
+    if text is not None:
+        face = cards.font(size, "kr")
+        cy = y + CELL_H / 2 - (8 if sub else 0)
+        draw.text((x + w / 2, cy), text, font=face, fill=WHITE, anchor="mm")
+        if sub:
+            draw.text((x + w / 2, y + CELL_H / 2 + 13), sub, font=cards.font(11, "kr"), fill=WHITE, anchor="mm")
+
+
+def _fit(text, size, width):
+    while size > 11 and cards.font(size, "kr").getlength(text) > width:
+        size -= 1
+    return size
+
+
+def _arrow(draw, cx, cy, angle, length=34, color=WHITE):
+    """An arrow pointing at angle degrees (0 = east, 90 = north)."""
+    rad = math.radians(angle)
+    dx, dy = math.cos(rad), -math.sin(rad)
+    tail = (cx - dx * length / 2, cy - dy * length / 2)
+    tip = (cx + dx * length / 2, cy + dy * length / 2)
+    base = (tip[0] - dx * 13, tip[1] - dy * 13)
+    draw.line((tail, base), fill=color, width=5)
+    draw.polygon([tip, (base[0] - dy * 9, base[1] + dx * 9), (base[0] + dy * 9, base[1] - dx * 9)], fill=color)
+
+
+def _amount_tile(draw, x, y, w, info, value_text):
+    if info["result"] == "same":
+        _tile(draw, x, y, w, GREEN_T, value_text, _fit(value_text, 18, w - 12))
+        return
+    color = YELLOW_T if info["close"] else GRAY_T
+    mark = "▲" if info["result"] == "up" else "▼"
+    _tile(draw, x, y, w, color, f"{value_text} {mark}", _fit(f"{value_text} {mark}", 18, w - 12))
+
+
+def render_board(rows, answer=None, total=None):
+    """PNG of the guesses so far (each from compare()), newest last. answer: code to show at the bottom when
+    the game has ended. total: how many guesses there were (more than the rows drawn when long)."""
+    total = total or len(rows)
+    hidden = total - len(rows)
+    width = PAD * 2 + sum(w for _, w in COLUMNS) + GAP * (len(COLUMNS) - 1)
+    head_h = 70
+    extra = 34 if hidden else 0
+    foot = 64 if answer else 0
+    legend_h = 30
+    height = PAD + head_h + 30 + extra + max(1, len(rows)) * (CELL_H + GAP) + foot + legend_h + PAD
+    image = Image.new("RGB", (width, height), BG)
+    draw = ImageDraw.Draw(image)
+    draw.text((PAD, PAD + 4), "나라 맞히기", font=cards.font(33, "kr"), fill=WHITE)
+    draw.text((width - PAD, PAD + 14), f"추측 {total}번", font=cards.font(22, "kr"), fill=MUTED, anchor="ra")
+
+    y = PAD + head_h
+    x = PAD
+    for title, w in COLUMNS:
+        draw.text((x + w / 2, y + 10), title, font=cards.font(16, "kr"), fill=MUTED, anchor="mm")
+        x += w + GAP
+    y += 30
+    if hidden:
+        draw.text((width / 2, y + 12), f"··· 앞의 추측 {hidden}개는 생략 ···", font=cards.font(14, "kr"), fill=MUTED, anchor="mm")
+        y += extra
+    if not rows:
+        draw.rounded_rectangle((PAD, y, width - PAD, y + CELL_H), radius=8, fill=PANEL)
+        draw.text((width / 2, y + CELL_H / 2), "!추측 <나라 이름> 으로 첫 추측을 해 보세요", font=cards.font(18, "kr"),
+                  fill=MUTED, anchor="mm")
+        y += CELL_H + GAP
+
+    data = countries()
+    for row in rows:
+        c = data[row["code"]]
+        x = PAD
+        cells = iter(w for _, w in COLUMNS)
+        w = next(cells)
+        _tile(draw, x, y, w, GREEN_T if row["correct"] else PANEL, c["ko"], _fit(c["ko"], 20, w - 14))
+        x += w + GAP
+        w = next(cells)
+        _tile(draw, x, y, w, GREEN_T if row["continent"] else RED_T, c["continent"], _fit(c["continent"], 18, w - 10))
+        x += w + GAP
+        w = next(cells)
+        _amount_tile(draw, x, y, w, row["population"], korean_number(c["population"]))
+        x += w + GAP
+        w = next(cells)
+        _amount_tile(draw, x, y, w, row["area"], area_text(c["area"]))
+        x += w + GAP
+        w = next(cells)
+        km = row["distance"]
+        color = GREEN_T if row["correct"] else YELLOW_T if km <= NEAR_KM else GRAY_T
+        _tile(draw, x, y, w, color, "정답" if row["correct"] else f"{km:,}km", _fit(f"{km:,}km", 18, w - 10))
+        x += w + GAP
+        w = next(cells)
+        if row["correct"]:
+            _tile(draw, x, y, w, GREEN_T)
+            cx, cy = x + w / 2, y + CELL_H / 2
+            draw.line(((cx - 12, cy), (cx - 3, cy + 9), (cx + 13, cy - 9)), fill=WHITE, width=5, joint="curve")
+        elif row["direction"] is None:
+            _tile(draw, x, y, w, GRAY_T, "·", 22)
+        else:
+            _tile(draw, x, y, w, GRAY_T)
+            _arrow(draw, x + w / 2, y + CELL_H / 2, row["direction"])
+        x += w + GAP
+        w = next(cells)
+        hemi = hemisphere(c)
+        _tile(draw, x, y, w, GREEN_T if row["hemisphere"] else RED_T, hemi, 18)
+        x += w + GAP
+        w = next(cells)
+        land = "내륙국" if c["landlocked"] else "아님"
+        _tile(draw, x, y, w, GREEN_T if row["landlocked"] else RED_T, land, 18)
+        y += CELL_H + GAP
+
+    if answer:
+        a = data[answer]
+        y += 8
+        draw.rounded_rectangle((PAD, y, width - PAD, y + 50), radius=8, fill=PANEL)
+        text = f"정답: {a['ko']} ({a['en']})"
+        draw.text((width / 2, y + 25), text, font=cards.font(_fit(text, 24, width - PAD * 4), "kr"), fill=WHITE, anchor="mm")
+        y += 50 + GAP
+    legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  노란색: 인구·면적 ±{round(CLOSE_RATIO * 100)}% 이내, "
+              f"거리 {NEAR_KM:,}km 이내  ·  거리·방향은 수도 기준")
+    draw.text((width / 2, y + 16), legend, font=cards.font(_fit(legend, 14, width - PAD * 2), "kr"), fill=MUTED, anchor="mm")
+
+    out = io.BytesIO()
+    image.save(out, "PNG", optimize=True)
+    image.close()
+    return out.getvalue()
