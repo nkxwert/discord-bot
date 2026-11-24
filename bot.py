@@ -4741,6 +4741,10 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
 
 async def quiz_start_command(q, ctx, options):
     parsed = quiz.parse_start(options)
+    if q is CAPITAL_QUIZ and not nara.has_info():
+        await ctx.reply("봇의 나라 데이터 파일(assets/countries.json)이 예전 버전이라 수도 맞히기를 할 수 없습니다.",
+                        mention_author=False)
+        return
     if parsed and q is ANIME_QUIZ and parsed[0] == quiz.HARD:
         await ctx.reply("애니캐 맞히기는 `쉬움`과 `보통`만 있습니다. 예: `!캐릭시작 쉬움 20`", mention_author=False)
         return
