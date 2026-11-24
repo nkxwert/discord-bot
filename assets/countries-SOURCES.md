@@ -12,3 +12,4 @@
 This file is a Database (countries.json) made available under the Open Database License (ODbL 1.0),
 built from world-countries (ODbL) and World Bank data (CC BY 4.0).
 - 국기 맞히기의 국기 그림(`assets/flags/*.png`, 가로 640px): [flagcdn.com](https://flagcdn.com/) (국기 그림은 퍼블릭 도메인)
+- 수도 맞히기의 정답 표기(`capitals`, `capital_names`): Wikidata의 수도 이름(한글·영어)과 world-countries의 영어 이름에, 흔히 쓰는 다른 표기(북경, 동경, 타이페이 등)와 수도가 여럿인 나라의 목록을 직접 보탰습니다. 평양·도쿄·베이징·쿠웨이트시티·야렌은 흔히 쓰는 이름으로 표시합니다.

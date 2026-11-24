@@ -98,15 +98,24 @@ def _jamo(text):
     return "".join(out)
 
 
+@lru_cache(maxsize=1)
+def _jamo_index():
+    """[(name, name in letters, code)], made once so a typo check doesn't split every name again."""
+    return [(key, _jamo(key), code) for key, code in _index().items()]
+
+
 def suggest(text, limit=3):
     """Korean names of the countries whose names look most like the text (for typos)."""
-    target = _jamo(normalize(text))
+    typed = normalize(text)
+    target = _jamo(typed)
     if not target:
         return []
+    matcher = SequenceMatcher(None, "", target)  # the typed text is the cached side; names are swapped in
     best = {}
-    for key, code in _index().items():
-        score = SequenceMatcher(None, target, _jamo(key)).ratio()
-        if key.startswith(normalize(text)) or normalize(text) in key:
+    for key, letters, code in _jamo_index():
+        matcher.set_seq1(letters)
+        score = matcher.ratio()
+        if typed in key:
             score = max(score, 0.75)
         if score > best.get(code, 0):
             best[code] = score
