@@ -130,6 +130,6 @@ def render(text):
     if scale < 1:
         image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.LANCZOS)
     out = io.BytesIO()
-    image.save(out, "PNG", optimize=True)
+    image.save(out, "PNG", compress_level=6)  # optimize=True was ~13x slower for about 3% smaller
     image.close()
     return out.getvalue()
