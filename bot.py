@@ -394,6 +394,8 @@ def init_db():
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
+        # 애니캐 맞히기: the works each server chose on the 작품 고르기 page (no row: all works).
+        conn.execute("CREATE TABLE IF NOT EXISTS anime_works (guild_id INTEGER PRIMARY KEY, works TEXT NOT NULL)")
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.commit()
@@ -3260,7 +3262,8 @@ HELP_COMMANDS = {
               "**명령어**\n"
               "`!캐릭시작 [쉬움|보통] [문제 수]` 시작 (기본 10문제, 최대 50)\n"
               "`!캐릭 <이름>` 답하기 · `!힌트` 작품 → 한 번 더 치면 초성\n"
-              "`!캐릭스킵` 넘기기 · `!캐릭중지` 그만 · `!캐릭순위` 순위\n\n"
+              "`!캐릭스킵` 넘기기 · `!캐릭중지` 그만 · `!캐릭순위` 순위\n"
+              "`!캐릭설정` 이 서버에서 나올 작품 고르기 (DM으로 10분짜리 링크)\n\n"
               "**난이도**\n"
               "🟢 쉬움 — 누구나 아는 대표 캐릭터\n"
               "🌍 보통 — 52개 작품의 캐릭터 약 300명\n\n"
@@ -4714,12 +4717,29 @@ async def quiz_next(q, channel, game, header):
         await channel.send(f"{header}\n🏁 **{q.title} · {game['total']}문제 끝!**\n-# {quiz_result_line(game)}")
         return
     recent = json.loads(game["recent"])
-    answer = quiz.pick(game["level"], recent, q.key)
+    answer = quiz.pick(game["level"], recent, q.key, quiz_works(q, game["guild_id"]))
     with connect_db() as conn:
         conn.execute(f"UPDATE {q.table}_games SET answer = ?, number = number + 1, recent = ?, hinted = 0 "
                      "WHERE channel_id = ?",
                      (answer, json.dumps((recent + [answer])[-QUIZ_RECENT:]), channel.id))
     await quiz_post_question(q, channel, quiz_game(q, channel.id), header)
+
+
+def anime_works_of(guild_id):
+    """The works this server chose for 애니캐 맞히기 (a set), or None for all."""
+    if not guild_id:
+        return None
+    with connect_db() as conn:
+        row = conn.execute("SELECT works FROM anime_works WHERE guild_id = ?", (guild_id,)).fetchone()
+    if not row:
+        return None
+    known = {c["work"] for c in quiz.anime().values()}
+    works = set(json.loads(row["works"])) & known  # a work dropped from the list later is ignored
+    return works or None
+
+
+def quiz_works(q, guild_id):
+    return anime_works_of(guild_id) if q is ANIME_QUIZ else None
 
 
 async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFAULT_COUNT):
@@ -4729,13 +4749,16 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
         if game:
             await quiz_post_question(q, channel, game, f"{header}\n진행 중인 퀴즈를 이어서 합니다.")
             return
-        answer = quiz.pick(level, kind=q.key)
+        answer = quiz.pick(level, kind=q.key, works=quiz_works(q, guild.id if guild else None))
         with connect_db() as conn:
             conn.execute(
                 f"INSERT OR REPLACE INTO {q.table}_games(channel_id, guild_id, level, answer, number, total, recent, "
                 "scores, hinted, started_by, started_at) VALUES (?, ?, ?, ?, 1, ?, ?, '{}', 0, ?, ?)",
                 (channel.id, guild.id if guild else None, level, answer, count, json.dumps([answer]), user.id, time.time()),
             )
+        works = quiz_works(q, guild.id if guild else None)
+        if works:
+            header += f"\n-# 이 서버에서 고른 작품 {len(works)}개에서 나옵니다 · 바꾸기: `!캐릭설정`"
         await quiz_post_question(q, channel, quiz_game(q, channel.id), header)
 
 
@@ -4905,17 +4928,72 @@ async def quiz_hint_command(ctx):
     await ctx.reply("\n".join(lines) or "이 채널에는 진행 중인 퀴즈가 없습니다.", mention_author=False)
 
 
+async def anime_settings_link(guild):
+    """(url, None) for the server's 작품 고르기 page, or (None, why not)."""
+    if not dashboard.configured():
+        return None, "봇에 사이트(NKOTE) 연결이 설정되지 않아 작품 고르기를 쓸 수 없습니다."
+    works = anime_works_of(guild.id)
+    try:
+        url = await dashboard.anime_link(guild.id, guild.name, quiz.anime_works(), sorted(works) if works else None)
+        return url, None
+    except dashboard.NotBound:
+        return None, "사이트에 연결된 봇 키가 아니라 링크를 만들 수 없습니다. 대시보드 연결을 확인해 주세요."
+    except Exception as exc:
+        print(f"작품 고르기 링크 실패: {type(exc).__name__}: {exc}")
+        return None, "링크를 만들지 못했습니다. 잠시 후 다시 시도해 주세요."
+
+
+@bot.command(name="캐릭설정", aliases=["애니캐설정", "캐릭작품"])
+@commands.guild_only()
+async def anime_settings_command(ctx):
+    """The link goes by DM: anyone with it can change the server's works for 10 minutes."""
+    url, problem = await anime_settings_link(ctx.guild)
+    if problem:
+        await ctx.reply(problem, mention_author=False)
+        return
+    view = discord.ui.View().add_item(discord.ui.Button(label="작품 고르기", emoji="🎌", url=url))
+    try:
+        await ctx.author.send(f"🎌 **{ctx.guild.name}** 애니캐 맞히기에서 나올 작품을 고르는 링크입니다. "
+                              "**10분** 동안 쓸 수 있습니다.", view=view)
+    except discord.HTTPException:
+        await ctx.reply("DM을 보낼 수 없습니다. DM을 열거나 `/도움말` → 게임 → 애니캐 맞히기 → ⚙️ 작품 고르기를 써 주세요.",
+                        mention_author=False)
+        return
+    await ctx.reply("📬 DM으로 작품 고르기 링크를 보냈습니다. (10분 동안 유효)", mention_author=False)
+
+
+async def help_anime_settings(interaction):
+    if interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    await interaction.response.defer()
+    url, problem = await anime_settings_link(interaction.guild)
+    if problem:
+        await show_quiz_page(ANIME_QUIZ, interaction, details=problem)
+        return
+    link = discord.ui.Button(label="작품 고르기 열기", emoji="🌐", url=url, row=3)
+    await show_quiz_page(ANIME_QUIZ, interaction, details="🎌 이 서버에서 나올 작품을 고르는 링크입니다. **10분** 동안 쓸 수 있습니다.",
+                         extra=[link])
+
+
 def quiz_buttons(q):
     buttons = [HelpButton(f"{q.key}_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
                HelpButton(f"{q.key}_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
                HelpButton(f"{q.key}_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
                HelpButton(f"{q.key}_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2)]
-    return [b for b in buttons if not (q is ANIME_QUIZ and b.action.endswith("_hard"))]
+    if q is ANIME_QUIZ:
+        buttons = [b for b in buttons if not b.action.endswith("_hard")]
+        buttons.append(HelpButton("anime_settings", "작품 고르기", "⚙️", discord.ButtonStyle.secondary, row=2))
+    return buttons
 
 
-async def show_quiz_page(q, interaction, details=None):
-    """/도움말 → 게임 → 국기 맞히기 / 수도 맞히기."""
-    await show_help(interaction, page="game", selected=q.key, details=details, extra_items=quiz_buttons(q))
+async def show_quiz_page(q, interaction, details=None, extra=()):
+    """/도움말 → 게임 → one quiz's page."""
+    if q is ANIME_QUIZ and interaction.guild and details is None:
+        works = anime_works_of(interaction.guild.id)
+        details = f"-# 이 서버: 고른 작품 {len(works)}개" if works else "-# 이 서버: 모든 작품"
+    await show_help(interaction, page="game", selected=q.key, details=details,
+                    extra_items=[*quiz_buttons(q), *extra])
 
 
 def help_quiz_actions(q):
@@ -4974,6 +5052,7 @@ HELP_ACTIONS = {
     **help_quiz_actions(CAPITAL_QUIZ),
     **help_quiz_actions(MAP_QUIZ),
     **help_quiz_actions(ANIME_QUIZ),
+    "anime_settings": help_anime_settings,
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,
@@ -5191,6 +5270,25 @@ async def dashboard_job(job):
             ok, message = False, FILE_NOT_CONFIGURED
         elif kind == "snapshot":
             pass
+        elif kind == "set_anime_works":
+            guild_id = dashboard_guild_id(args.get("guild_id"))
+            known = {c["work"] for c in quiz.anime().values()}
+            works = args.get("works")
+            if not guild_id:
+                ok, message = False, "서버를 알 수 없습니다."
+            elif works is None:
+                with connect_db() as conn:
+                    conn.execute("DELETE FROM anime_works WHERE guild_id = ?", (guild_id,))
+                message = "애니캐 맞히기: 모든 작품"
+            else:
+                chosen = sorted({w for w in works if isinstance(w, str)} & known)
+                if not chosen:
+                    ok, message = False, "알 수 있는 작품이 없습니다."
+                else:
+                    with connect_db() as conn:
+                        conn.execute("INSERT OR REPLACE INTO anime_works(guild_id, works) VALUES (?, ?)",
+                                     (guild_id, json.dumps(chosen, ensure_ascii=False)))
+                    message = f"애니캐 맞히기: 작품 {len(chosen)}개"
         elif kind == "set_limits":
             scope = "default" if args.get("scope") == "default" else dashboard_guild_id(args.get("scope"))
             changes = limit_changes(args.get("quota"), args.get("max")) if scope else "서버를 알 수 없습니다."

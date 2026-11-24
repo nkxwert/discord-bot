@@ -57,9 +57,16 @@ MAP_DIR = Path(__file__).parent / "assets" / "maps"
 MAP_MIN_HARD_AREA = 2500  # km²; smaller countries are dots or specks as a silhouette, so 어려움 skips them
 
 
-def pool(level, kind=FLAG):
-    if kind == ANIME:  # 쉬움: the best-known characters (★); 보통: all of them
-        return sorted(cid for cid, c in anime().items() if c["star"] or level != EASY)
+ANIME_MIN_EASY = 5  # with fewer ★ characters in a server's chosen works, 쉬움 uses all of their characters
+
+
+def pool(level, kind=FLAG, works=None):
+    if kind == ANIME:  # 쉬움: the best-known characters (★); 보통: all of them. works: the server's choice (None: all)
+        chosen = [cid for cid, c in anime().items() if works is None or c["work"] in works]
+        if level == EASY:
+            stars = [cid for cid in chosen if anime()[cid]["star"]]
+            chosen = stars if len(stars) >= ANIME_MIN_EASY else chosen
+        return sorted(chosen) or sorted(anime())
     codes = sorted(nara.countries())
     if level == EASY:
         return [c for c in codes if c in nara.FAMOUS]
@@ -73,9 +80,9 @@ def pool(level, kind=FLAG):
     return codes
 
 
-def pick(level, recent=(), kind=FLAG, rng=random):
-    """A country for the next question, avoiding the ones asked recently in this quiz."""
-    choices = [c for c in pool(level, kind) if c not in recent] or pool(level, kind)
+def pick(level, recent=(), kind=FLAG, works=None, rng=random):
+    """A country (or character) for the next question, avoiding the ones asked recently in this quiz."""
+    choices = [c for c in pool(level, kind, works) if c not in recent] or pool(level, kind, works)
     return rng.choice(choices)
 
 
@@ -145,3 +152,13 @@ def _anime_index():
 def anime_codes(text):
     """The characters this name belongs to: the Korean name, the given name alone, or the English/Japanese name."""
     return _anime_index().get(nara.normalize(text), set())
+
+
+def anime_works():
+    """[{title, stars, chars}] in list order, for the 작품 고르기 page."""
+    works = {}
+    for c in anime().values():
+        w = works.setdefault(c["work"], {"title": c["work"], "stars": 0, "chars": []})
+        w["chars"].append(c["ko"])
+        w["stars"] += c["star"]
+    return list(works.values())
