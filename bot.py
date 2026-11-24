@@ -395,8 +395,12 @@ def init_db():
                 )
             """)
         # 노래 맞히기: the genre a quiz was started with, and the songs each server added (!노래추가).
-        if "genre" not in [row["name"] for row in conn.execute("PRAGMA table_info(song_games)")]:
+        song_columns = [row["name"] for row in conn.execute("PRAGMA table_info(song_games)")]
+        if "genre" not in song_columns:
             conn.execute("ALTER TABLE song_games ADD COLUMN genre TEXT")
+        if "upcoming" not in song_columns:  # the next question's song, chosen early so it can be prepared
+            conn.execute("ALTER TABLE song_games ADD COLUMN upcoming TEXT")
+        conn.execute("CREATE TABLE IF NOT EXISTS song_apple (id TEXT PRIMARY KEY, apple TEXT NOT NULL)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS song_custom (
                 guild_id INTEGER NOT NULL,
@@ -4715,6 +4719,8 @@ async def quiz_post_question(q, channel, game, header=None):
         text = f"{head}\n-# {help_line}"
         file = discord.File(quiz.flag_path(game["answer"]), QUIZ_FLAG_FILE)
     await channel.send(f"{header}\n{text}" if header else text, **({"file": file} if file else {}))
+    if q is SONG_QUIZ:
+        song_prefetch(game)
 
 
 async def anime_picture(cid):
@@ -4772,7 +4778,9 @@ async def quiz_next(q, channel, game, header, answer_file=None):
         header = None
     recent = json.loads(game["recent"])
     if q is SONG_QUIZ:
-        answer = song_pick(game["guild_id"], game["genre"], recent) or game["answer"]
+        upcoming = game["upcoming"]
+        answer = (upcoming if upcoming and upcoming not in recent else None) or \
+            song_pick(game["guild_id"], game["genre"], recent) or game["answer"]
     else:
         answer = quiz.pick(game["level"], recent, q.key, quiz_works(q, game["guild_id"]))
     with connect_db() as conn:
@@ -5197,10 +5205,13 @@ def song_hint_word(info):
 
 
 ITUNES_API = "https://itunes.apple.com"
-_song_previews = {}  # song id -> (bytes, extension): the last few previews, so the answer reuses the question's
+DEEZER_RETRY_SECONDS = 3600  # after Deezer fails (e.g. a server in Korea, where it is not available), Apple only for a while
+SONG_READY_MAX = 8
+_deezer_down_until = [0.0]
+_song_ready = {}  # song id -> task giving {"clip": {seconds: mp3}, "answer": mp3 or None}: questions prepared ahead
 
 
-async def _json_get(url, params=None, timeout=10):
+async def _json_get(url, params=None, timeout=6):
     try:
         async with net.session().get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             if resp.status != 200:
@@ -5219,36 +5230,45 @@ async def itunes_search(term, limit=10):
     return []
 
 
+def song_apple_id(sid):
+    """Apple's id for a song found earlier by name, so the search isn't repeated."""
+    with connect_db() as conn:
+        row = conn.execute("SELECT apple FROM song_apple WHERE id = ?", (sid,)).fetchone()
+    return row["apple"] if row else None
+
+
 async def song_preview_url(guild_id, sid):
     """The current 30-second official preview address: Deezer's (signed, so asked for each time) or, where Deezer
-    is not available (it is not in Korea) or has none, Apple's (iTunes)."""
+    can't be reached (it is not available in Korea) or has none, Apple's (iTunes)."""
     info = song_info(guild_id, sid) or {}
-    if sid.startswith("dz"):
-        data = await _json_get(f"{DEEZER_API}/track/{sid[2:]}")
+    if sid.startswith("dz") and time.time() >= _deezer_down_until[0]:
+        data = await _json_get(f"{DEEZER_API}/track/{sid[2:]}", timeout=4)
         if data and data.get("preview"):
             return data["preview"]
-    itunes_id = sid[2:] if sid.startswith("it") else info.get("itunes")
-    if itunes_id:
-        data = await _json_get(f"{ITUNES_API}/lookup", {"id": itunes_id, "country": "KR"}) or {}
+        if data is None or (data.get("error") or {}).get("code") not in (None, 800):  # 800: no such track
+            _deezer_down_until[0] = time.time() + DEEZER_RETRY_SECONDS
+    apple = sid[2:] if sid.startswith("it") else info.get("itunes") or song_apple_id(sid)
+    if apple:
+        data = await _json_get(f"{ITUNES_API}/lookup", {"id": apple, "country": "KR"}) or {}
         for r in data.get("results") or []:
             if r.get("previewUrl"):
                 return r["previewUrl"]
-    if info:  # no Apple id saved: look the song up by name
+    if info:  # no Apple id yet: look the song up by name once, and remember what was found
         for r in await itunes_search(f"{info['artist']} {quiz.song_names(info['title'])[0]}", 5):
             if r.get("previewUrl") and nara.normalize(info["artist"])[:4] in nara.normalize(r.get("artistName", "")):
+                with connect_db() as conn:
+                    conn.execute("INSERT OR REPLACE INTO song_apple(id, apple) VALUES (?, ?)", (sid, str(r["trackId"])))
                 return r["previewUrl"]
     return None
 
 
 async def song_preview(guild_id, sid):
-    """(bytes, extension) of the song's preview, or None; the last few are kept for the answer."""
-    if sid in _song_previews:
-        return _song_previews[sid]
+    """(bytes, extension) of the song's preview, or None."""
     url = await song_preview_url(guild_id, sid)
     if not url:
         return None
     try:
-        async with net.session().get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        async with net.session().get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200 or (resp.content_length or 0) > SONG_PREVIEW_MAX:
                 return None
             data = await resp.read()
@@ -5256,59 +5276,99 @@ async def song_preview(guild_id, sid):
         return None
     if not data or len(data) > SONG_PREVIEW_MAX:
         return None
-    ext = "m4a" if (".m4a" in url or ".aac" in url) else "mp3"
-    while len(_song_previews) >= 6:
-        _song_previews.pop(next(iter(_song_previews)))
-    _song_previews[sid] = (data, ext)
-    return data, ext
+    return data, ("m4a" if (".m4a" in url or ".aac" in url) else "mp3")
 
 
-async def song_encode(data, ext, seconds=None, start=0.0):
-    """The preview (or seconds of it from start, faded in and out) as MP3 bytes, or None."""
+async def song_encode(data, ext, clips=(), whole=False):
+    """One ffmpeg run: {seconds: mp3 of a random part that long, faded in and out} for each length in clips, and
+    under "answer" the whole preview as mp3 when whole. Missing ones are left out."""
     ffmpeg = storage.ffmpeg_path()
     if not ffmpeg:
-        return data if ext == "mp3" else None
+        return {"answer": data} if (whole and ext == "mp3") else {}
     folder = tempfile.mkdtemp(prefix="maco-song-")
     try:
-        source, out = os.path.join(folder, f"in.{ext}"), os.path.join(folder, "out.mp3")
+        source = os.path.join(folder, f"in.{ext}")
         with open(source, "wb") as f:
             f.write(data)
-        cut, filters = [], []
-        if seconds:
+        outputs, args = {}, []
+        for seconds in clips:
             fade = min(0.4, seconds / 5)
-            cut = ["-ss", f"{start:.2f}", "-t", str(seconds)]
-            filters = ["-af", f"afade=t=in:d={fade / 2:.2f},afade=t=out:st={seconds - fade:.2f}:d={fade:.2f}"]
-        code, _ = await storage._run_capture(ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *cut, "-i", source,
-                                             *filters, "-vn", "-c:a", "libmp3lame", "-b:a", "128k", out, timeout=30)
-        if code != 0 or not os.path.exists(out):
-            return None
-        with open(out, "rb") as f:
-            return f.read()
+            start = random.uniform(1.5, max(1.5, 28 - seconds))
+            out = os.path.join(folder, f"clip{seconds}.mp3")
+            outputs[seconds] = out
+            args += ["-ss", f"{start:.2f}", "-t", str(seconds),
+                     "-af", f"afade=t=in:d={fade / 2:.2f},afade=t=out:st={seconds - fade:.2f}:d={fade:.2f}",
+                     "-vn", "-c:a", "libmp3lame", "-b:a", "128k", out]
+        if whole and ext != "mp3":
+            outputs["answer"] = os.path.join(folder, "answer.mp3")
+            args += ["-vn", "-c:a", "libmp3lame", "-b:a", "128k", outputs["answer"]]
+        result = {"answer": data} if (whole and ext == "mp3") else {}
+        if args:
+            code, _ = await storage._run_capture(ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", source,
+                                                 *args, timeout=30)
+            for key, path in outputs.items():
+                if code == 0 and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        result[key] = f.read()
+        return result
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def song_ready(guild_id, sid, seconds):
+    """The task preparing a question's clip and its answer (started at once, shared by both). The next question's
+    is started while the current one is being played, so it is usually ready when needed."""
+    task = _song_ready.get(sid)
+    if task is not None and not (task.done() and (task.cancelled() or task.exception() or not task.result())):
+        return task
+
+    async def prepare():
+        preview = await song_preview(guild_id, sid)
+        return await song_encode(*preview, clips=(seconds,), whole=True) if preview else {}
+
+    for old in [k for k, t in _song_ready.items() if t.done()][:max(0, len(_song_ready) - SONG_READY_MAX + 1)]:
+        del _song_ready[old]
+    task = _song_ready[sid] = asyncio.get_running_loop().create_task(prepare())
+    return task
+
+
 async def song_clip(guild_id, sid, seconds):
-    """A random few seconds of the song's official preview as 노래.mp3, or None. Nothing is kept on disk."""
-    preview = await song_preview(guild_id, sid)
-    if not preview:
-        return None
-    clip = await song_encode(*preview, seconds=seconds, start=random.uniform(1.5, max(1.5, 28 - seconds)))
+    """A few seconds of the song's official preview as 노래.mp3, or None. Nothing is kept on disk."""
+    ready = await song_ready(guild_id, sid, seconds)
+    clip = ready.get(seconds)
+    if clip is None and ready:  # prepared for another length (the difficulty changed): cut again
+        preview = await song_preview(guild_id, sid)
+        clip = (await song_encode(*preview, clips=(seconds,))).get(seconds) if preview else None
     return discord.File(io.BytesIO(clip), SONG_FILE) if clip else None
 
 
 async def song_answer_file(guild_id, sid):
     """The whole 30-second preview, named after the song, to play from the answer message (rather than a link:
     the services' pages don't open everywhere, e.g. Deezer in Korea)."""
-    preview = await song_preview(guild_id, sid)
-    if not preview:
-        return None
-    data = preview[0] if preview[1] == "mp3" else await song_encode(*preview)
+    task = _song_ready.get(sid)
+    data = (await task).get("answer") if task else None
+    if not data:
+        preview = await song_preview(guild_id, sid)
+        data = (await song_encode(*preview, whole=True)).get("answer") if preview else None
     if not data:
         return None
+    _song_ready.pop(sid, None)  # done with this song
     info = song_info(guild_id, sid) or {"title": "노래", "artist": ""}
     name = re.sub(r'[\\/:*?"<>|]+', " ", f"{info['title']} - {info['artist']}").strip()[:80] or "노래"
     return discord.File(io.BytesIO(data), f"{name}.mp3")
+
+
+def song_prefetch(game):
+    """Choose the next question's song now and start preparing it (saved as the game's upcoming song)."""
+    if game["number"] >= game["total"]:
+        return
+    recent = json.loads(game["recent"])
+    upcoming = song_pick(game["guild_id"], game["genre"], recent)
+    if not upcoming or upcoming == game["answer"]:
+        return
+    with connect_db() as conn:
+        conn.execute("UPDATE song_games SET upcoming = ? WHERE channel_id = ?", (upcoming, game["channel_id"]))
+    song_ready(game["guild_id"], upcoming, quiz.SONG_SECONDS[game["level"]])
 
 
 async def song_search(text, limit=5):
