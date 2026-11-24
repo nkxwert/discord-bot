@@ -110,11 +110,61 @@ OWNER_IDS = {int(i) for i in re.findall(r"\d+", os.getenv("BOT_OWNER_IDS", ""))}
 
 intents = discord.Intents.default()
 intents.message_content = True
+# Channel permissions the bot needs, with the names Discord shows in the channel settings.
+PERMISSION_NAMES = {
+    "send_messages": "메시지 보내기", "embed_links": "링크 첨부", "attach_files": "파일 첨부",
+    "read_message_history": "메시지 기록 보기", "add_reactions": "반응 추가하기", "manage_webhooks": "웹후크 관리하기",
+}
+# Nearly every answer is an embed or a picture, so ! commands need these three to work at all.
+CORE_PERMISSIONS = ("send_messages", "embed_links", "attach_files")
+
+
+def missing_permissions(channel, names=CORE_PERMISSIONS):
+    """Which of these permissions the bot lacks in this channel (none in DMs)."""
+    guild = getattr(channel, "guild", None)
+    if guild is None or not hasattr(channel, "permissions_for"):
+        return []
+    perms = channel.permissions_for(guild.me)
+    missing = []
+    for name in names:
+        if name == "send_messages" and isinstance(channel, discord.Thread):
+            ok = perms.send_messages_in_threads
+        else:
+            ok = getattr(perms, name)
+        if not ok:
+            missing.append(name)
+    return missing
+
+
+def can_reply_in(channel):
+    """Replies quote the command message, which Discord allows only with 메시지 기록 보기."""
+    return not missing_permissions(channel, ("read_message_history",))
+
+
+async def reply_to(message, content=None, **kwargs):
+    """message.reply that still answers (as a plain message) where the bot can't read the history."""
+    if can_reply_in(message.channel):
+        return await message.reply(content, **kwargs)
+    kwargs.pop("mention_author", None)
+    return await message.channel.send(content, **kwargs)
+
+
+class BotMissingPermissions(commands.CheckFailure):
+    def __init__(self, missing):
+        self.missing = missing
+        super().__init__("봇 권한 부족: " + ", ".join(missing))
+
+
 class MacoContext(commands.Context):
     async def reply(self, content=None, **kwargs):
         """Reply to the command message; if it was deleted meanwhile (stats take seconds), the answer still
-        arrives as a plain message instead of failing with an error."""
-        kwargs.setdefault("reference", self.message.to_reference(fail_if_not_exists=False))
+        arrives as a plain message instead of failing with an error. Without 메시지 기록 보기 it is a plain
+        message from the start."""
+        if can_reply_in(self.channel):
+            kwargs.setdefault("reference", self.message.to_reference(fail_if_not_exists=False))
+        else:
+            kwargs.pop("reference", None)
+            kwargs.pop("mention_author", None)
         return await self.send(content, **kwargs)
 
 
@@ -133,7 +183,20 @@ bot = MacoBot(
     allowed_mentions=discord.AllowedMentions.none(),
     # Owner-only commands (£servers). Empty means "the account that owns the app in the Developer Portal".
     owner_ids=OWNER_IDS or None,
+    # The status line under the bot's name tells people how to find the commands.
+    activity=discord.Game("!도움말 · /도움말로 명령어 보기"),
 )
+
+
+@bot.check
+async def bot_can_answer(ctx):
+    """Stop a ! command before it starts when the bot couldn't post its answer here anyway."""
+    missing = missing_permissions(ctx.channel)
+    if ctx.command and ctx.command.name == "도움말" and "send_messages" not in missing:
+        return True  # the command list also works as plain text, so reviewers always see it
+    if missing:
+        raise BotMissingPermissions(missing)
+    return True
 
 # Per-server activity for £servers: kind -> guild id -> {hour number: count}. Memory only, last 24 hours.
 traffic = {"messages": {}, "commands": {}}
@@ -634,18 +697,18 @@ async def easter_egg(message):
     registration = easter_eggs.parse_registration(content)
     if registration:
         if message.guild is None:
-            await message.reply("이스터에그는 디스코드 서버에서만 등록할 수 있습니다.", mention_author=False)
+            await reply_to(message, "이스터에그는 디스코드 서버에서만 등록할 수 있습니다.", mention_author=False)
             return
         try:
             key = easter_eggs.register(message.guild.id, message.guild.name, *registration)
         except ValueError as exc:
-            await message.reply(str(exc), mention_author=False)
+            await reply_to(message, str(exc), mention_author=False)
             return
         except OSError as exc:
             print(f"이스터에그 저장 실패: {type(exc).__name__}: {exc}")
-            await message.reply("저장 실패", mention_author=False)
+            await reply_to(message, "저장 실패", mention_author=False)
             return
-        await message.reply(f"굿: `€{key}`", mention_author=False)
+        await reply_to(message, f"굿: `€{key}`", mention_author=False)
         return
 
     if content.startswith("€") and content[1:].strip():
@@ -655,7 +718,7 @@ async def easter_egg(message):
                 text = easter_eggs.find(message.guild.id, content[1:].strip())
             except OSError as exc:
                 print(f"이스터에그 파일 읽기 실패: {type(exc).__name__}: {exc}")
-        await message.reply(text or "바보", mention_author=False)
+        await reply_to(message, text or "바보", mention_author=False)
 
 
 @bot.listen("on_message")
@@ -1283,7 +1346,22 @@ async def owner_servers(message, args):
 
 @bot.command(name="도움말", aliases=["help"])
 async def help_command(ctx):
-    await ctx.reply(embed=command_list_embed(), mention_author=False)
+    embed = command_list_embed()
+    if not missing_permissions(ctx.channel, ("embed_links",)):
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+    # Without 링크 첨부 Discord drops embeds, so the list goes out as plain text (2,000 characters a message).
+    lines = [f"**{embed.title}** 명령어 목록"]
+    lines += [f"**{f.name}**\n{f.value}" for f in embed.fields]
+    lines.append(permission_problem_text(ctx.channel, missing_permissions(ctx.channel)).replace(
+        "명령어를 실행할 수 없습니다", "일부 명령어(카드·그림·게임)를 실행할 수 없습니다"))
+    chunk = ""
+    for line in lines:
+        if chunk and len(chunk) + len(line) + 2 > 2000:
+            await ctx.send(chunk)
+            chunk = ""
+        chunk = f"{chunk}\n\n{line}" if chunk else line
+    await ctx.send(chunk)
 
 
 def command_list_embed():
@@ -1487,9 +1565,50 @@ async def delete_address_error(ctx, error):
         await report_error(ctx, error)
 
 
+def permission_problem_text(channel, missing):
+    names = ", ".join(f"**{PERMISSION_NAMES.get(n, n)}**" for n in missing) or "필요한"
+    where = f" {channel.mention}" if hasattr(channel, "mention") else ""
+    return (f"⚠️ 봇에게{where} 채널의 {names} 권한이 없어 명령어를 실행할 수 없습니다.\n"
+            "서버 관리자에게 봇 역할이나 채널 설정에서 이 권한을 켜 달라고 요청해 주세요.")
+
+
+async def tell_missing_permissions(ctx, missing=None):
+    """Say which permission is missing: in the channel if the bot can still post there, otherwise
+    privately (an interaction's own reply, or a DM)."""
+    channel = ctx.channel
+    missing = missing or missing_permissions(
+        channel, ("send_messages", "embed_links", "attach_files", "add_reactions")) or []
+    text = permission_problem_text(channel, missing)
+    interaction = getattr(ctx, "interaction", None)
+    if interaction is not None:
+        try:
+            send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await send(text, ephemeral=True)
+            return
+        except discord.HTTPException:
+            pass
+    if "send_messages" not in missing:
+        try:
+            await channel.send(text)
+            return
+        except discord.HTTPException:
+            pass
+    guild = getattr(ctx, "guild", None)
+    try:
+        await ctx.author.send(f"**{guild.name if guild else '서버'}**에서 보낸 명령어에 답하지 못했습니다.\n{text}")
+    except discord.HTTPException:
+        pass  # DMs closed too: nothing more the bot can do
+
+
 async def report_error(ctx, error):
     """Log an unexpected command error and tell the user, replacing the waiting notice if one is up."""
     original = getattr(error, "original", error)
+    if isinstance(original, BotMissingPermissions):
+        await tell_missing_permissions(ctx, original.missing)
+        return
+    if isinstance(original, discord.Forbidden) and getattr(ctx, "guild", None):
+        await tell_missing_permissions(ctx)  # a permission taken away mid-command, or a rarer one
+        return
     traceback.print_exception(type(original), original, original.__traceback__)
     notify_admin(
         "명령어 처리 중 오류", f"{type(original).__name__}: {original}", describe_ctx(ctx),
@@ -3362,8 +3481,10 @@ class HelpContext:
         extra = {k: v for k, v in {"embed": embed, "file": file, "view": view}.items() if v is not None}
         content = self.with_header(content)
         try:
+            if missing_permissions(self.channel):
+                raise PermissionError  # Discord would drop the embed or refuse the file: answer privately
             message = await self.channel.send(content, **extra)
-        except (discord.HTTPException, AttributeError):
+        except (discord.HTTPException, AttributeError, PermissionError):
             # No permission to post in this channel (or no channel object): answer through the interaction.
             if file is not None:
                 file.reset()
@@ -3415,7 +3536,14 @@ class HeaderMessage:
         return self
 
 
-async def run_from_help(ctx, awaitable):
+async def run_from_help(ctx, awaitable, channel_only=False):
+    """Run a ! command's code for a /도움말 button. channel_only: it posts straight into the channel (games),
+    so it can't fall back to a private answer and needs the bot's channel permissions first."""
+    missing = missing_permissions(ctx.channel) if channel_only else []
+    if missing:
+        awaitable.close()
+        await tell_missing_permissions(ctx, missing)
+        return
     try:
         await awaitable
     except Exception as exc:
@@ -4542,7 +4670,7 @@ def help_run_nara(level):
             return
         await show_nara_page(interaction)
         ctx = HelpContext(interaction, f"나라 맞히기 · {nara.LEVEL_NAMES[level]}")
-        await run_from_help(ctx, nara_start(interaction.channel, interaction.guild, interaction.user, level))
+        await run_from_help(ctx, nara_start(interaction.channel, interaction.guild, interaction.user, level), channel_only=True)
     return handler
 
 
@@ -5526,7 +5654,7 @@ def help_quiz_actions(q):
                 return
             await show_quiz_page(q, interaction)
             ctx = HelpContext(interaction, f"{q.title} · {quiz.LEVEL_NAMES[level]}")
-            await run_from_help(ctx, quiz_start(q, interaction.channel, interaction.guild, interaction.user, level))
+            await run_from_help(ctx, quiz_start(q, interaction.channel, interaction.guild, interaction.user, level), channel_only=True)
         return handler
 
     async def rank(interaction):
