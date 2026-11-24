@@ -1,8 +1,11 @@
-"""국기 맞히기: a flag is shown, and the first to type its country (!국기 <나라>) gets a point.
+"""Quizzes where the first right answer scores a point: 국기 맞히기 (a flag -> its country) and
+수도 맞히기 (a country -> its capital).
 
-Pure logic; bot.py keeps the quiz (one per channel) and the counts. Country names, matching and the
-well-known list come from nara.py; the flag pictures are assets/flags/<code>.png (flagcdn.com, public domain)."""
+Pure logic; bot.py keeps the quizzes (one of each kind per channel) and the counts. Country names, matching
+and the well-known list come from nara.py; the flag pictures are assets/flags/<code>.png (flagcdn.com, public
+domain); capitals and their accepted spellings are in assets/countries.json ('capitals', 'capital_names')."""
 import random
+from functools import lru_cache
 from pathlib import Path
 
 import nara
@@ -47,20 +50,47 @@ def parse_start(text):
     return level, count
 
 
-def pool(level):
+FLAG, CAPITAL = "flag", "capital"
+
+
+def pool(level, kind=FLAG):
     codes = sorted(nara.countries())
     if level == EASY:
         return [c for c in codes if c in nara.FAMOUS]
     if level == HARD:
         hard = [c for c in codes if c not in nara.FAMOUS]
-        return hard + [c for c in hard if c in _LOOKALIKE] * (LOOKALIKE_WEIGHT - 1)
+        if kind == FLAG:
+            return hard + [c for c in hard if c in _LOOKALIKE] * (LOOKALIKE_WEIGHT - 1)
+        return hard
     return codes
 
 
-def pick(level, recent=(), rng=random):
+def pick(level, recent=(), kind=FLAG, rng=random):
     """A country for the next question, avoiding the ones asked recently in this quiz."""
-    choices = [c for c in pool(level) if c not in recent] or pool(level)
+    choices = [c for c in pool(level, kind) if c not in recent] or pool(level, kind)
     return rng.choice(choices)
+
+
+@lru_cache(maxsize=1)
+def _capital_index():
+    """normalized capital name -> codes of the countries it is a capital of"""
+    index = {}
+    for code, c in nara.countries().items():
+        for name in (*c.get("capitals", [c["capital"]]), *c.get("capital_names", [])):
+            index.setdefault(nara.normalize(name), set()).add(code)
+    return index
+
+
+def capital_codes(text):
+    """The countries whose capital the text names exactly (spaces and punctuation aside)."""
+    return _capital_index().get(nara.normalize(text), set())
+
+
+def capital_text(code):
+    """'프리토리아 (케이프타운·블룸폰테인도 정답)' for a country with several capitals, else just the capital."""
+    c = nara.countries()[code]
+    capitals = c.get("capitals", [c["capital"]])
+    return capitals[0] + (f" ({'·'.join(capitals[1:])}도 정답)" if len(capitals) > 1 else "")
 
 
 def flag_path(code):
