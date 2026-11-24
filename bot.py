@@ -1310,7 +1310,8 @@ def command_list_embed():
                     value="지도 맞히기: 지도(어려움은 나라 모양)를 보고 가장 먼저 나라를 맞힌 사람의 개수가 기록됩니다.",
                     inline=False)
     embed.add_field(name="!캐릭시작 [쉬움|보통] [문제 수] · !캐릭 <이름> · !힌트 · !캐릭순위",
-                    value="애니캐 맞히기: 애니 캐릭터 그림을 보고 가장 먼저 이름을 맞힌 사람의 개수가 기록됩니다.",
+                    value="애니캐 맞히기: 애니 캐릭터 그림을 보고 가장 먼저 이름을 맞힌 사람의 개수가 기록됩니다. "
+                          "`!애니 리스트`로 작품 목록, `!애니 추천 <작품>`으로 작품 추천.",
                     inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
@@ -3263,7 +3264,8 @@ HELP_COMMANDS = {
               "`!캐릭시작 [쉬움|보통] [문제 수]` 시작 (기본 10문제, 최대 50)\n"
               "`!캐릭 <이름>` 답하기 · `!힌트` 작품 → 한 번 더 치면 초성\n"
               "`!캐릭스킵` 넘기기 · `!캐릭중지` 그만 · `!캐릭순위` 순위\n"
-              "`!캐릭설정` 이 서버에서 나올 작품 고르기 (DM으로 10분짜리 링크)\n\n"
+              "`!캐릭설정` 이 서버에서 나올 작품 고르기 (DM으로 10분짜리 링크)\n"
+              "`!애니 리스트` 작품 목록 · `!애니 추천 <작품>` 넣고 싶은 작품 추천\n\n"
               "**난이도**\n"
               "🟢 쉬움 — 누구나 아는 대표 캐릭터\n"
               "🌍 보통 — 52개 작품의 캐릭터 약 300명\n\n"
@@ -4974,6 +4976,92 @@ async def help_anime_settings(interaction):
     link = discord.ui.Button(label="작품 고르기 열기", emoji="🌐", url=url, row=3)
     await show_quiz_page(ANIME_QUIZ, interaction, details="🎌 이 서버에서 나올 작품을 고르는 링크입니다. **10분** 동안 쓸 수 있습니다.",
                          extra=[link])
+
+
+ANIME_SUGGEST_COOLDOWN = 60
+_anime_suggest_last = {}  # user id -> when they last suggested a work
+
+
+def anime_list_embed(guild_id, work=None):
+    """!애니 리스트: every work in 애니캐 맞히기 (✅ = used in this server), or one work's characters."""
+    works = quiz.anime_works()
+    chosen = anime_works_of(guild_id)
+    if work:
+        wanted = nara.normalize(work)
+        found = next((w for w in works if nara.normalize(w["title"]) == wanted), None) or \
+            next((w for w in works if wanted in nara.normalize(w["title"])), None)
+        if not found:
+            return None
+        stars = {c["ko"] for c in quiz.anime().values() if c["work"] == found["title"] and c["star"]}
+        names = " · ".join(f"★{n}" if n in stars else n for n in found["chars"])
+        embed = discord.Embed(title=f"🎌 『{found['title']}』 캐릭터 {len(found['chars'])}명", description=names,
+                              color=discord.Color.green())
+        embed.set_footer(text="★ 쉬움에도 나오는 캐릭터")
+        return embed
+    lines = [f"{'✅' if chosen is None or w['title'] in chosen else '▫️'} {w['title']} · {len(w['chars'])}명" for w in works]
+    scope = "모든 작품" if chosen is None else f"고른 작품 {len(chosen)}개 (✅)"
+    embed = discord.Embed(title=f"🎌 애니캐 맞히기 작품 {len(works)}개", description="\n".join(lines)[:4096],
+                          color=discord.Color.green())
+    embed.set_footer(text=f"이 서버: {scope} · 캐릭터 보기: !애니 리스트 <작품> · 고르기: !캐릭설정 · 추천: !애니 추천 <작품>")
+    return embed
+
+
+async def anilist_find(title):
+    """(display title, url) of the best AniList match for a work's name, or None."""
+    query = "query($s:String){ Media(search:$s, type:ANIME, sort:SEARCH_MATCH){ title{ romaji native } siteUrl } }"
+    try:
+        async with net.session().post(ANILIST_URL, json={"query": query, "variables": {"s": title}},
+                                      timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            media = ((await resp.json()).get("data") or {}).get("Media")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+    if not media:
+        return None
+    t = media["title"]
+    return " / ".join(x for x in (t.get("native"), t.get("romaji")) if x), media.get("siteUrl")
+
+
+@bot.command(name="애니", aliases=["애니메이션"])
+async def anime_command(ctx, action: str = "", *, rest: str = ""):
+    """!애니 리스트 [작품] · !애니 추천 <작품>"""
+    rest = rest.strip()
+    if action in ("리스트", "목록", "list"):
+        embed = anime_list_embed(ctx.guild.id if ctx.guild else None, rest or None)
+        if embed is None:
+            await ctx.reply(f"`{rest[:50]}` 작품이 목록에 없습니다. `!애니 리스트`로 전체를 보거나 `!애니 추천 {rest[:50]}`으로 추천해 주세요.",
+                            mention_author=False)
+            return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+    if action in ("추천", "recommend"):
+        if not rest:
+            await ctx.reply("`!애니 추천 <작품 이름>`처럼 써 주세요. 예: `!애니 추천 귀멸의 칼날`", mention_author=False)
+            return
+        if len(rest) > 100:
+            await ctx.reply("작품 이름은 100자까지 쓸 수 있습니다.", mention_author=False)
+            return
+        if any(nara.normalize(w["title"]) == nara.normalize(rest) for w in quiz.anime_works()):
+            await ctx.reply(f"**{rest}**{nara.josa(rest, '은', '는')} 이미 애니캐 맞히기에 있습니다. `!애니 리스트`로 확인해 보세요.", mention_author=False)
+            return
+        left = math.ceil(ANIME_SUGGEST_COOLDOWN - (time.time() - _anime_suggest_last.get(ctx.author.id, 0)))
+        if left > 0:
+            await ctx.reply(f"{left}초 후에 다시 추천해 주세요.", mention_author=False)
+            return
+        found = await anilist_find(rest)
+        detail = f"AniList: {found[0]}\n{found[1]}" if found else "AniList에서 찾지 못했습니다 (한글 제목은 대개 검색되지 않습니다)."
+        delivered = await deliver_to_admins(ctx.author, f"[애니 추천] {rest}", f"애니캐 맞히기에 넣어 주세요: {rest}\n{detail}",
+                                            describe_place(ctx.guild, ctx.channel), [])
+        if not delivered:
+            await ctx.reply("전달하지 못했습니다. 잠시 후 다시 시도해 주세요.", mention_author=False)
+            return
+        if len(_anime_suggest_last) >= 500:
+            _anime_suggest_last.clear()
+        _anime_suggest_last[ctx.author.id] = time.time()
+        found_text = f" (AniList: {found[0]})" if found else ""
+        await ctx.reply(f"📮 **{rest}**{found_text} 추천을 개발자에게 전달했습니다. 고마워요!", mention_author=False)
+        return
+    await ctx.reply("`!애니 리스트` 작품 목록 · `!애니 리스트 <작품>` 캐릭터 목록 · `!애니 추천 <작품>` 작품 추천",
+                    mention_author=False)
 
 
 def quiz_buttons(q):
