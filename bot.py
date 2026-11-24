@@ -3193,25 +3193,47 @@ HELP_COMMANDS = {
              "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
-    "nara": ("나라 맞히기", "!나라시작", "`!나라시작 [쉬움|보통|어려움]` · `!추측 <나라>` · `!포기` · `!나라순위` · `!정보 <나라>`\n"
-             "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다. 진행 중인 판이 있으면 이어서 합니다.\n"
-             "**🟢 쉬움**: 잘 알려진 나라 · **🌍 보통**: 모든 나라 중 무작위. 둘 다 횟수 제한 없음. 대륙·반구·내륙국은 같으면 🟩, "
-             "인구·면적은 ▲(정답이 더 큼)/▼에 비슷하면 🟨, 거리·방향은 추측한 나라 수도에서 정답 나라 수도까지입니다.\n"
-             "**🔥 어려움**: 잘 알려지지 않은 나라를 **10번 안에**. 표는 대륙·내륙국·이웃(정답과 국경이 닿는지)·평균 기온·인구·면적이고, "
-             "기온·인구·면적은 ▲/▼만 나옵니다.\n"
-             "**📖 나라 정보**: 나라 하나의 소개와 수도·인구·면적·언어 등을 봅니다."),
-    "flag": ("국기 맞히기", "!국기시작", "`!국기시작 [쉬움|보통|어려움] [문제 수]` · `!국기 <나라>` · `!힌트` · `!국기스킵` · "
-             "`!국기중지` · `!국기순위`\n"
-             "국기 그림이 올라오면 채널의 누구나 `!국기 <나라>`로 답하고, **가장 먼저 맞힌 사람**의 맞힌 개수가 기록됩니다. "
-             "시간 제한·횟수 제한은 없고, 틀리면 ❌, 맞았지만 한발 늦으면 ⏱️가 달립니다. `!힌트`는 초성(예: ㅍㄹㅅ)을 알려 줍니다.\n"
-             "**🟢 쉬움**: 잘 알려진 나라 · **🌍 보통**: 모든 나라 · **🔥 어려움**: 덜 알려진 나라, 비슷하게 생긴 국기가 자주 나옴\n"
-             "문제 수를 안 쓰면 10문제입니다(최대 50)."),
-    "capital": ("수도 맞히기", "!수도시작", "`!수도시작 [쉬움|보통|어려움] [문제 수]` · `!수도 <수도>` · `!힌트` · `!수도스킵` · "
-                "`!수도중지` · `!수도순위`\n"
-                "나라가 나오면 채널의 누구나 `!수도 <수도>`로 답하고, **가장 먼저 맞힌 사람**의 맞힌 개수가 기록됩니다. "
-                "수도 이름은 정확히 써야 하고(흔한 다른 표기·영어 이름도 정답), 수도가 여럿인 나라는 그중 하나면 됩니다. "
-                "틀리면 ❌, 한발 늦으면 ⏱️. `!힌트`는 초성을 알려 줍니다.\n"
-                "**🟢 쉬움**: 잘 알려진 나라 · **🌍 보통**: 모든 나라 · **🔥 어려움**: 덜 알려진 나라 · 문제 수를 안 쓰면 10문제(최대 50)"),
+    "nara": ("나라 맞히기", "!나라시작",
+             "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다.\n\n"
+             "**명령어**\n"
+             "`!나라시작 [쉬움|보통|어려움]` 새 판 (진행 중이면 이어서)\n"
+             "`!추측 <나라>` 추측 · `!포기` 정답 공개\n"
+             "`!나라순위` 순위 · `!정보 <나라>` 나라 정보\n\n"
+             "**난이도**\n"
+             "🟢 쉬움 — 잘 알려진 나라 · 횟수 무제한\n"
+             "🌍 보통 — 모든 나라 · 횟수 무제한\n"
+             "🔥 어려움 — 덜 알려진 나라 · **10번 안에**\n\n"
+             "**표 보는 법**\n"
+             "🟩 같음 · 🟥 다름 · 🟨 비슷함\n"
+             "▲ 정답이 더 큼 · ▼ 정답이 더 작음\n"
+             "거리·방향은 추측한 나라 수도에서 정답 나라 수도까지\n"
+             "어려움은 이웃·평균 기온 칸이 나오고 거리·방향은 없습니다."),
+    "flag": ("국기 맞히기", "!국기시작",
+             "국기를 보고 나라를 맞힙니다. **가장 먼저 맞힌 사람**의 개수가 기록됩니다.\n\n"
+             "**명령어**\n"
+             "`!국기시작 [쉬움|보통|어려움] [문제 수]` 시작 (기본 10문제, 최대 50)\n"
+             "`!국기 <나라>` 답하기 · `!힌트` 초성\n"
+             "`!국기스킵` 넘기기 · `!국기중지` 그만 · `!국기순위` 순위\n\n"
+             "**난이도**\n"
+             "🟢 쉬움 — 잘 알려진 나라\n"
+             "🌍 보통 — 모든 나라\n"
+             "🔥 어려움 — 덜 알려진 나라 · 비슷한 국기가 자주 나옴\n\n"
+             "**규칙**\n"
+             "시간·횟수 제한 없음 · 틀리면 ❌ · 한발 늦으면 ⏱️"),
+    "capital": ("수도 맞히기", "!수도시작",
+                "나라를 보고 수도를 맞힙니다. **가장 먼저 맞힌 사람**의 개수가 기록됩니다.\n\n"
+                "**명령어**\n"
+                "`!수도시작 [쉬움|보통|어려움] [문제 수]` 시작 (기본 10문제, 최대 50)\n"
+                "`!수도 <수도>` 답하기 · `!힌트` 초성\n"
+                "`!수도스킵` 넘기기 · `!수도중지` 그만 · `!수도순위` 순위\n\n"
+                "**난이도**\n"
+                "🟢 쉬움 — 잘 알려진 나라\n"
+                "🌍 보통 — 모든 나라\n"
+                "🔥 어려움 — 덜 알려진 나라\n\n"
+                "**규칙**\n"
+                "수도 이름은 정확히 (흔한 다른 표기·영어도 정답)\n"
+                "수도가 여럿인 나라는 그중 하나면 정답\n"
+                "시간·횟수 제한 없음 · 틀리면 ❌ · 한발 늦으면 ⏱️"),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -4198,10 +4220,17 @@ async def nara_post_board(channel, game, guesses, content, finished=False):
     return await channel.send(content, file=discord.File(io.BytesIO(png), NARA_FILE))
 
 
+NARA_LEVEL_EMOJI = {nara.EASY: "🟢", nara.NORMAL: "🌍", nara.HARD: "🔥"}
+
+
 def nara_rules(level):
     if level == nara.HARD:
-        return f"**{nara.HARD_MAX_GUESSES}번** 안에 맞혀야 합니다 · 포기: `!포기`"
-    return "횟수 제한 없음 · 포기: `!포기`"
+        return f"**{nara.HARD_MAX_GUESSES}번** 안에 맞혀야 합니다."
+    return "**횟수 제한 없이** 추측할 수 있습니다."
+
+
+def nara_title(level):
+    return f"{NARA_LEVEL_EMOJI[level]} **나라 맞히기 · {nara.LEVEL_NAMES[level]}**"
 
 
 async def nara_start(channel, guild, user, level=nara.NORMAL):
@@ -4211,21 +4240,19 @@ async def nara_start(channel, guild, user, level=nara.NORMAL):
         header = f"-# {user.mention}님의 요청 · 나라 맞히기"
         if game:
             guesses = json.loads(game["guesses"])
-            name = nara.LEVEL_NAMES[game["level"]]
             other = ""
             if game["level"] != level:
                 other = f"\n-# {nara.LEVEL_NAMES[level]}으로 하려면 `!포기` 후 다시 시작하세요."
-            content = (f"{header}\n이 채널에서 진행 중인 판(**{name}**)을 이어서 합니다. (지금까지 추측 {len(guesses)}번)\n"
-                       f"`!추측 <나라>`로 추측하세요. {nara_rules(game['level'])}{other}")
+            content = (f"{header}\n{nara_title(game['level'])} (이어서)\n"
+                       f"지금까지 추측 {len(guesses)}번 · {nara_rules(game['level'])}{other}")
             await nara_post_board(channel, game, guesses, content)
             return
         game = {"answer": nara.pick(level), "level": level}
-        intro = {
-            nara.EASY: "🟢 **나라 맞히기 · 쉬움** 새 판! 잘 알려진 나라 하나를 골랐습니다.",
-            nara.NORMAL: "🌍 **나라 맞히기 · 보통** 새 판! 나라 하나를 골랐습니다.",
-            nara.HARD: "🔥 **나라 맞히기 · 어려움** 새 판! 잘 알려지지 않은 나라 하나를 골랐습니다.",
-        }[level]
-        content = f"{header}\n{intro}\n누구나 `!추측 <나라>`로 추측할 수 있습니다. {nara_rules(level)}"
+        if level == nara.HARD:
+            rule = f"누구나 `!추측 <나라>`로 추측할 수 있습니다. {nara_rules(level)}"
+        else:
+            rule = "누구나 `!추측 <나라>`로 **횟수 제한 없이** 추측할 수 있습니다."
+        content = f"{header}\n{nara_title(level)}\n{rule}"
         message = await nara_post_board(channel, game, [], content)
         with connect_db() as conn:
             conn.execute(
@@ -4277,8 +4304,8 @@ async def nara_guess_command(ctx, *, name: str = ""):
         answer_name = nara.countries()[answer]["ko"]
         limit = nara.max_guesses(level)
         if code == answer:
-            content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{answer_name}**입니다. "
-                       f"(모두 합쳐 추측 {len(guesses)}번)\n-# {nara.summary(answer)} · 새 판: `!나라시작` · 순위: `!나라순위`")
+            content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{answer_name}**입니다.\n"
+                       f"-# 추측 시도 {len(guesses)}번\n-# {nara.summary(answer)}")
             if len(_nara_just_won) >= 300:
                 _nara_just_won.clear()
             _nara_just_won[ctx.channel.id] = (code, ctx.author.id, time.monotonic())
@@ -4293,13 +4320,12 @@ async def nara_guess_command(ctx, *, name: str = ""):
                 )
             return
         if limit and len(guesses) >= limit:
-            content = (f"{header}\n💀 {limit}번 안에 맞히지 못했습니다. 정답은 **{answer_name}**였습니다.\n"
-                       f"-# {nara.summary(answer)} · 새 판: `!나라시작 어려움`")
+            content = (f"{header}\n💀 {limit}번 안에 맞히지 못했습니다. 정답은 **{answer_name}**입니다.\n"
+                       f"-# {nara.summary(answer)}")
             await nara_post_board(ctx.channel, game, guesses, content, finished=True)
             nara_end_game(ctx.channel.id)
             return
-        left = f" · 남은 기회 **{limit - len(guesses)}번**" if limit else ""
-        content = f"{header}{left}\n-# `!추측 <나라>`로 계속 · 포기: `!포기`"
+        content = header + (f"\n-# 남은 기회 {limit - len(guesses)}번" if limit else "")
         await nara_post_board(ctx.channel, game, guesses, content)
         with connect_db() as conn:
             conn.execute("UPDATE nara_games SET guesses = ? WHERE channel_id = ?", (json.dumps(guesses), ctx.channel.id))
@@ -4314,9 +4340,9 @@ async def nara_giveup_command(ctx):
             await ctx.reply("이 채널에는 진행 중인 나라 맞히기 판이 없습니다.", mention_author=False)
             return
         guesses, answer = json.loads(game["guesses"]), game["answer"]
-        content = (f"-# {ctx.author.mention}님이 포기했습니다 · 나라 맞히기 ({nara.LEVEL_NAMES[game['level']]})\n"
-                   f"정답은 **{nara.countries()[answer]['ko']}**였습니다. (추측 {len(guesses)}번)\n"
-                   f"-# {nara.summary(answer)} · 새 판: `!나라시작`")
+        content = (f"-# {ctx.author.mention}님이 포기했습니다 · 나라 맞히기\n"
+                   f"🏳️ 정답은 **{nara.countries()[answer]['ko']}**입니다.\n"
+                   f"-# 추측 시도 {len(guesses)}번\n-# {nara.summary(answer)}")
         await nara_post_board(ctx.channel, game, guesses, content, finished=True)
         nara_end_game(ctx.channel.id)
 
@@ -4518,14 +4544,14 @@ def quiz_hint_word(q, code):
 
 
 async def quiz_post_question(q, channel, game, header=None):
-    head = f"{q.emoji} **{q.title} · {quiz.LEVEL_NAMES[game['level']]}** · 문제 {game['number']}/{game['total']}"
-    help_line = f"`!{q.answer} <{q.noun}>`로 답하세요 · 힌트: `!힌트` · 넘기기: `!{q.skip}` · 그만: `!{q.stop}`"
+    head = f"{q.emoji} **{q.title} · {quiz.LEVEL_NAMES[game['level']]}** · {game['number']}/{game['total']}"
+    help_line = f"`!{q.answer} <{q.noun}>`로 답하기 · `!힌트` 초성 · `!{q.skip}` 넘기기 · `!{q.stop}` 그만"
     file = None
     if q is CAPITAL_QUIZ:
         c = nara.countries()[game["answer"]]
         text = f"{head}\n## {c.get('flag', '')} {c['ko']}의 수도는?\n-# {help_line}"
     else:
-        text = f"{head}\n{help_line}"
+        text = f"{head}\n-# {help_line}"
         file = discord.File(quiz.flag_path(game["answer"]), QUIZ_FLAG_FILE)
     await channel.send(f"{header}\n{text}" if header else text, **({"file": file} if file else {}))
 
@@ -4537,14 +4563,17 @@ def quiz_session_text(scores):
     return " · ".join(f"{medals.get(i, f'{i}.')} <@{uid}> {n}개" for i, (uid, n) in enumerate(ranked, 1))
 
 
+def quiz_result_line(game):
+    result = quiz_session_text(json.loads(game["scores"]))
+    return f"이번에 맞힌 개수: {result}" if result else "이번에는 맞힌 사람이 없습니다."
+
+
 async def quiz_next(q, channel, game, header):
     """Move on after a question is answered or skipped: the next question, or the end of the quiz."""
     if game["number"] >= game["total"]:
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (channel.id,))
-        result = quiz_session_text(json.loads(game["scores"])) or "맞힌 사람이 없습니다."
-        await channel.send(f"{header}\n🏁 **{game['total']}문제 끝!** 이번에 맞힌 개수: {result}\n"
-                           f"-# 새로 하기: `!{q.start} [쉬움|보통|어려움] [문제 수]` · 순위: `!{q.rank}`")
+        await channel.send(f"{header}\n🏁 **{q.title} · {game['total']}문제 끝!**\n-# {quiz_result_line(game)}")
         return
     recent = json.loads(game["recent"])
     answer = quiz.pick(game["level"], recent, q.key)
@@ -4628,8 +4657,8 @@ async def quiz_answer_command(q, ctx, text):
             )
             total = conn.execute(f"SELECT {level} FROM {q.table}_scores WHERE guild_id = ? AND user_id = ?",
                                  (ctx.guild.id, ctx.author.id)).fetchone()[0]
-        header = (f"🎉 {ctx.author.mention}님 정답! {quiz_reveal(q, answer)}\n"
-                  f"-# {ctx.author.mention}님의 {quiz.LEVEL_NAMES[level]} 누적 {total}개")
+        header = (f"-# {ctx.author.mention}님의 정답 · {q.title}\n🎉 {quiz_reveal(q, answer)}\n"
+                  f"-# {quiz.LEVEL_NAMES[level]} 누적 {total}개\n")
         await quiz_next(q, ctx.channel, quiz_game(q, ctx.channel.id), header)
 
 
@@ -4639,7 +4668,8 @@ async def quiz_skip_command(q, ctx):
         if game is None:
             await ctx.reply(f"이 채널에는 진행 중인 {q.title} 퀴즈가 없습니다.", mention_author=False)
             return
-        await quiz_next(q, ctx.channel, game, f"-# {ctx.author.mention}님이 넘겼습니다 · 정답: {quiz_reveal(q, game['answer'])}")
+        await quiz_next(q, ctx.channel, game,
+                        f"-# {ctx.author.mention}님이 넘겼습니다 · {q.title}\n⏭️ 정답: {quiz_reveal(q, game['answer'])}\n")
 
 
 async def quiz_stop_command(q, ctx):
@@ -4650,9 +4680,8 @@ async def quiz_stop_command(q, ctx):
             return
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (ctx.channel.id,))
-        result = quiz_session_text(json.loads(game["scores"])) or "맞힌 사람이 없습니다."
-        await ctx.channel.send(f"-# {ctx.author.mention}님이 퀴즈를 멈췄습니다 · 마지막 문제 정답: {quiz_reveal(q, game['answer'])}\n"
-                               f"🏁 이번에 맞힌 개수: {result}")
+        await ctx.channel.send(f"-# {ctx.author.mention}님이 멈췄습니다 · {q.title}\n"
+                               f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'])}\n-# {quiz_result_line(game)}")
 
 
 def quiz_ranking_text(q, guild_id, limit=10):
