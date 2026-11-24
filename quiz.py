@@ -1,5 +1,5 @@
-"""Quizzes where the first right answer scores a point: 국기 맞히기 (a flag -> its country) and
-수도 맞히기 (a country -> its capital).
+"""Quizzes where the first right answer scores a point: 국기 맞히기 (a flag -> its country),
+수도 맞히기 (a country -> its capital) and 지도 맞히기 (a map or silhouette -> its country).
 
 Pure logic; bot.py keeps the quizzes (one of each kind per channel) and the counts. Country names, matching
 and the well-known list come from nara.py; the flag pictures are assets/flags/<code>.png (flagcdn.com, public
@@ -50,7 +50,9 @@ def parse_start(text):
     return level, count
 
 
-FLAG, CAPITAL = "flag", "capital"
+FLAG, CAPITAL, MAP = "flag", "capital", "map"
+MAP_DIR = Path(__file__).parent / "assets" / "maps"
+MAP_MIN_HARD_AREA = 2500  # km²; smaller countries are dots or specks as a silhouette, so 어려움 skips them
 
 
 def pool(level, kind=FLAG):
@@ -59,6 +61,8 @@ def pool(level, kind=FLAG):
         return [c for c in codes if c in nara.FAMOUS]
     if level == HARD:
         hard = [c for c in codes if c not in nara.FAMOUS]
+        if kind == MAP:
+            return [c for c in hard if nara.countries()[c]["area"] >= MAP_MIN_HARD_AREA]
         if kind == FLAG:
             return hard + [c for c in hard if c in _LOOKALIKE] * (LOOKALIKE_WEIGHT - 1)
         return hard
@@ -95,6 +99,12 @@ def capital_text(code):
 
 def flag_path(code):
     return FLAG_DIR / f"{code}.png"
+
+
+def map_path(code, level):
+    """The location map (the country in red among its neighbours), or for 어려움 its silhouette alone.
+    Drawn beforehand from Natural Earth (public domain); see assets/maps/SOURCES.md."""
+    return MAP_DIR / (f"{code}_s.png" if level == HARD else f"{code}.png")
 
 
 CHOSUNG = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"

@@ -363,10 +363,12 @@ def init_db():
             conn.execute("ALTER TABLE nara_games ADD COLUMN level TEXT NOT NULL DEFAULT 'normal'")
         if "hard_wins" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_scores)")]:
             conn.execute("ALTER TABLE nara_scores ADD COLUMN hard_wins INTEGER NOT NULL DEFAULT 0")
+        if "setter" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_games)")]:
+            conn.execute("ALTER TABLE nara_games ADD COLUMN setter INTEGER")  # who chose the answer (!나라출제)
         if "easy_wins" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_scores)")]:
             conn.execute("ALTER TABLE nara_scores ADD COLUMN easy_wins INTEGER NOT NULL DEFAULT 0")
         # 국기 맞히기 / 수도 맞히기: one quiz of each per channel and how many each person has got, per difficulty.
-        for table in ("flag", "capital"):
+        for table in ("flag", "capital", "map"):
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {table}_games (
                     channel_id INTEGER PRIMARY KEY,
@@ -1292,7 +1294,7 @@ def command_list_embed():
     embed.add_field(name="!일침", value="정신이 번쩍 드는 한마디를 듣습니다. 칠 때마다 무작위로 나옵니다.", inline=False)
     embed.add_field(name="!dday [이름]", value="이 서버의 D-Day 목록을 보거나 그 날까지 남은 시간을 봅니다. "
                                               "만들기·편집·삭제는 `/도움말` → 기타 → D-Day에서 합니다.", inline=False)
-    embed.add_field(name="!나라시작 [쉬움|보통|어려움] · !추측 <나라> · !포기 · !나라순위",
+    embed.add_field(name="!나라시작 [쉬움|보통|어려움] · !추측 <나라> · !포기 · !나라순위 · !나라출제",
                     value="나라 맞히기: 채널의 모두가 함께 비밀 나라를 맞힙니다. 추측할 때마다 대륙·인구·면적·거리·방향 힌트가 표로 나옵니다. "
                           "쉬움은 잘 알려진 나라, 보통은 모든 나라, 어려움은 잘 알려지지 않은 나라를 10번 안에 맞힙니다.",
                     inline=False)
@@ -1302,6 +1304,9 @@ def command_list_embed():
     embed.add_field(name="!수도시작 [쉬움|보통|어려움] [문제 수] · !수도 <수도> · !힌트 · !수도순위",
                     value="수도 맞히기: 나라가 나오면 가장 먼저 수도를 맞힌 사람의 개수가 기록됩니다. "
                           "`!수도스킵`은 넘기기, `!수도중지`는 그만하기입니다.", inline=False)
+    embed.add_field(name="!지도시작 [쉬움|보통|어려움] [문제 수] · !지도 <나라> · !힌트 · !지도순위",
+                    value="지도 맞히기: 지도(어려움은 나라 모양)를 보고 가장 먼저 나라를 맞힌 사람의 개수가 기록됩니다.",
+                    inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -3169,7 +3174,7 @@ HELP_CATEGORIES = {
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
     "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
-    "game": ("🎮", "게임", ["nara", "flag", "capital"]),
+    "game": ("🎮", "게임", ["nara", "flag", "capital", "map"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -3198,6 +3203,7 @@ HELP_COMMANDS = {
              "**명령어**\n"
              "`!나라시작 [쉬움|보통|어려움]` 새 판 (진행 중이면 이어서)\n"
              "`!추측 <나라>` 추측 · `!포기` 정답 공개\n"
+             "`!나라출제` 내가 고른 나라를 다른 사람들이 맞히게 하기 (순위에는 안 들어감)\n"
              "`!나라순위` 순위 · `!정보 <나라>` 나라 정보\n\n"
              "**난이도**\n"
              "🟢 쉬움 — 잘 알려진 나라 · 횟수 무제한\n"
@@ -3234,6 +3240,18 @@ HELP_COMMANDS = {
                 "수도 이름은 정확히 (흔한 다른 표기·영어도 정답)\n"
                 "수도가 여럿인 나라는 그중 하나면 정답\n"
                 "시간·횟수 제한 없음 · 틀리면 ❌ · 한발 늦으면 ⏱️"),
+    "map": ("지도 맞히기", "!지도시작",
+            "지도를 보고 나라를 맞힙니다. **가장 먼저 맞힌 사람**의 개수가 기록됩니다.\n\n"
+            "**명령어**\n"
+            "`!지도시작 [쉬움|보통|어려움] [문제 수]` 시작 (기본 10문제, 최대 50)\n"
+            "`!지도 <나라>` 답하기 · `!힌트` 초성\n"
+            "`!지도스킵` 넘기기 · `!지도중지` 그만 · `!지도순위` 순위\n\n"
+            "**난이도**\n"
+            "🟢 쉬움 — 잘 알려진 나라 · 주변이 보이는 지도에 빨간색\n"
+            "🌍 보통 — 모든 나라 · 주변이 보이는 지도에 빨간색\n"
+            "🔥 어려움 — 덜 알려진 나라 · **나라 모양(실루엣)만**\n\n"
+            "**규칙**\n"
+            "아주 작은 나라는 빨간 동그라미로 표시 · 시간·횟수 제한 없음 · 틀리면 ❌ · 한발 늦으면 ⏱️"),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -3247,7 +3265,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "map": "🗺️", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -4229,42 +4247,52 @@ def nara_rules(level):
     return "**횟수 제한 없이** 추측할 수 있습니다."
 
 
-def nara_title(level):
+def nara_title(level, setter=None):
+    if setter:
+        return f"✏️ **나라 맞히기 · 출제** ({nara.LEVEL_NAMES[level]} 규칙)"
     return f"{NARA_LEVEL_EMOJI[level]} **나라 맞히기 · {nara.LEVEL_NAMES[level]}**"
 
 
-async def nara_start(channel, guild, user, level=nara.NORMAL):
-    """Start a game in this channel, or show the one already going on there."""
+async def nara_start(channel, guild, user, level=nara.NORMAL, answer=None):
+    """Start a game in this channel, or show the one already going on there. With answer, user chose it
+    (!나라출제): they can't guess, and winning it doesn't count in the ranking."""
     async with nara_lock(channel.id):
         game = nara_game(channel.id)
         header = f"-# {user.mention}님의 요청 · 나라 맞히기"
         if game:
             guesses = json.loads(game["guesses"])
             other = ""
-            if game["level"] != level:
+            if game["level"] != level and not game["setter"]:
                 other = f"\n-# {nara.LEVEL_NAMES[level]}으로 하려면 `!포기` 후 다시 시작하세요."
-            content = (f"{header}\n{nara_title(game['level'])} (이어서)\n"
+            content = (f"{header}\n{nara_title(game['level'], game['setter'])} · 이어서\n"
                        f"지금까지 추측 {len(guesses)}번 · {nara_rules(game['level'])}{other}")
             await nara_post_board(channel, game, guesses, content)
             return
-        game = {"answer": nara.pick(level), "level": level}
+        setter = user.id if answer else None
+        game = {"answer": answer or nara.pick(level), "level": level}
         if level == nara.HARD:
             rule = f"누구나 `!추측 <나라>`로 추측할 수 있습니다. {nara_rules(level)}"
         else:
             rule = "누구나 `!추측 <나라>`로 **횟수 제한 없이** 추측할 수 있습니다."
-        content = f"{header}\n{nara_title(level)}\n{rule}"
+        if setter:
+            header = f"-# {user.mention}님의 출제 · 나라 맞히기"
+            rule = f"{user.mention}님이 낸 나라를 맞혀 보세요! {rule}"
+        content = f"{header}\n{nara_title(level, setter)}\n{rule}"
         message = await nara_post_board(channel, game, [], content)
         with connect_db() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO nara_games(channel_id, guild_id, answer, guesses, started_by, started_at, "
-                "board_message_id, level) VALUES (?, ?, ?, '[]', ?, ?, ?, ?)",
-                (channel.id, guild.id if guild else None, game["answer"], user.id, time.time(), message.id, level),
+                "board_message_id, level, setter) VALUES (?, ?, ?, '[]', ?, ?, ?, ?, ?)",
+                (channel.id, guild.id if guild else None, game["answer"], user.id, time.time(), message.id, level, setter),
             )
 
 
 @bot.command(name="나라시작", aliases=["나라맞히기", "나라"])
 @commands.guild_only()
 async def nara_start_command(ctx, *, level: str = ""):
+    if level.strip() == "출제":
+        await nara_set_command(ctx)
+        return
     chosen = nara.level_of(level)
     if chosen is None:
         await ctx.reply("난이도는 `쉬움`, `보통`, `어려움`입니다. 예: `!나라시작 쉬움`", mention_author=False)
@@ -4293,6 +4321,9 @@ async def nara_guess_command(ctx, *, name: str = ""):
                 return
             await ctx.reply("이 채널에는 진행 중인 판이 없습니다. `!나라시작`으로 시작해 주세요.", mention_author=False)
             return
+        if game["setter"] == ctx.author.id:
+            await ctx.reply("출제자는 추측할 수 없습니다. 다른 사람들이 맞힐 때까지 기다려 주세요!", mention_author=False)
+            return
         guesses = json.loads(game["guesses"])
         code, answer, level = country["code"], game["answer"], game["level"]
         if any(done == code for done, _ in guesses):
@@ -4304,8 +4335,9 @@ async def nara_guess_command(ctx, *, name: str = ""):
         answer_name = nara.countries()[answer]["ko"]
         limit = nara.max_guesses(level)
         if code == answer:
+            setter = f"\n-# 출제: <@{game['setter']}>" if game["setter"] else ""
             content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{answer_name}**입니다.\n"
-                       f"-# 추측 시도 {len(guesses)}번\n-# {nara.summary(answer)}")
+                       f"-# 추측 시도 {len(guesses)}번{setter}\n-# {nara.summary(answer)}")
             if len(_nara_just_won) >= 300:
                 _nara_just_won.clear()
             _nara_just_won[ctx.channel.id] = (code, ctx.author.id, time.monotonic())
@@ -4313,6 +4345,8 @@ async def nara_guess_command(ctx, *, name: str = ""):
             column = {nara.EASY: "easy_wins", nara.NORMAL: "wins", nara.HARD: "hard_wins"}[level]
             with connect_db() as conn:
                 conn.execute("DELETE FROM nara_games WHERE channel_id = ?", (ctx.channel.id,))
+                if game["setter"]:  # a chosen answer isn't a fair game for the ranking
+                    return
                 conn.execute(
                     f"INSERT INTO nara_scores(guild_id, user_id, {column}) VALUES (?, ?, 1) "
                     f"ON CONFLICT(guild_id, user_id) DO UPDATE SET {column} = {column} + 1",
@@ -4345,6 +4379,71 @@ async def nara_giveup_command(ctx):
                    f"-# 추측 시도 {len(guesses)}번\n-# {nara.summary(answer)}")
         await nara_post_board(ctx.channel, game, guesses, content, finished=True)
         nara_end_game(ctx.channel.id)
+
+
+@bot.command(name="나라출제")
+@commands.guild_only()
+async def nara_set_command(ctx):
+    """Choose the answer yourself: a button (only for you) opens a private form, so nobody sees the country."""
+    if nara_game(ctx.channel.id):
+        await ctx.reply("이 채널에는 진행 중인 판이 있습니다. 끝난 뒤(또는 `!포기` 후) 출제해 주세요.", mention_author=False)
+        return
+    await ctx.channel.send(f"-# {ctx.author.mention}님의 요청 · 나라 맞히기 출제\n"
+                           "✏️ 아래 버튼을 눌러 낼 나라를 정해 주세요. 입력 창은 출제자에게만 보입니다.",
+                           view=discord.ui.View(timeout=None).add_item(NaraSetButton(ctx.author.id)))
+
+
+class NaraSetButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:naraset:(?P<user_id>\d+)"):
+    """[나라 정하기] under !나라출제; only the person who asked can use it (works after a restart)."""
+
+    def __init__(self, user_id):
+        super().__init__(discord.ui.Button(label="나라 정하기", emoji="✏️", style=discord.ButtonStyle.primary,
+                                           custom_id=f"maco:naraset:{user_id}"))
+        self.user_id = user_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["user_id"]))
+
+    async def callback(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("출제한 사람만 누를 수 있습니다. `!나라출제`로 직접 출제해 보세요!",
+                                                    ephemeral=True)
+            return
+        await interaction.response.send_modal(NaraSetModal())
+
+
+class NaraSetModal(SafeModal, title="나라 출제"):
+    def __init__(self):
+        super().__init__()
+        self.country = discord.ui.TextInput(max_length=60, placeholder="예: 이집트")
+        self.rule = discord.ui.Select(options=[
+            discord.SelectOption(label="보통 규칙", value=nara.NORMAL, default=True,
+                                 description="모든 힌트 · 횟수 제한 없음"),
+            discord.SelectOption(label="어려움 규칙", value=nara.HARD,
+                                 description="이웃·평균 기온 칸 · 10번 안에"),
+        ])
+        self.add_item(discord.ui.Label(text="낼 나라", component=self.country))
+        self.add_item(discord.ui.Label(text="규칙", component=self.rule))
+
+    async def on_submit(self, interaction):
+        name = self.country.value.strip()
+        country = nara.find(name)
+        if country is None:
+            await interaction.response.send_message(f"{nara_not_found(name)}\n-# 버튼을 다시 눌러 주세요.", ephemeral=True)
+            return
+        if nara_game(interaction.channel.id):
+            await interaction.response.send_message("그새 이 채널에 다른 판이 시작됐습니다. 끝난 뒤 다시 출제해 주세요.",
+                                                    ephemeral=True)
+            return
+        await interaction.response.send_message(f"**{country['ko']}**{nara.josa(country['ko'], '을', '를')} 냈습니다! "
+                                                "다른 사람들이 맞힐 때까지 기다려 주세요.", ephemeral=True)
+        level = self.rule.values[0] if self.rule.values else nara.NORMAL
+        try:
+            await interaction.message.delete()  # the button message, done with
+        except (discord.HTTPException, AttributeError):
+            pass
+        await nara_start(interaction.channel, interaction.guild, interaction.user, level, country["code"])
 
 
 def nara_ranking_text(guild_id, limit=10):
@@ -4514,8 +4613,10 @@ class QuizKind:
 
 FLAG_QUIZ = QuizKind(quiz.FLAG, "국기 맞히기", "🚩", "flag", ("국기시작", "국기", "국기스킵", "국기중지", "국기순위"), "나라")
 CAPITAL_QUIZ = QuizKind(quiz.CAPITAL, "수도 맞히기", "🏛️", "capital", ("수도시작", "수도", "수도스킵", "수도중지", "수도순위"), "수도")
-QUIZZES = (FLAG_QUIZ, CAPITAL_QUIZ)
-QUIZ_FLAG_FILE = "국기.png"  # always this name, so the file name never gives the answer away
+MAP_QUIZ = QuizKind(quiz.MAP, "지도 맞히기", "🗺️", "map", ("지도시작", "지도", "지도스킵", "지도중지", "지도순위"), "나라")
+QUIZZES = (FLAG_QUIZ, CAPITAL_QUIZ, MAP_QUIZ)
+QUIZ_FLAG_FILE = "국기.png"  # always these names, so the file name never gives the answer away
+QUIZ_MAP_FILE = "지도.png"
 QUIZ_RECENT = 30  # countries asked lately in a channel's quiz, not asked again soon
 QUIZ_LATE_SECONDS = 15
 _quiz_just_answered = {}  # (kind, channel id) -> (country, when): a right answer a moment too late gets ⏱️, not ❌
@@ -4550,6 +4651,9 @@ async def quiz_post_question(q, channel, game, header=None):
     if q is CAPITAL_QUIZ:
         c = nara.countries()[game["answer"]]
         text = f"{head}\n## {c.get('flag', '')} {c['ko']}의 수도는?\n-# {help_line}"
+    elif q is MAP_QUIZ:
+        text = f"{head}\n-# {help_line}"
+        file = discord.File(quiz.map_path(game["answer"], game["level"]), QUIZ_MAP_FILE)
     else:
         text = f"{head}\n-# {help_line}"
         file = discord.File(quiz.flag_path(game["answer"]), QUIZ_FLAG_FILE)
@@ -4733,6 +4837,7 @@ def quiz_register(q, start_aliases, answer_aliases, skip_aliases, stop_aliases, 
 
 quiz_register(FLAG_QUIZ, ["국기맞히기"], [], ["국기패스", "국기넘기기"], ["국기그만"], ["국기랭킹"])
 quiz_register(CAPITAL_QUIZ, ["수도맞히기"], [], ["수도패스", "수도넘기기"], ["수도그만"], ["수도랭킹"])
+quiz_register(MAP_QUIZ, ["지도맞히기"], [], ["지도패스", "지도넘기기"], ["지도그만"], ["지도랭킹"])
 
 
 @bot.command(name="힌트")
@@ -4814,6 +4919,7 @@ HELP_ACTIONS = {
     "nara_info": lambda interaction: interaction.response.send_modal(NaraInfoModal()),
     **help_quiz_actions(FLAG_QUIZ),
     **help_quiz_actions(CAPITAL_QUIZ),
+    **help_quiz_actions(MAP_QUIZ),
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,
@@ -5117,7 +5223,7 @@ async def setup_hook():
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton,
-                          DdayPick, DdayAfter, DdayCelebrateButton, SongDisplayButton)
+                          DdayPick, DdayAfter, DdayCelebrateButton, SongDisplayButton, NaraSetButton)
     await load_help_emojis()
     if dashboard.configured():
         task = asyncio.get_running_loop().create_task(dashboard_loop())
