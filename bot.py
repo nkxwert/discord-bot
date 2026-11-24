@@ -4672,8 +4672,8 @@ def quiz_lock(q, channel_id):
 def quiz_reveal(q, code, guild_id=None):
     """The answer of a question, for messages: '🇫🇷 **프랑스**' / '🇲🇳 몽골의 수도 **울란바토르**'"""
     if q is SONG_QUIZ:
-        info = song_info(guild_id, code) or {"title": "?", "artist": "?"}
-        return f"**{info['title']}** - {info['artist']}"
+        info = song_info(guild_id, code)
+        return f"**{info['title']}** - {info['artist']}" if info else "(목록에서 지워진 곡)"
     if q is ANIME_QUIZ:
         c = quiz.anime()[code]
         return f"**{c['ko']}** · 『{c['work']}』"
@@ -5345,6 +5345,10 @@ async def song_clip(guild_id, sid, seconds):
 async def song_answer_file(guild_id, sid):
     """The whole 30-second preview, named after the song, to play from the answer message (rather than a link:
     the services' pages don't open everywhere, e.g. Deezer in Korea)."""
+    info = song_info(guild_id, sid)
+    if info is None:  # a server's song deleted meanwhile
+        _song_ready.pop(sid, None)
+        return None
     task = _song_ready.get(sid)
     data = (await task).get("answer") if task else None
     if not data:
@@ -5353,7 +5357,6 @@ async def song_answer_file(guild_id, sid):
     if not data:
         return None
     _song_ready.pop(sid, None)  # done with this song
-    info = song_info(guild_id, sid) or {"title": "노래", "artist": ""}
     name = re.sub(r'[\\/:*?"<>|]+', " ", f"{info['title']} - {info['artist']}").strip()[:80] or "노래"
     return discord.File(io.BytesIO(data), f"{name}.mp3")
 
