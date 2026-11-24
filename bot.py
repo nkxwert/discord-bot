@@ -4509,37 +4509,9 @@ async def show_nara_page(interaction, details=None, notice=None):
                     extra_items=nara_buttons())
 
 
-# !정보: a country's summary from Korean Wikipedia (fetched when asked, kept a day) and the bundled numbers.
-WIKI_SUMMARY_URL = "https://ko.wikipedia.org/api/rest_v1/page/summary/{}"
-WIKI_USER_AGENT = "maco-discord-bot/1.0 (Discord bot; country info command)"
-WIKI_CACHE_SECONDS = 24 * 60 * 60
-_wiki_cache = {}  # title -> (fetched at, summary); at most 60
-
-
-async def wiki_summary(title):
-    """{'extract', 'thumbnail', 'url'} for a Korean Wikipedia article, or None if it can't be fetched now."""
-    cached = _wiki_cache.get(title)
-    if cached and time.time() - cached[0] < WIKI_CACHE_SECONDS:
-        return cached[1]
-    try:
-        async with net.session().get(WIKI_SUMMARY_URL.format(quote(title.replace(" ", "_"), safe="")),
-                                     headers={"User-Agent": WIKI_USER_AGENT},
-                                     timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-        return None
-    summary = {
-        "extract": data.get("extract") or "",
-        "thumbnail": (data.get("thumbnail") or {}).get("source"),
-        "url": ((data.get("content_urls") or {}).get("desktop") or {}).get("page"),
-    }
-    _wiki_cache.pop(title, None)
-    if len(_wiki_cache) >= 60:
-        _wiki_cache.pop(next(iter(_wiki_cache)))
-    _wiki_cache[title] = (time.time(), summary)
-    return summary
+# !정보: the introduction from Korean Wikipedia and the numbers, all bundled in assets/countries.json. (Asking
+# Wikipedia when the command was used often failed: it turns away busy shared server addresses with 429.)
+WIKI_PAGE_URL = "https://ko.wikipedia.org/wiki/{}"
 
 
 def nara_not_found(name):
@@ -4548,18 +4520,22 @@ def nara_not_found(name):
     return f"`{name[:50]}`라는 나라를 찾지 못했습니다.{hint}"
 
 
-async def nara_info_embed(country):
-    summary = await wiki_summary(country["wiki"])
-    text = nara.intro(summary["extract"]) if summary else ""
+def nara_info_message(country):
+    """{'embed', 'file'} for !정보: the bundled introduction, the numbers, and the flag from assets/flags."""
+    text = nara.intro(country.get("intro", "")) or nara.basic_intro(country)
     embed = discord.Embed(title=f"{country.get('flag', '')} {country['ko']} ({country['en']})",
-                          description=text or "-# (위키백과 소개를 지금 불러오지 못했습니다)",
-                          url=summary["url"] if summary and summary["url"] else None, color=discord.Color.green())
+                          description=text,
+                          url=WIKI_PAGE_URL.format(quote(country["wiki"].replace(" ", "_"))) if country.get("wiki") else None,
+                          color=discord.Color.green())
     for name, value in nara.info_fields(country):
         embed.add_field(name=name, value=value, inline=True)
-    if summary and summary["thumbnail"]:
-        embed.set_thumbnail(url=summary["thumbnail"])
-    embed.set_footer(text="출처: 위키백과 (소개), World Bank (인구), world-countries · Wikidata")
-    return embed
+    embed.set_footer(text="출처: 위키백과 (소개, CC BY-SA), World Bank (인구), world-countries · Wikidata")
+    message = {"embed": embed}
+    flag = quiz.flag_path(country["code"])
+    if flag.exists():
+        message["file"] = discord.File(flag, "flag.png")
+        embed.set_thumbnail(url="attachment://flag.png")
+    return message
 
 
 @bot.command(name="정보", aliases=["나라정보"])
@@ -4575,9 +4551,7 @@ async def nara_info_command(ctx, *, name: str = ""):
     if not nara.has_info():
         await ctx.reply("봇의 나라 데이터 파일(assets/countries.json)이 예전 버전이라 정보를 보여 줄 수 없습니다.", mention_author=False)
         return
-    async with ctx.typing():
-        embed = await nara_info_embed(country)
-    await ctx.reply(embed=embed, mention_author=False)
+    await ctx.reply(mention_author=False, **nara_info_message(country))
 
 
 class NaraInfoModal(SafeModal, title="나라 정보"):
@@ -4596,7 +4570,7 @@ class NaraInfoModal(SafeModal, title="나라 정보"):
         ctx = HelpContext(interaction, f"나라 정보 · {country['ko']}")
 
         async def post():
-            await ctx.reply(embed=await nara_info_embed(country))
+            await ctx.reply(**nara_info_message(country))
         await run_from_help(ctx, post())
 
 

@@ -460,6 +460,15 @@ def intro(extract, limit=420):
     return cut[:end + 1] if end > limit // 3 else cut.rstrip() + "…"
 
 
+def basic_intro(c):
+    """A plain introduction made from the bundled numbers, for a country without a Wikipedia one."""
+    sea = "바다가 없는 내륙국이다" if c["landlocked"] else "바다에 닿아 있다"
+    neighbours = border_names(c)
+    near = f" 이웃 나라는 {', '.join(neighbours[:5])}{' 등' if len(neighbours) > 5 else ''}이다." if neighbours else ""
+    return (f"{c['ko']}{josa(c['ko'], '은', '는')} {c['continent']}에 있는 나라로, 수도는 {c['capital']}이다. "
+            f"인구는 약 {korean_number(c['population'])}명, 면적은 {c['area']:,.0f}㎢이며 {sea}.{near}")
+
+
 def info_fields(c):
     """[(name, value)] for the !정보 embed."""
     density = c["population"] / c["area"] if c["area"] else 0
