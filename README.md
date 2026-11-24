@@ -153,4 +153,4 @@ python bot.py
 - 카드 폰트는 [Monocraft](https://github.com/IdreesInc/Monocraft)와 [Galmuri](https://github.com/quiple/galmuri), 글자콘 폰트는 [검은고딕(Black Han Sans)](https://github.com/zesstype/Black-Han-Sans)입니다(모두 SIL Open Font License 1.1). 라이선스는 `assets/fonts/`에 있습니다.
 
 #Invite it!
-https://discord.com/oauth2/authorize?client_id=1561618276763570186&permissions=8515703062133056&integration_type=0&scope=bot%20applications.commands
+https://discord.com/oauth2/authorize?client_id=1561618276763570186&permissions=277562641472&integration_type=0&scope=bot%20applications.commands
