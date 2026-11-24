@@ -368,7 +368,7 @@ def init_db():
         if "easy_wins" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_scores)")]:
             conn.execute("ALTER TABLE nara_scores ADD COLUMN easy_wins INTEGER NOT NULL DEFAULT 0")
         # 국기 맞히기 / 수도 맞히기: one quiz of each per channel and how many each person has got, per difficulty.
-        for table in ("flag", "capital", "map", "anime"):
+        for table in ("flag", "capital", "map", "anime", "song"):
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {table}_games (
                     channel_id INTEGER PRIMARY KEY,
@@ -394,6 +394,22 @@ def init_db():
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
+        # 노래 맞히기: the genre a quiz was started with, and the songs each server added (!노래추가).
+        if "genre" not in [row["name"] for row in conn.execute("PRAGMA table_info(song_games)")]:
+            conn.execute("ALTER TABLE song_games ADD COLUMN genre TEXT")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS song_custom (
+                guild_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                names TEXT NOT NULL,
+                cover TEXT,
+                added_by INTEGER NOT NULL,
+                added_at REAL NOT NULL,
+                PRIMARY KEY (guild_id, id)
+            )
+        """)
         # 애니캐 맞히기: the works each server chose on the 작품 고르기 page (no row: all works).
         conn.execute("CREATE TABLE IF NOT EXISTS anime_works (guild_id INTEGER PRIMARY KEY, works TEXT NOT NULL)")
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
@@ -1313,6 +1329,9 @@ def command_list_embed():
                     value="애니캐 맞히기: 애니 캐릭터 그림을 보고 가장 먼저 이름을 맞힌 사람의 개수가 기록됩니다. "
                           "`!애니 리스트`로 작품 목록, `!애니 추천 <작품>`으로 작품 추천.",
                     inline=False)
+    embed.add_field(name="!노래시작 [쉬움|보통|어려움] [장르] [문제 수] · !노래 <제목> · !노래추가 <곡>",
+                    value="노래 맞히기: 노래 일부분(공식 미리듣기)을 듣고 가장 먼저 제목을 맞힌 사람의 개수가 기록됩니다. "
+                          "`!노래추가`로 이 서버에 곡을 넣을 수 있습니다.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -3180,7 +3199,7 @@ HELP_CATEGORIES = {
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
     "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
-    "game": ("🎮", "게임", ["nara", "flag", "capital", "map", "anime"]),
+    "game": ("🎮", "게임", ["nara", "flag", "capital", "map", "anime", "song"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -3273,6 +3292,20 @@ HELP_COMMANDS = {
               "이름만 써도 정답 (예: `탄지로`) · 영어·일본어 이름도 정답\n"
               "시간·횟수 제한 없음 · 틀리면 ❌ · 한발 늦으면 ⏱️\n"
               "-# 그림·캐릭터 정보: AniList"),
+    "song": ("노래 맞히기", "!노래시작",
+             "노래 일부분을 듣고 제목을 맞힙니다. **가장 먼저 맞힌 사람**의 개수가 기록됩니다.\n\n"
+             "**명령어**\n"
+             "`!노래시작 [쉬움|보통|어려움] [장르] [문제 수]` 시작 (기본 10문제, 최대 50)\n"
+             "`!노래 <제목>` 답하기 · `!힌트` 가수 → 한 번 더 치면 초성\n"
+             "`!노래스킵` 넘기기 · `!노래중지` 그만 · `!노래순위` 순위\n"
+             "`!노래추가 <가수와 제목> [| 다른 이름]` 이 서버에 곡 추가 · `!노래목록` · `!노래삭제 <번호>`\n\n"
+             "**난이도** (들려주는 길이)\n"
+             "🟢 쉬움 — 10초 · 🌍 보통 — 5초 · 🔥 어려움 — 2초\n\n"
+             "**장르** (안 쓰면 전부)\n"
+             "`케이팝` · `제이팝`(애니 포함) · `팝송` · `추가곡`(이 서버에서 추가한 곡만)\n\n"
+             "**규칙**\n"
+             "제목만 맞히면 정답 (한글·영어·흔한 다른 표기) · 틀리면 ❌ · 한발 늦으면 ⏱️\n"
+             "-# 노래는 Deezer의 공식 30초 미리듣기 중 일부입니다"),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -3286,7 +3319,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "map": "🗺️", "anime": "🎌", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "map": "🗺️", "anime": "🎌", "song": "🎵", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -3429,7 +3462,7 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
     for extra in (details, notice):
         if extra:
             text += f"\n\n{extra}"
-    for key in keys:
+    for index, key in enumerate(keys):
         style = discord.ButtonStyle.success if key == selected else discord.ButtonStyle.secondary
         if key == "upload" and upload_url:
             # A link button: one press opens the upload page; the file is posted automatically afterwards.
@@ -3439,7 +3472,9 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
             view.add_item(discord.ui.Button(label="준비 중...", emoji="⏳", disabled=True, row=0,
                                             custom_id="maco:help:wait"))
         else:
-            button(f"run_{key}", HELP_COMMANDS[key][0], help_emojis.get(key) or HELP_BUTTON_EMOJIS.get(key), style)
+            # A row holds 5 buttons: a 6th command (the 게임 tab) goes on the next row, beside ◀ 처음으로.
+            button(f"run_{key}", HELP_COMMANDS[key][0], help_emojis.get(key) or HELP_BUTTON_EMOJIS.get(key), style,
+                   row=index // 5)
         if key == "upload":
             button("attach", "첨부", "📎", discord.ButtonStyle.secondary)
     button("home", "◀ 처음으로", style=discord.ButtonStyle.secondary, row=1)
@@ -4610,7 +4645,8 @@ FLAG_QUIZ = QuizKind(quiz.FLAG, "국기 맞히기", "🚩", "flag", ("국기시�
 CAPITAL_QUIZ = QuizKind(quiz.CAPITAL, "수도 맞히기", "🏛️", "capital", ("수도시작", "수도", "수도스킵", "수도중지", "수도순위"), "수도")
 MAP_QUIZ = QuizKind(quiz.MAP, "지도 맞히기", "🗺️", "map", ("지도시작", "지도", "지도스킵", "지도중지", "지도순위"), "나라")
 ANIME_QUIZ = QuizKind(quiz.ANIME, "애니캐 맞히기", "🎌", "anime", ("캐릭시작", "캐릭", "캐릭스킵", "캐릭중지", "캐릭순위"), "이름")
-QUIZZES = (FLAG_QUIZ, CAPITAL_QUIZ, MAP_QUIZ, ANIME_QUIZ)
+SONG_QUIZ = QuizKind(quiz.SONG, "노래 맞히기", "🎵", "song", ("노래시작", "노래", "노래스킵", "노래중지", "노래순위"), "제목")
+QUIZZES = (FLAG_QUIZ, CAPITAL_QUIZ, MAP_QUIZ, ANIME_QUIZ, SONG_QUIZ)
 ANILIST_URL = "https://graphql.anilist.co"
 ANIME_FILE_MAX = 8 * 1024 * 1024
 QUIZ_FLAG_FILE = "국기.png"  # always these names, so the file name never gives the answer away
@@ -4629,8 +4665,11 @@ def quiz_lock(q, channel_id):
     return nara_lock(f"{q.key}:{channel_id}")
 
 
-def quiz_reveal(q, code):
+def quiz_reveal(q, code, guild_id=None):
     """The answer of a question, for messages: '🇫🇷 **프랑스**' / '🇲🇳 몽골의 수도 **울란바토르**'"""
+    if q is SONG_QUIZ:
+        info = song_info(guild_id, code) or {"title": "?", "artist": "?"}
+        return f"**{info['title']}** - {info['artist']} · <https://www.deezer.com/track/{code[2:]}>"
     if q is ANIME_QUIZ:
         c = quiz.anime()[code]
         return f"**{c['ko']}** · 『{c['work']}』"
@@ -4640,7 +4679,9 @@ def quiz_reveal(q, code):
     return f"{c.get('flag', '')} **{c['ko']}**"
 
 
-def quiz_hint_word(q, code):
+def quiz_hint_word(q, code, guild_id=None):
+    if q is SONG_QUIZ:
+        return song_hint_word(song_info(guild_id, code) or {"title": "?", "names": []})
     if q is ANIME_QUIZ:
         return quiz.anime()[code]["ko"]
     c = nara.countries()[code]
@@ -4649,13 +4690,19 @@ def quiz_hint_word(q, code):
 
 async def quiz_post_question(q, channel, game, header=None):
     head = f"{q.emoji} **{q.title} · {quiz.LEVEL_NAMES[game['level']]}** · {game['number']}/{game['total']}"
-    ro = "으로" if q.noun == "이름" else "로"
-    hint = "`!힌트` 작품·초성" if q is ANIME_QUIZ else "`!힌트` 초성"
+    ro = "으로" if q.noun in ("이름", "제목") else "로"
+    hint = {ANIME_QUIZ: "`!힌트` 작품·초성", SONG_QUIZ: "`!힌트` 가수·초성"}.get(q, "`!힌트` 초성")
     help_line = f"`!{q.answer} <{q.noun}>`{ro} 답하기 · {hint} · `!{q.skip}` 넘기기 · `!{q.stop}` 그만"
     file = None
     if q is CAPITAL_QUIZ:
         c = nara.countries()[game["answer"]]
         text = f"{head}\n## {c.get('flag', '')} {c['ko']}의 수도는?\n-# {help_line}"
+    elif q is SONG_QUIZ:
+        seconds = quiz.SONG_SECONDS[game["level"]]
+        file = await song_clip(game["answer"], seconds)
+        text = f"{head} · {seconds}초\n-# {help_line}"
+        if file is None:
+            text += f"\n-# (노래를 불러오지 못했습니다. `!{q.skip}`으로 넘겨 주세요)"
     elif q is ANIME_QUIZ:
         file = await anime_picture(game["answer"])
         text = f"{head}\n-# {help_line}"
@@ -4719,7 +4766,10 @@ async def quiz_next(q, channel, game, header):
         await channel.send(f"{header}\n🏁 **{q.title} · {game['total']}문제 끝!**\n-# {quiz_result_line(game)}")
         return
     recent = json.loads(game["recent"])
-    answer = quiz.pick(game["level"], recent, q.key, quiz_works(q, game["guild_id"]))
+    if q is SONG_QUIZ:
+        answer = song_pick(game["guild_id"], game["genre"], recent) or game["answer"]
+    else:
+        answer = quiz.pick(game["level"], recent, q.key, quiz_works(q, game["guild_id"]))
     with connect_db() as conn:
         conn.execute(f"UPDATE {q.table}_games SET answer = ?, number = number + 1, recent = ?, hinted = 0 "
                      "WHERE channel_id = ?",
@@ -4744,20 +4794,30 @@ def quiz_works(q, guild_id):
     return anime_works_of(guild_id) if q is ANIME_QUIZ else None
 
 
-async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFAULT_COUNT):
+async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFAULT_COUNT, genre=None):
     async with quiz_lock(q, channel.id):
         game = quiz_game(q, channel.id)
         header = f"-# {user.mention}님의 요청 · {q.title}"
         if game:
             await quiz_post_question(q, channel, game, f"{header}\n진행 중인 퀴즈를 이어서 합니다.")
             return
-        answer = quiz.pick(level, kind=q.key, works=quiz_works(q, guild.id if guild else None))
+        if q is SONG_QUIZ:
+            answer = song_pick(guild.id if guild else None, genre)
+            if answer is None:
+                await channel.send(f"{header}\n이 서버에 추가한 곡이 없습니다. `!노래추가 <가수와 제목>`으로 먼저 추가해 주세요.")
+                return
+        else:
+            answer = quiz.pick(level, kind=q.key, works=quiz_works(q, guild.id if guild else None))
         with connect_db() as conn:
             conn.execute(
                 f"INSERT OR REPLACE INTO {q.table}_games(channel_id, guild_id, level, answer, number, total, recent, "
                 "scores, hinted, started_by, started_at) VALUES (?, ?, ?, ?, 1, ?, ?, '{}', 0, ?, ?)",
                 (channel.id, guild.id if guild else None, level, answer, count, json.dumps([answer]), user.id, time.time()),
             )
+            if q is SONG_QUIZ:
+                conn.execute("UPDATE song_games SET genre = ? WHERE channel_id = ?", (genre, channel.id))
+        if q is SONG_QUIZ and genre:
+            header += f"\n-# 장르: {quiz.SONG_GENRES[genre]}"
         works = quiz_works(q, guild.id if guild else None)
         if works:
             header += f"\n-# 이 서버에서 고른 작품 {len(works)}개에서 나옵니다 · 바꾸기: `!캐릭설정`"
@@ -4765,6 +4825,9 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
 
 
 async def quiz_start_command(q, ctx, options):
+    genre = None
+    if q is SONG_QUIZ:
+        genre, options = quiz.split_song_options(options)
     parsed = quiz.parse_start(options)
     if q is CAPITAL_QUIZ and not nara.has_info():
         await ctx.reply("봇의 나라 데이터 파일(assets/countries.json)이 예전 버전이라 수도 맞히기를 할 수 없습니다.",
@@ -4777,7 +4840,7 @@ async def quiz_start_command(q, ctx, options):
         await ctx.reply(f"`!{q.start} [쉬움|보통|어려움] [문제 수 1~{quiz.MAX_COUNT}]`처럼 써 주세요. "
                         f"예: `!{q.start} 어려움 20`", mention_author=False)
         return
-    await quiz_start(q, ctx.channel, ctx.guild, ctx.author, *parsed)
+    await quiz_start(q, ctx.channel, ctx.guild, ctx.author, *parsed, genre=genre)
 
 
 async def quiz_react(message, emoji):
@@ -4801,6 +4864,8 @@ async def quiz_answer_command(q, ctx, text):
         named = quiz.capital_codes(text)  # an unknown name is simply wrong: suggesting one would give it away
     elif q is ANIME_QUIZ:
         named = quiz.anime_codes(text)
+    elif q is SONG_QUIZ:
+        named = quiz.song_codes(text, song_custom(game["guild_id"]))
     else:
         country = nara.find(text)
         if country is None:
@@ -4830,7 +4895,7 @@ async def quiz_answer_command(q, ctx, text):
             )
             total = conn.execute(f"SELECT {level} FROM {q.table}_scores WHERE guild_id = ? AND user_id = ?",
                                  (ctx.guild.id, ctx.author.id)).fetchone()[0]
-        header = (f"-# {ctx.author.mention}님의 정답 · {q.title}\n🎉 {quiz_reveal(q, answer)}\n"
+        header = (f"-# {ctx.author.mention}님의 정답 · {q.title}\n🎉 {quiz_reveal(q, answer, game['guild_id'])}\n"
                   f"-# {quiz.LEVEL_NAMES[level]} 누적 {total}개\n")
         await quiz_next(q, ctx.channel, quiz_game(q, ctx.channel.id), header)
 
@@ -4842,7 +4907,7 @@ async def quiz_skip_command(q, ctx):
             await ctx.reply(f"이 채널에는 진행 중인 {q.title} 퀴즈가 없습니다.", mention_author=False)
             return
         await quiz_next(q, ctx.channel, game,
-                        f"-# {ctx.author.mention}님이 넘겼습니다 · {q.title}\n⏭️ 정답: {quiz_reveal(q, game['answer'])}\n")
+                        f"-# {ctx.author.mention}님이 넘겼습니다 · {q.title}\n⏭️ 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n")
 
 
 async def quiz_stop_command(q, ctx):
@@ -4854,7 +4919,7 @@ async def quiz_stop_command(q, ctx):
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (ctx.channel.id,))
         await ctx.channel.send(f"-# {ctx.author.mention}님이 멈췄습니다 · {q.title}\n"
-                               f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'])}\n-# {quiz_result_line(game)}")
+                               f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n-# {quiz_result_line(game)}")
 
 
 def quiz_ranking_text(q, guild_id, limit=10):
@@ -4908,6 +4973,7 @@ def quiz_register(q, start_aliases, answer_aliases, skip_aliases, stop_aliases, 
 quiz_register(FLAG_QUIZ, ["국기맞히기"], [], ["국기패스", "국기넘기기"], ["국기그만"], ["국기랭킹"])
 quiz_register(CAPITAL_QUIZ, ["수도맞히기"], [], ["수도패스", "수도넘기기"], ["수도그만"], ["수도랭킹"])
 quiz_register(MAP_QUIZ, ["지도맞히기"], [], ["지도패스", "지도넘기기"], ["지도그만"], ["지도랭킹"])
+quiz_register(SONG_QUIZ, ["노래맞히기"], ["곡"], ["노래패스", "노래넘기기"], ["노래그만"], ["노래랭킹"])
 quiz_register(ANIME_QUIZ, ["캐릭맞히기", "애니캐"], ["캐릭터"], ["캐릭패스", "캐릭넘기기"], ["캐릭그만"], ["캐릭랭킹"])
 
 
@@ -4919,7 +4985,13 @@ async def quiz_hint_command(ctx):
     for q in QUIZZES:
         game = quiz_game(q, ctx.channel.id)
         if game:
-            word = quiz_hint_word(q, game["answer"])
+            word = quiz_hint_word(q, game["answer"], game["guild_id"])
+            if q is SONG_QUIZ and not game["hinted"]:  # first the singer, then the initials
+                with connect_db() as conn:
+                    conn.execute("UPDATE song_games SET hinted = 1 WHERE channel_id = ?", (ctx.channel.id,))
+                info = song_info(game["guild_id"], game["answer"]) or {"artist": "?"}
+                lines.append(f"💡 {q.title} 힌트: **{info['artist']}**의 노래입니다. (한 번 더 `!힌트`면 초성)")
+                continue
             if q is ANIME_QUIZ and not game["hinted"]:  # first the work, then the initials
                 with connect_db() as conn:
                     conn.execute(f"UPDATE {q.table}_games SET hinted = 1 WHERE channel_id = ?", (ctx.channel.id,))
@@ -5064,6 +5136,216 @@ async def anime_command(ctx, action: str = "", *, rest: str = ""):
                     mention_author=False)
 
 
+# ---------------------------------------------------------------- 노래 맞히기 (the parts only songs need)
+
+DEEZER_API = "https://api.deezer.com"
+SONG_FILE = "노래.mp3"
+SONG_PREVIEW_MAX = 4 * 1024 * 1024
+SONG_CUSTOM_MAX = 300  # songs one server can add
+SONG_SEARCH_JUNK = re.compile(r"karaoke|instrumental|inst\.|cover|piano|8-bit|lullaby|music box|orgel|tribute|"
+                              r"originally performed|가라오케|노래방|カラオケ", re.I)
+
+
+def song_custom(guild_id):
+    """[(id, names)] of the songs this server added, for matching answers."""
+    if not guild_id:
+        return []
+    with connect_db() as conn:
+        return [(r["id"], json.loads(r["names"])) for r in
+                conn.execute("SELECT id, names FROM song_custom WHERE guild_id = ?", (guild_id,))]
+
+
+def song_info(guild_id, sid):
+    """{title, artist, names, cover} of a built-in or server-added song, or None."""
+    if sid in quiz.songs():
+        return quiz.songs()[sid]
+    with connect_db() as conn:
+        row = conn.execute("SELECT * FROM song_custom WHERE guild_id = ? AND id = ?", (guild_id, sid)).fetchone()
+    return {"title": row["title"], "artist": row["artist"], "names": json.loads(row["names"]), "cover": row["cover"]} if row else None
+
+
+def song_pool(guild_id, genre):
+    """Song ids for a quiz: one genre, the server's added songs ("custom"), or (None) everything."""
+    custom = [sid for sid, _ in song_custom(guild_id)]
+    if genre == "custom":
+        return custom
+    built = [sid for sid, s in quiz.songs().items() if genre is None or s["genre"] == genre]
+    return built + (custom if genre is None else [])
+
+
+def song_pick(guild_id, genre, recent=()):
+    pool = song_pool(guild_id, genre)
+    if not pool:
+        return None
+    return random.choice([s for s in pool if s not in recent] or pool)
+
+
+def song_hint_word(info):
+    """The title to give the initials of: a Korean name when there is one."""
+    korean = [n for n in info["names"] if re.search(r"[가-힣]", n)]
+    return korean[0] if korean else info["title"]
+
+
+async def song_preview_url(sid):
+    """The current 30-second preview address (Deezer's are signed and expire, so it is asked for each time)."""
+    try:
+        async with net.session().get(f"{DEEZER_API}/track/{sid[2:]}", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json(content_type=None)
+        return data.get("preview") or None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError):
+        return None
+
+
+async def song_clip(sid, seconds):
+    """A few seconds of the song's official preview as 노래.mp3 (a random part, faded in and out), or None.
+    Nothing is kept: the preview goes to a temporary folder that is deleted at once."""
+    url = await song_preview_url(sid)
+    if not url:
+        return None
+    try:
+        async with net.session().get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200 or (resp.content_length or 0) > SONG_PREVIEW_MAX:
+                return None
+            data = await resp.read()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+    ffmpeg = storage.ffmpeg_path()
+    if not ffmpeg:
+        return discord.File(io.BytesIO(data), SONG_FILE)  # no ffmpeg: the whole 30 seconds
+    folder = tempfile.mkdtemp(prefix="maco-song-")
+    try:
+        source, out = os.path.join(folder, "in.mp3"), os.path.join(folder, "out.mp3")
+        with open(source, "wb") as f:
+            f.write(data)
+        start = random.uniform(1.5, max(1.5, 28 - seconds))
+        fade = min(0.4, seconds / 5)
+        code, _ = await storage._run_capture(
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}", "-t", str(seconds), "-i", source,
+            "-af", f"afade=t=in:d={fade / 2:.2f},afade=t=out:st={seconds - fade:.2f}:d={fade:.2f}",
+            "-vn", "-c:a", "libmp3lame", "-b:a", "128k", out, timeout=30)
+        if code != 0 or not os.path.exists(out):
+            return None
+        with open(out, "rb") as f:
+            return discord.File(io.BytesIO(f.read()), SONG_FILE)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+async def deezer_search(text, limit=5):
+    """[{id, title, artist, cover}] for !노래추가 (karaoke, covers and the like left out, previews only)."""
+    try:
+        async with net.session().get(f"{DEEZER_API}/search", params={"q": text, "limit": 25},
+                                     timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            rows = (await resp.json(content_type=None)).get("data") or []
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError):
+        return None
+    found, seen = [], set()
+    for r in rows:
+        title, artist = r.get("title") or "", (r.get("artist") or {}).get("name") or ""
+        if not r.get("preview") or SONG_SEARCH_JUNK.search(f"{title} {artist}") or (title, artist) in seen:
+            continue
+        seen.add((title, artist))
+        found.append({"id": f"dz{r['id']}", "title": title, "artist": artist,
+                      "cover": (r.get("album") or {}).get("cover_medium") or ""})
+        if len(found) >= limit:
+            break
+    return found
+
+
+class SongAddSelect(discord.ui.Select):
+    """The search results of !노래추가; only the person who searched can pick."""
+
+    def __init__(self, user_id, results, aliases):
+        options = [discord.SelectOption(label=r["title"][:100], description=r["artist"][:100], value=str(i))
+                   for i, r in enumerate(results)]
+        super().__init__(placeholder="추가할 곡을 고르세요", options=options)
+        self.user_id, self.results, self.aliases = user_id, results, aliases
+
+    async def callback(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("검색한 사람만 고를 수 있습니다.", ephemeral=True)
+            return
+        song = self.results[int(self.values[0])]
+        message = song_add(interaction.guild.id, song, self.aliases, interaction.user.id)
+        await interaction.response.edit_message(content=message, view=None)
+
+
+def song_add(guild_id, song, aliases, user_id):
+    """Add one search result to the server's songs; the message to show."""
+    if song["id"] in quiz.songs():
+        return f"🎵 이미 기본 목록에 있는 곡입니다: **{song['title']}** - {song['artist']}"
+    with connect_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM song_custom WHERE guild_id = ?", (guild_id,)).fetchone()[0]
+        if count >= SONG_CUSTOM_MAX:
+            return f"이 서버는 곡을 {SONG_CUSTOM_MAX}개까지 추가할 수 있습니다. `!노래삭제`로 정리해 주세요."
+        conn.execute(
+            "INSERT OR REPLACE INTO song_custom(guild_id, id, title, artist, names, cover, added_by, added_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, song["id"], song["title"], song["artist"],
+             json.dumps(quiz.song_names(song["title"], *aliases), ensure_ascii=False), song["cover"], user_id, time.time()),
+        )
+    names = quiz.song_names(song["title"], *aliases)
+    return (f"✅ 이 서버의 노래 맞히기에 추가했습니다: **{song['title']}** - {song['artist']}\n"
+            f"-# 정답으로 받는 이름: {', '.join(names)}")
+
+
+@bot.command(name="노래추가")
+@commands.guild_only()
+async def song_add_command(ctx, *, text: str = ""):
+    """!노래추가 <검색어> [| 다른 이름, 다른 이름]"""
+    query, _, extra = text.partition("|")
+    query = query.strip()
+    aliases = [a.strip() for a in extra.split(",") if a.strip()][:5]
+    if not query:
+        await ctx.reply("`!노래추가 <가수와 제목>`처럼 써 주세요. 예: `!노래추가 아이유 밤편지`\n"
+                        "-# 한글 제목도 정답으로 받으려면 `!노래추가 IU Through the Night | 밤편지`처럼 `|` 뒤에 적어 주세요.",
+                        mention_author=False)
+        return
+    results = await deezer_search(query[:100])
+    if results is None:
+        await ctx.reply("곡을 검색하지 못했습니다. 잠시 후 다시 시도해 주세요.", mention_author=False)
+        return
+    if not results:
+        await ctx.reply(f"`{query[:50]}`로 찾은 곡이 없습니다. 가수 이름이나 영어 제목으로 검색해 보세요.", mention_author=False)
+        return
+    view = discord.ui.View(timeout=180).add_item(SongAddSelect(ctx.author.id, results, aliases))
+    await ctx.reply("🔎 추가할 곡을 골라 주세요 (공식 30초 미리듣기가 있는 곡만 보여 줍니다)", view=view, mention_author=False)
+
+
+@bot.command(name="노래목록", aliases=["노래리스트"])
+@commands.guild_only()
+async def song_list_command(ctx):
+    with connect_db() as conn:
+        rows = conn.execute("SELECT title, artist FROM song_custom WHERE guild_id = ? ORDER BY added_at",
+                            (ctx.guild.id,)).fetchall()
+    counts = {g: sum(1 for s in quiz.songs().values() if s["genre"] == g) for g in ("kpop", "jpop", "pop")}
+    base = " · ".join(f"{quiz.SONG_GENRES[g]} {n}곡" for g, n in counts.items())
+    lines = [f"`{i}.` {r['title']} - {r['artist']}" for i, r in enumerate(rows, 1)]
+    embed = discord.Embed(title=f"🎵 노래 맞히기 · 이 서버 추가곡 {len(rows)}개",
+                          description="\n".join(lines)[:4000] or "아직 추가한 곡이 없습니다. `!노래추가 <가수와 제목>`으로 추가해 보세요.",
+                          color=discord.Color.green())
+    embed.set_footer(text=f"기본 목록: {base} · 지우기: !노래삭제 <번호>")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="노래삭제")
+@commands.guild_only()
+async def song_delete_command(ctx, number: str = ""):
+    with connect_db() as conn:
+        rows = conn.execute("SELECT id, title, artist, added_by FROM song_custom WHERE guild_id = ? ORDER BY added_at",
+                            (ctx.guild.id,)).fetchall()
+    if not number.isdigit() or not 1 <= int(number) <= len(rows):
+        await ctx.reply("`!노래삭제 <번호>`처럼 써 주세요. 번호는 `!노래목록`에서 볼 수 있습니다.", mention_author=False)
+        return
+    row = rows[int(number) - 1]
+    if row["added_by"] != ctx.author.id and not ctx.author.guild_permissions.manage_messages:
+        await ctx.reply("추가한 사람이나 메시지 관리 권한이 있는 사람만 지울 수 있습니다.", mention_author=False)
+        return
+    with connect_db() as conn:
+        conn.execute("DELETE FROM song_custom WHERE guild_id = ? AND id = ?", (ctx.guild.id, row["id"]))
+    await ctx.reply(f"🗑️ 지웠습니다: **{row['title']}** - {row['artist']}", mention_author=False)
+
+
 def quiz_buttons(q):
     buttons = [HelpButton(f"{q.key}_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
                HelpButton(f"{q.key}_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
@@ -5140,6 +5422,7 @@ HELP_ACTIONS = {
     **help_quiz_actions(CAPITAL_QUIZ),
     **help_quiz_actions(MAP_QUIZ),
     **help_quiz_actions(ANIME_QUIZ),
+    **help_quiz_actions(SONG_QUIZ),
     "anime_settings": help_anime_settings,
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),

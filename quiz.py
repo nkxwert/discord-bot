@@ -51,7 +51,12 @@ def parse_start(text):
     return level, count
 
 
-FLAG, CAPITAL, MAP, ANIME = "flag", "capital", "map", "anime"
+FLAG, CAPITAL, MAP, ANIME, SONG = "flag", "capital", "map", "anime", "song"
+SONG_PATH = Path(__file__).parent / "assets" / "songs.json"
+SONG_SECONDS = {EASY: 10, NORMAL: 5, HARD: 2}  # how long the clip of 노래 맞히기 is, by difficulty
+SONG_GENRES = {"kpop": "K-POP", "jpop": "J-POP·애니", "pop": "팝송", "custom": "이 서버 추가곡"}
+SONG_GENRE_WORDS = {"케이팝": "kpop", "kpop": "kpop", "k-pop": "kpop", "제이팝": "jpop", "jpop": "jpop", "j-pop": "jpop",
+                    "애니": "jpop", "팝": "pop", "팝송": "pop", "pop": "pop", "추가곡": "custom", "서버": "custom"}
 ANIME_PATH = Path(__file__).parent / "assets" / "anime.json"
 MAP_DIR = Path(__file__).parent / "assets" / "maps"
 MAP_MIN_HARD_AREA = 2500  # km²; smaller countries are dots or specks as a silhouette, so 어려움 skips them
@@ -162,3 +167,48 @@ def anime_works():
         w["chars"].append(c["ko"])
         w["stars"] += c["star"]
     return list(works.values())
+
+
+# ------------------------------------------------------------------ 노래 맞히기
+
+@lru_cache(maxsize=1)
+def songs():
+    """Deezer track id ("dz…") -> {genre, title, artist, names, cover}: the built-in list. Only names are kept;
+    the 30-second official preview is fetched from Deezer for each question (see assets/songs-SOURCES.md)."""
+    with open(SONG_PATH, encoding="utf-8") as f:
+        return {s["id"]: s for s in json.load(f)}
+
+
+@lru_cache(maxsize=1)
+def _song_index():
+    index = {}
+    for sid, s in songs().items():
+        for name in s["names"]:
+            index.setdefault(nara.normalize(name), set()).add(sid)
+    return index
+
+
+def song_codes(text, extra=()):
+    """Songs whose title (or another accepted name) this is; extra: (id, names) of a server's added songs."""
+    key = nara.normalize(text)
+    found = set(_song_index().get(key, set()))
+    found |= {sid for sid, names in extra if key in {nara.normalize(n) for n in names}}
+    return found
+
+
+def split_song_options(text):
+    """(genre or None, the rest) from what follows !노래시작: '케이팝 어려움 20' -> ('kpop', '어려움 20')."""
+    genre, rest = None, []
+    for word in text.split():
+        if word.lower() in SONG_GENRE_WORDS:
+            genre = SONG_GENRE_WORDS[word.lower()]
+        else:
+            rest.append(word)
+    return genre, " ".join(rest)
+
+
+def song_names(title, *extra):
+    """Accepted names for a song: its title, the title without (feat. …)/[…] parts, and any extras."""
+    import re
+    clean = re.sub(r"\s*[\(\[].*?[\)\]]", "", title).strip()
+    return sorted({n.strip() for n in (title, clean, *extra) if n and n.strip()})
