@@ -4,6 +4,7 @@
 Pure logic; bot.py keeps the quizzes (one of each kind per channel) and the counts. Country names, matching
 and the well-known list come from nara.py; the flag pictures are assets/flags/<code>.png (flagcdn.com, public
 domain); capitals and their accepted spellings are in assets/countries.json ('capitals', 'capital_names')."""
+import json
 import random
 from functools import lru_cache
 from pathlib import Path
@@ -50,12 +51,15 @@ def parse_start(text):
     return level, count
 
 
-FLAG, CAPITAL, MAP = "flag", "capital", "map"
+FLAG, CAPITAL, MAP, ANIME = "flag", "capital", "map", "anime"
+ANIME_PATH = Path(__file__).parent / "assets" / "anime.json"
 MAP_DIR = Path(__file__).parent / "assets" / "maps"
 MAP_MIN_HARD_AREA = 2500  # km²; smaller countries are dots or specks as a silhouette, so 어려움 skips them
 
 
 def pool(level, kind=FLAG):
+    if kind == ANIME:  # 쉬움: the best-known characters (★); 보통: all of them
+        return sorted(cid for cid, c in anime().items() if c["star"] or level != EASY)
     codes = sorted(nara.countries())
     if level == EASY:
         return [c for c in codes if c in nara.FAMOUS]
@@ -117,3 +121,27 @@ def chosung(text):
         code = ord(ch) - 0xAC00
         out.append(CHOSUNG[code // 588] if 0 <= code < 11172 else ch)
     return "".join(out)
+
+
+# ------------------------------------------------------------------ 애니캐 맞히기
+
+@lru_cache(maxsize=1)
+def anime():
+    """AniList character id -> {ko, work, star, names, image}. The pictures are not kept here: the bot
+    downloads one from AniList for each question (see assets/anime-SOURCES.md)."""
+    with open(ANIME_PATH, encoding="utf-8") as f:
+        return {c["id"]: c for c in json.load(f)}
+
+
+@lru_cache(maxsize=1)
+def _anime_index():
+    index = {}
+    for cid, c in anime().items():
+        for name in c["names"]:
+            index.setdefault(nara.normalize(name), set()).add(cid)
+    return index
+
+
+def anime_codes(text):
+    """The characters this name belongs to: the Korean name, the given name alone, or the English/Japanese name."""
+    return _anime_index().get(nara.normalize(text), set())

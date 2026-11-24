@@ -368,7 +368,7 @@ def init_db():
         if "easy_wins" not in [row["name"] for row in conn.execute("PRAGMA table_info(nara_scores)")]:
             conn.execute("ALTER TABLE nara_scores ADD COLUMN easy_wins INTEGER NOT NULL DEFAULT 0")
         # 국기 맞히기 / 수도 맞히기: one quiz of each per channel and how many each person has got, per difficulty.
-        for table in ("flag", "capital", "map"):
+        for table in ("flag", "capital", "map", "anime"):
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {table}_games (
                     channel_id INTEGER PRIMARY KEY,
@@ -1306,6 +1306,9 @@ def command_list_embed():
                           "`!수도스킵`은 넘기기, `!수도중지`는 그만하기입니다.", inline=False)
     embed.add_field(name="!지도시작 [쉬움|보통|어려움] [문제 수] · !지도 <나라> · !힌트 · !지도순위",
                     value="지도 맞히기: 지도(어려움은 나라 모양)를 보고 가장 먼저 나라를 맞힌 사람의 개수가 기록됩니다.",
+                    inline=False)
+    embed.add_field(name="!캐릭시작 [쉬움|보통] [문제 수] · !캐릭 <이름> · !힌트 · !캐릭순위",
+                    value="애니캐 맞히기: 애니 캐릭터 그림을 보고 가장 먼저 이름을 맞힌 사람의 개수가 기록됩니다.",
                     inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
@@ -3174,7 +3177,7 @@ HELP_CATEGORIES = {
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
     "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
-    "game": ("🎮", "게임", ["nara", "flag", "capital", "map"]),
+    "game": ("🎮", "게임", ["nara", "flag", "capital", "map", "anime"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -3252,6 +3255,19 @@ HELP_COMMANDS = {
             "🔥 어려움 — 덜 알려진 나라 · **나라 모양(실루엣)만**\n\n"
             "**규칙**\n"
             "아주 작은 나라는 빨간 동그라미로 표시 · 시간·횟수 제한 없음 · 틀리면 ❌ · 한발 늦으면 ⏱️"),
+    "anime": ("애니캐 맞히기", "!캐릭시작",
+              "애니 캐릭터 그림을 보고 이름을 맞힙니다. **가장 먼저 맞힌 사람**의 개수가 기록됩니다.\n\n"
+              "**명령어**\n"
+              "`!캐릭시작 [쉬움|보통] [문제 수]` 시작 (기본 10문제, 최대 50)\n"
+              "`!캐릭 <이름>` 답하기 · `!힌트` 작품 → 한 번 더 치면 초성\n"
+              "`!캐릭스킵` 넘기기 · `!캐릭중지` 그만 · `!캐릭순위` 순위\n\n"
+              "**난이도**\n"
+              "🟢 쉬움 — 누구나 아는 대표 캐릭터\n"
+              "🌍 보통 — 52개 작품의 캐릭터 약 300명\n\n"
+              "**규칙**\n"
+              "이름만 써도 정답 (예: `탄지로`) · 영어·일본어 이름도 정답\n"
+              "시간·횟수 제한 없음 · 틀리면 ❌ · 한발 늦으면 ⏱️\n"
+              "-# 그림·캐릭터 정보: AniList"),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -3265,7 +3281,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "map": "🗺️", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "map": "🗺️", "anime": "🎌", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -4588,7 +4604,10 @@ class QuizKind:
 FLAG_QUIZ = QuizKind(quiz.FLAG, "국기 맞히기", "🚩", "flag", ("국기시작", "국기", "국기스킵", "국기중지", "국기순위"), "나라")
 CAPITAL_QUIZ = QuizKind(quiz.CAPITAL, "수도 맞히기", "🏛️", "capital", ("수도시작", "수도", "수도스킵", "수도중지", "수도순위"), "수도")
 MAP_QUIZ = QuizKind(quiz.MAP, "지도 맞히기", "🗺️", "map", ("지도시작", "지도", "지도스킵", "지도중지", "지도순위"), "나라")
-QUIZZES = (FLAG_QUIZ, CAPITAL_QUIZ, MAP_QUIZ)
+ANIME_QUIZ = QuizKind(quiz.ANIME, "애니캐 맞히기", "🎌", "anime", ("캐릭시작", "캐릭", "캐릭스킵", "캐릭중지", "캐릭순위"), "이름")
+QUIZZES = (FLAG_QUIZ, CAPITAL_QUIZ, MAP_QUIZ, ANIME_QUIZ)
+ANILIST_URL = "https://graphql.anilist.co"
+ANIME_FILE_MAX = 8 * 1024 * 1024
 QUIZ_FLAG_FILE = "국기.png"  # always these names, so the file name never gives the answer away
 QUIZ_MAP_FILE = "지도.png"
 QUIZ_RECENT = 30  # countries asked lately in a channel's quiz, not asked again soon
@@ -4607,6 +4626,9 @@ def quiz_lock(q, channel_id):
 
 def quiz_reveal(q, code):
     """The answer of a question, for messages: '🇫🇷 **프랑스**' / '🇲🇳 몽골의 수도 **울란바토르**'"""
+    if q is ANIME_QUIZ:
+        c = quiz.anime()[code]
+        return f"**{c['ko']}** · 『{c['work']}』"
     c = nara.countries()[code]
     if q is CAPITAL_QUIZ:
         return f"{c.get('flag', '')} {c['ko']}의 수도 **{quiz.capital_text(code)}**"
@@ -4614,17 +4636,26 @@ def quiz_reveal(q, code):
 
 
 def quiz_hint_word(q, code):
+    if q is ANIME_QUIZ:
+        return quiz.anime()[code]["ko"]
     c = nara.countries()[code]
     return c.get("capitals", [c["capital"]])[0] if q is CAPITAL_QUIZ else c["ko"]
 
 
 async def quiz_post_question(q, channel, game, header=None):
     head = f"{q.emoji} **{q.title} · {quiz.LEVEL_NAMES[game['level']]}** · {game['number']}/{game['total']}"
-    help_line = f"`!{q.answer} <{q.noun}>`로 답하기 · `!힌트` 초성 · `!{q.skip}` 넘기기 · `!{q.stop}` 그만"
+    ro = "으로" if q.noun == "이름" else "로"
+    hint = "`!힌트` 작품·초성" if q is ANIME_QUIZ else "`!힌트` 초성"
+    help_line = f"`!{q.answer} <{q.noun}>`{ro} 답하기 · {hint} · `!{q.skip}` 넘기기 · `!{q.stop}` 그만"
     file = None
     if q is CAPITAL_QUIZ:
         c = nara.countries()[game["answer"]]
         text = f"{head}\n## {c.get('flag', '')} {c['ko']}의 수도는?\n-# {help_line}"
+    elif q is ANIME_QUIZ:
+        file = await anime_picture(game["answer"])
+        text = f"{head}\n-# {help_line}"
+        if file is None:
+            text += f"\n-# (그림을 불러오지 못했습니다. `!{q.skip}`으로 넘겨 주세요)"
     elif q is MAP_QUIZ:
         text = f"{head}\n-# {help_line}"
         file = discord.File(quiz.map_path(game["answer"], game["level"]), QUIZ_MAP_FILE)
@@ -4632,6 +4663,35 @@ async def quiz_post_question(q, channel, game, header=None):
         text = f"{head}\n-# {help_line}"
         file = discord.File(quiz.flag_path(game["answer"]), QUIZ_FLAG_FILE)
     await channel.send(f"{header}\n{text}" if header else text, **({"file": file} if file else {}))
+
+
+async def anime_picture(cid):
+    """The character's picture from AniList as a file named 캐릭터.<ext> (the address would give the answer
+    away), or None. If the saved address stopped working, the current one is asked for once."""
+    async def download(url):
+        try:
+            async with net.session().get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200 or (resp.content_length or 0) > ANIME_FILE_MAX:
+                    return None
+                return await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+
+    url = quiz.anime()[cid]["image"]
+    data = await download(url)
+    if data is None:
+        try:
+            query = "query($id:Int){ Character(id:$id){ image{ large } } }"
+            async with net.session().post(ANILIST_URL, json={"query": query, "variables": {"id": int(cid)}},
+                                          timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                url = (await resp.json())["data"]["Character"]["image"]["large"]
+            data = await download(url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
+            data = None
+    if not data or len(data) > ANIME_FILE_MAX:
+        return None
+    ext = url.rsplit(".", 1)[-1].lower() if "." in url.rsplit("/", 1)[-1] else "png"
+    return discord.File(io.BytesIO(data), f"캐릭터.{ext if ext in ('png', 'jpg', 'jpeg', 'gif', 'webp') else 'png'}")
 
 
 def quiz_session_text(scores):
@@ -4656,7 +4716,8 @@ async def quiz_next(q, channel, game, header):
     recent = json.loads(game["recent"])
     answer = quiz.pick(game["level"], recent, q.key)
     with connect_db() as conn:
-        conn.execute(f"UPDATE {q.table}_games SET answer = ?, number = number + 1, recent = ? WHERE channel_id = ?",
+        conn.execute(f"UPDATE {q.table}_games SET answer = ?, number = number + 1, recent = ?, hinted = 0 "
+                     "WHERE channel_id = ?",
                      (answer, json.dumps((recent + [answer])[-QUIZ_RECENT:]), channel.id))
     await quiz_post_question(q, channel, quiz_game(q, channel.id), header)
 
@@ -4680,6 +4741,9 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
 
 async def quiz_start_command(q, ctx, options):
     parsed = quiz.parse_start(options)
+    if parsed and q is ANIME_QUIZ and parsed[0] == quiz.HARD:
+        await ctx.reply("애니캐 맞히기는 `쉬움`과 `보통`만 있습니다. 예: `!캐릭시작 쉬움 20`", mention_author=False)
+        return
     if parsed is None:
         await ctx.reply(f"`!{q.start} [쉬움|보통|어려움] [문제 수 1~{quiz.MAX_COUNT}]`처럼 써 주세요. "
                         f"예: `!{q.start} 어려움 20`", mention_author=False)
@@ -4706,6 +4770,8 @@ async def quiz_answer_command(q, ctx, text):
         return
     if q is CAPITAL_QUIZ:
         named = quiz.capital_codes(text)  # an unknown name is simply wrong: suggesting one would give it away
+    elif q is ANIME_QUIZ:
+        named = quiz.anime_codes(text)
     else:
         country = nara.find(text)
         if country is None:
@@ -4770,8 +4836,9 @@ def quiz_ranking_text(q, guild_id, limit=10):
             (guild_id, limit),
         ).fetchall()
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · 쉬움 {r['easy']}개 · 보통 {r['normal']}개 · "
-                     f"어려움 {r['hard']}개" for i, r in enumerate(rows, 1))
+    hard = (lambda r: "") if q is ANIME_QUIZ else (lambda r: f" · 어려움 {r['hard']}개")  # 애니캐 has no 어려움
+    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · 쉬움 {r['easy']}개 · 보통 {r['normal']}개{hard(r)}"
+                      for i, r in enumerate(rows, 1))
 
 
 async def quiz_ranking_command(q, ctx):
@@ -4812,6 +4879,7 @@ def quiz_register(q, start_aliases, answer_aliases, skip_aliases, stop_aliases, 
 quiz_register(FLAG_QUIZ, ["국기맞히기"], [], ["국기패스", "국기넘기기"], ["국기그만"], ["국기랭킹"])
 quiz_register(CAPITAL_QUIZ, ["수도맞히기"], [], ["수도패스", "수도넘기기"], ["수도그만"], ["수도랭킹"])
 quiz_register(MAP_QUIZ, ["지도맞히기"], [], ["지도패스", "지도넘기기"], ["지도그만"], ["지도랭킹"])
+quiz_register(ANIME_QUIZ, ["캐릭맞히기", "애니캐"], ["캐릭터"], ["캐릭패스", "캐릭넘기기"], ["캐릭그만"], ["캐릭랭킹"])
 
 
 @bot.command(name="힌트")
@@ -4823,15 +4891,22 @@ async def quiz_hint_command(ctx):
         game = quiz_game(q, ctx.channel.id)
         if game:
             word = quiz_hint_word(q, game["answer"])
+            if q is ANIME_QUIZ and not game["hinted"]:  # first the work, then the initials
+                with connect_db() as conn:
+                    conn.execute(f"UPDATE {q.table}_games SET hinted = 1 WHERE channel_id = ?", (ctx.channel.id,))
+                lines.append(f"💡 {q.title} 힌트: 『{quiz.anime()[game['answer']]['work']}』의 캐릭터입니다. "
+                             "(한 번 더 `!힌트`면 초성)")
+                continue
             lines.append(f"💡 {q.title} 초성 힌트: **{quiz.chosung(word)}** ({len(word.replace(' ', ''))}글자)")
     await ctx.reply("\n".join(lines) or "이 채널에는 진행 중인 퀴즈가 없습니다.", mention_author=False)
 
 
 def quiz_buttons(q):
-    return [HelpButton(f"{q.key}_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
-            HelpButton(f"{q.key}_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
-            HelpButton(f"{q.key}_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
-            HelpButton(f"{q.key}_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2)]
+    buttons = [HelpButton(f"{q.key}_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
+               HelpButton(f"{q.key}_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
+               HelpButton(f"{q.key}_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
+               HelpButton(f"{q.key}_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2)]
+    return [b for b in buttons if not (q is ANIME_QUIZ and b.action.endswith("_hard"))]
 
 
 async def show_quiz_page(q, interaction, details=None):
@@ -4894,6 +4969,7 @@ HELP_ACTIONS = {
     **help_quiz_actions(FLAG_QUIZ),
     **help_quiz_actions(CAPITAL_QUIZ),
     **help_quiz_actions(MAP_QUIZ),
+    **help_quiz_actions(ANIME_QUIZ),
     "dm": help_dm_to_dev,
     "run_add": help_open_form(AddServerModal),
     "run_uptime": help_run_uptime,
