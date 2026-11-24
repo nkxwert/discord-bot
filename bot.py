@@ -3305,7 +3305,7 @@ HELP_COMMANDS = {
              "`케이팝` · `제이팝`(애니 포함) · `팝송` · `추가곡`(이 서버에서 추가한 곡만)\n\n"
              "**규칙**\n"
              "제목만 맞히면 정답 (한글·영어·흔한 다른 표기) · 틀리면 ❌ · 한발 늦으면 ⏱️\n"
-             "-# 노래는 Deezer의 공식 30초 미리듣기 중 일부입니다"),
+             "-# 노래는 Deezer·Apple Music의 공식 30초 미리듣기 중 일부입니다. 정답이 나오면 30초를 재생할 수 있습니다"),
     "valorant": ("Valorant 전적", "!V전적", "`!V전적 <이름#태그> [지역]`\n발로란트 전적 카드를 봅니다. 지역은 자동으로 찾습니다.\n"
                  "`!V전적 <이름#태그> 지역`으로도 검색할 수 있습니다."),
 }
@@ -4669,7 +4669,7 @@ def quiz_reveal(q, code, guild_id=None):
     """The answer of a question, for messages: '🇫🇷 **프랑스**' / '🇲🇳 몽골의 수도 **울란바토르**'"""
     if q is SONG_QUIZ:
         info = song_info(guild_id, code) or {"title": "?", "artist": "?"}
-        return f"**{info['title']}** - {info['artist']} · <https://www.deezer.com/track/{code[2:]}>"
+        return f"**{info['title']}** - {info['artist']}"
     if q is ANIME_QUIZ:
         c = quiz.anime()[code]
         return f"**{c['ko']}** · 『{c['work']}』"
@@ -4699,7 +4699,7 @@ async def quiz_post_question(q, channel, game, header=None):
         text = f"{head}\n## {c.get('flag', '')} {c['ko']}의 수도는?\n-# {help_line}"
     elif q is SONG_QUIZ:
         seconds = quiz.SONG_SECONDS[game["level"]]
-        file = await song_clip(game["answer"], seconds)
+        file = await song_clip(game["guild_id"], game["answer"], seconds)
         text = f"{head} · {seconds}초\n-# {help_line}"
         if file is None:
             text += f"\n-# (노래를 불러오지 못했습니다. `!{q.skip}`으로 넘겨 주세요)"
@@ -4758,13 +4758,18 @@ def quiz_result_line(game):
     return f"이번에 맞힌 개수: {result}" if result else "이번에는 맞힌 사람이 없습니다."
 
 
-async def quiz_next(q, channel, game, header):
-    """Move on after a question is answered or skipped: the next question, or the end of the quiz."""
+async def quiz_next(q, channel, game, header, answer_file=None):
+    """Move on after a question is answered or skipped: the next question, or the end of the quiz.
+    answer_file (노래 맞히기: the whole preview) goes with the answer in a message of its own."""
     if game["number"] >= game["total"]:
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (channel.id,))
-        await channel.send(f"{header}\n🏁 **{q.title} · {game['total']}문제 끝!**\n-# {quiz_result_line(game)}")
+        await channel.send(f"{header}\n🏁 **{q.title} · {game['total']}문제 끝!**\n-# {quiz_result_line(game)}",
+                           **({"file": answer_file} if answer_file else {}))
         return
+    if answer_file:
+        await channel.send(header.rstrip(), file=answer_file)
+        header = None
     recent = json.loads(game["recent"])
     if q is SONG_QUIZ:
         answer = song_pick(game["guild_id"], game["genre"], recent) or game["answer"]
@@ -4897,7 +4902,8 @@ async def quiz_answer_command(q, ctx, text):
                                  (ctx.guild.id, ctx.author.id)).fetchone()[0]
         header = (f"-# {ctx.author.mention}님의 정답 · {q.title}\n🎉 {quiz_reveal(q, answer, game['guild_id'])}\n"
                   f"-# {quiz.LEVEL_NAMES[level]} 누적 {total}개\n")
-        await quiz_next(q, ctx.channel, quiz_game(q, ctx.channel.id), header)
+        answer_file = await song_answer_file(game["guild_id"], answer) if q is SONG_QUIZ else None
+        await quiz_next(q, ctx.channel, quiz_game(q, ctx.channel.id), header, answer_file)
 
 
 async def quiz_skip_command(q, ctx):
@@ -4906,8 +4912,10 @@ async def quiz_skip_command(q, ctx):
         if game is None:
             await ctx.reply(f"이 채널에는 진행 중인 {q.title} 퀴즈가 없습니다.", mention_author=False)
             return
+        answer_file = await song_answer_file(game["guild_id"], game["answer"]) if q is SONG_QUIZ else None
         await quiz_next(q, ctx.channel, game,
-                        f"-# {ctx.author.mention}님이 넘겼습니다 · {q.title}\n⏭️ 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n")
+                        f"-# {ctx.author.mention}님이 넘겼습니다 · {q.title}\n⏭️ 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n",
+                        answer_file)
 
 
 async def quiz_stop_command(q, ctx):
@@ -4918,8 +4926,10 @@ async def quiz_stop_command(q, ctx):
             return
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (ctx.channel.id,))
+        answer_file = await song_answer_file(game["guild_id"], game["answer"]) if q is SONG_QUIZ else None
         await ctx.channel.send(f"-# {ctx.author.mention}님이 멈췄습니다 · {q.title}\n"
-                               f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n-# {quiz_result_line(game)}")
+                               f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n-# {quiz_result_line(game)}",
+                               **({"file": answer_file} if answer_file else {}))
 
 
 def quiz_ranking_text(q, guild_id, limit=10):
@@ -5186,20 +5196,55 @@ def song_hint_word(info):
     return korean[0] if korean else info["title"]
 
 
-async def song_preview_url(sid):
-    """The current 30-second preview address (Deezer's are signed and expire, so it is asked for each time)."""
+ITUNES_API = "https://itunes.apple.com"
+_song_previews = {}  # song id -> (bytes, extension): the last few previews, so the answer reuses the question's
+
+
+async def _json_get(url, params=None, timeout=10):
     try:
-        async with net.session().get(f"{DEEZER_API}/track/{sid[2:]}", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json(content_type=None)
-        return data.get("preview") or None
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError):
+        async with net.session().get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         return None
 
 
-async def song_clip(sid, seconds):
-    """A few seconds of the song's official preview as 노래.mp3 (a random part, faded in and out), or None.
-    Nothing is kept: the preview goes to a temporary folder that is deleted at once."""
-    url = await song_preview_url(sid)
+async def itunes_search(term, limit=10):
+    """Apple's search (no key needed); the Korean store first, which knows Korean titles, then the US one."""
+    for country in ("KR", "US"):
+        data = await _json_get(f"{ITUNES_API}/search", {"term": term, "entity": "song", "limit": limit, "country": country})
+        if data and data.get("results"):
+            return data["results"]
+    return []
+
+
+async def song_preview_url(guild_id, sid):
+    """The current 30-second official preview address: Deezer's (signed, so asked for each time) or, where Deezer
+    is not available (it is not in Korea) or has none, Apple's (iTunes)."""
+    info = song_info(guild_id, sid) or {}
+    if sid.startswith("dz"):
+        data = await _json_get(f"{DEEZER_API}/track/{sid[2:]}")
+        if data and data.get("preview"):
+            return data["preview"]
+    itunes_id = sid[2:] if sid.startswith("it") else info.get("itunes")
+    if itunes_id:
+        data = await _json_get(f"{ITUNES_API}/lookup", {"id": itunes_id, "country": "KR"}) or {}
+        for r in data.get("results") or []:
+            if r.get("previewUrl"):
+                return r["previewUrl"]
+    if info:  # no Apple id saved: look the song up by name
+        for r in await itunes_search(f"{info['artist']} {quiz.song_names(info['title'])[0]}", 5):
+            if r.get("previewUrl") and nara.normalize(info["artist"])[:4] in nara.normalize(r.get("artistName", "")):
+                return r["previewUrl"]
+    return None
+
+
+async def song_preview(guild_id, sid):
+    """(bytes, extension) of the song's preview, or None; the last few are kept for the answer."""
+    if sid in _song_previews:
+        return _song_previews[sid]
+    url = await song_preview_url(guild_id, sid)
     if not url:
         return None
     try:
@@ -5209,55 +5254,96 @@ async def song_clip(sid, seconds):
             data = await resp.read()
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return None
+    if not data or len(data) > SONG_PREVIEW_MAX:
+        return None
+    ext = "m4a" if (".m4a" in url or ".aac" in url) else "mp3"
+    while len(_song_previews) >= 6:
+        _song_previews.pop(next(iter(_song_previews)))
+    _song_previews[sid] = (data, ext)
+    return data, ext
+
+
+async def song_encode(data, ext, seconds=None, start=0.0):
+    """The preview (or seconds of it from start, faded in and out) as MP3 bytes, or None."""
     ffmpeg = storage.ffmpeg_path()
     if not ffmpeg:
-        return discord.File(io.BytesIO(data), SONG_FILE)  # no ffmpeg: the whole 30 seconds
+        return data if ext == "mp3" else None
     folder = tempfile.mkdtemp(prefix="maco-song-")
     try:
-        source, out = os.path.join(folder, "in.mp3"), os.path.join(folder, "out.mp3")
+        source, out = os.path.join(folder, f"in.{ext}"), os.path.join(folder, "out.mp3")
         with open(source, "wb") as f:
             f.write(data)
-        start = random.uniform(1.5, max(1.5, 28 - seconds))
-        fade = min(0.4, seconds / 5)
-        code, _ = await storage._run_capture(
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}", "-t", str(seconds), "-i", source,
-            "-af", f"afade=t=in:d={fade / 2:.2f},afade=t=out:st={seconds - fade:.2f}:d={fade:.2f}",
-            "-vn", "-c:a", "libmp3lame", "-b:a", "128k", out, timeout=30)
+        cut, filters = [], []
+        if seconds:
+            fade = min(0.4, seconds / 5)
+            cut = ["-ss", f"{start:.2f}", "-t", str(seconds)]
+            filters = ["-af", f"afade=t=in:d={fade / 2:.2f},afade=t=out:st={seconds - fade:.2f}:d={fade:.2f}"]
+        code, _ = await storage._run_capture(ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *cut, "-i", source,
+                                             *filters, "-vn", "-c:a", "libmp3lame", "-b:a", "128k", out, timeout=30)
         if code != 0 or not os.path.exists(out):
             return None
         with open(out, "rb") as f:
-            return discord.File(io.BytesIO(f.read()), SONG_FILE)
+            return f.read()
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
 
-async def deezer_search(text, limit=5):
-    """[{id, title, artist, cover}] for !노래추가 (karaoke, covers and the like left out, previews only)."""
-    try:
-        async with net.session().get(f"{DEEZER_API}/search", params={"q": text, "limit": 25},
-                                     timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            rows = (await resp.json(content_type=None)).get("data") or []
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError):
+async def song_clip(guild_id, sid, seconds):
+    """A random few seconds of the song's official preview as 노래.mp3, or None. Nothing is kept on disk."""
+    preview = await song_preview(guild_id, sid)
+    if not preview:
         return None
-    found, seen = [], set()
+    clip = await song_encode(*preview, seconds=seconds, start=random.uniform(1.5, max(1.5, 28 - seconds)))
+    return discord.File(io.BytesIO(clip), SONG_FILE) if clip else None
+
+
+async def song_answer_file(guild_id, sid):
+    """The whole 30-second preview, named after the song, to play from the answer message (rather than a link:
+    the services' pages don't open everywhere, e.g. Deezer in Korea)."""
+    preview = await song_preview(guild_id, sid)
+    if not preview:
+        return None
+    data = preview[0] if preview[1] == "mp3" else await song_encode(*preview)
+    if not data:
+        return None
+    info = song_info(guild_id, sid) or {"title": "노래", "artist": ""}
+    name = re.sub(r'[\\/:*?"<>|]+', " ", f"{info['title']} - {info['artist']}").strip()[:80] or "노래"
+    return discord.File(io.BytesIO(data), f"{name}.mp3")
+
+
+async def song_search(text, limit=5):
+    """[{id, title, artist, cover, source}] for !노래추가 from Apple (iTunes, which also knows Korean titles) and
+    Deezer, without karaoke, covers and the like and only songs with a preview; None if both searches failed."""
+    found, seen, answered = [], set(), False
+
+    def keep(sid, title, artist, cover, source):
+        key = (nara.normalize(title), nara.normalize(artist))
+        if SONG_SEARCH_JUNK.search(f"{title} {artist}") or key in seen:
+            return
+        seen.add(key)
+        found.append({"id": sid, "title": title, "artist": artist, "cover": cover, "source": source})
+
+    rows = await itunes_search(text, 25)
+    answered = answered or rows is not None
     for r in rows:
-        title, artist = r.get("title") or "", (r.get("artist") or {}).get("name") or ""
-        if not r.get("preview") or SONG_SEARCH_JUNK.search(f"{title} {artist}") or (title, artist) in seen:
-            continue
-        seen.add((title, artist))
-        found.append({"id": f"dz{r['id']}", "title": title, "artist": artist,
-                      "cover": (r.get("album") or {}).get("cover_medium") or ""})
-        if len(found) >= limit:
-            break
-    return found
+        if r.get("previewUrl"):
+            keep(f"it{r['trackId']}", r.get("trackName") or "", r.get("artistName") or "", r.get("artworkUrl100") or "", "Apple")
+    data = await _json_get(f"{DEEZER_API}/search", {"q": text, "limit": 25})
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        answered = True
+        for r in data["data"]:
+            if r.get("preview"):
+                keep(f"dz{r['id']}", r.get("title") or "", (r.get("artist") or {}).get("name") or "",
+                     (r.get("album") or {}).get("cover_medium") or "", "Deezer")
+    return found[:limit] if (found or answered) else None
 
 
 class SongAddSelect(discord.ui.Select):
     """The search results of !노래추가; only the person who searched can pick."""
 
     def __init__(self, user_id, results, aliases):
-        options = [discord.SelectOption(label=r["title"][:100], description=r["artist"][:100], value=str(i))
-                   for i, r in enumerate(results)]
+        options = [discord.SelectOption(label=r["title"][:100], description=f"{r['artist']} · {r['source']}"[:100],
+                                        value=str(i)) for i, r in enumerate(results)]
         super().__init__(placeholder="추가할 곡을 고르세요", options=options)
         self.user_id, self.results, self.aliases = user_id, results, aliases
 
@@ -5272,7 +5358,8 @@ class SongAddSelect(discord.ui.Select):
 
 def song_add(guild_id, song, aliases, user_id):
     """Add one search result to the server's songs; the message to show."""
-    if song["id"] in quiz.songs():
+    same = lambda s: (nara.normalize(quiz.song_names(s["title"])[0]), nara.normalize(s["artist"]))
+    if song["id"] in quiz.songs() or any(same(s) == same(song) for s in quiz.songs().values()):
         return f"🎵 이미 기본 목록에 있는 곡입니다: **{song['title']}** - {song['artist']}"
     with connect_db() as conn:
         count = conn.execute("SELECT COUNT(*) FROM song_custom WHERE guild_id = ?", (guild_id,)).fetchone()[0]
@@ -5298,18 +5385,19 @@ async def song_add_command(ctx, *, text: str = ""):
     aliases = [a.strip() for a in extra.split(",") if a.strip()][:5]
     if not query:
         await ctx.reply("`!노래추가 <가수와 제목>`처럼 써 주세요. 예: `!노래추가 아이유 밤편지`\n"
-                        "-# 한글 제목도 정답으로 받으려면 `!노래추가 IU Through the Night | 밤편지`처럼 `|` 뒤에 적어 주세요.",
+                        "-# 다른 이름도 정답으로 받으려면 `!노래추가 아이유 밤편지 | Through the Night`처럼 `|` 뒤에 적어 주세요.",
                         mention_author=False)
         return
-    results = await deezer_search(query[:100])
+    results = await song_search(query[:100])
     if results is None:
         await ctx.reply("곡을 검색하지 못했습니다. 잠시 후 다시 시도해 주세요.", mention_author=False)
         return
     if not results:
-        await ctx.reply(f"`{query[:50]}`로 찾은 곡이 없습니다. 가수 이름이나 영어 제목으로 검색해 보세요.", mention_author=False)
+        await ctx.reply(f"`{query[:50]}`로 찾은 곡이 없습니다. 가수 이름과 제목을 같이 써 보세요.", mention_author=False)
         return
     view = discord.ui.View(timeout=180).add_item(SongAddSelect(ctx.author.id, results, aliases))
-    await ctx.reply("🔎 추가할 곡을 골라 주세요 (공식 30초 미리듣기가 있는 곡만 보여 줍니다)", view=view, mention_author=False)
+    await ctx.reply("🔎 추가할 곡을 골라 주세요 (공식 30초 미리듣기가 있는 곡만, Apple Music·Deezer에서 찾았습니다)",
+                    view=view, mention_author=False)
 
 
 @bot.command(name="노래목록", aliases=["노래리스트"])
