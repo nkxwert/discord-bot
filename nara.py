@@ -22,15 +22,14 @@ NEAR_KM = 1500  # capitals this close count as near (yellow distance)
 BOARD_ROWS = 15  # guesses drawn on the board; older ones are summarised in one line
 
 # Difficulty. 쉬움: the answer is a well-known country (FAMOUS); 보통: any country. Both show every hint exactly.
-# 어려움: the answer is one of the other, lesser-known countries; population and area say only
-# bigger/smaller, distance only near/far (HARD_NEAR_KM), and there are HARD_MAX_GUESSES guesses.
-# and the direction is hidden. Continent, hemisphere and landlocked stay.
+# 어려움: the answer is one of the other, lesser-known countries, there are HARD_MAX_GUESSES guesses, and the
+# board shows other columns (HARD_COLUMNS): continent, landlocked, whether the guess borders the answer, average
+# temperature, population and area, the last three only bigger/smaller.
 EASY, NORMAL, HARD = "easy", "normal", "hard"
 LEVEL_NAMES = {EASY: "쉬움", NORMAL: "보통", HARD: "어려움"}
 LEVEL_WORDS = {"": NORMAL, "보통": NORMAL, "normal": NORMAL, "쉬움": EASY, "쉽게": EASY, "easy": EASY,
                "어려움": HARD, "hard": HARD, "어렵게": HARD, "하드": HARD}
 HARD_MAX_GUESSES = 10
-HARD_NEAR_KM = 2000
 FAMOUS = {
     # 아시아
     "KOR", "JPN", "CHN", "TWN", "PRK", "MNG", "VNM", "THA", "PHL", "IDN", "MYS", "SGP", "IND", "PAK", "BGD",
@@ -188,6 +187,8 @@ def compare(guess_code, answer_code):
         "direction": direction(g, a),
         "hemisphere": hemisphere(g) == hemisphere(a),
         "landlocked": g["landlocked"] == a["landlocked"],
+        "neighbor": answer_code in g.get("borders", ()),
+        "temp": _amount(g.get("temp", 0), a.get("temp", 0)),
     }
 
 
@@ -227,8 +228,6 @@ RED_T = (165, 60, 60)
 GRAY_T = (78, 80, 88)
 WHITE = (242, 243, 245)
 MUTED = (148, 155, 164)
-COLUMNS = [("나라", 190), ("대륙", 112), ("인구", 130), ("면적", 130), ("거리", 120), ("방향", 76), ("반구", 92),
-           ("내륙국", 92)]
 CELL_H, GAP, PAD = 56, 6, 20
 
 
@@ -268,13 +267,99 @@ def _amount_tile(draw, x, y, w, info, value_text, level):
     _tile(draw, x, y, w, color, f"{value_text} {mark}", _fit(f"{value_text} {mark}", 18, w - 12))
 
 
+@lru_cache(maxsize=256)
+def _flag_icon(code, height=24):
+    """The country's flag, small, for the left of its name on the board (None if the picture is missing)."""
+    path = Path(__file__).parent / "assets" / "flags" / f"{code}.png"
+    if not path.exists():
+        return None
+    with Image.open(path) as im:
+        im = im.convert("RGBA")
+        return im.resize((max(1, round(im.width * height / im.height)), height), Image.LANCZOS)
+
+
+def _cell_name(draw, image, x, y, w, row, c, level):
+    _tile(draw, x, y, w, GREEN_T if row["correct"] else PANEL)
+    icon = _flag_icon(c["code"])
+    icon_w = min(icon.width, 40) if icon else 0
+    size = _fit(c["ko"], 20, w - 22 - icon_w)
+    text_w = cards.font(size, "kr").getlength(c["ko"])
+    left = x + (w - icon_w - (8 if icon else 0) - text_w) / 2
+    if icon:
+        icon = icon if icon.width <= 40 else icon.crop((0, 0, 40, icon.height))
+        image.paste(icon, (round(left), round(y + (CELL_H - icon.height) / 2)), icon)
+        left += icon_w + 8
+    draw.text((left, y + CELL_H / 2), c["ko"], font=cards.font(size, "kr"), fill=WHITE, anchor="lm")
+
+
+def _cell_continent(draw, image, x, y, w, row, c, level):
+    _tile(draw, x, y, w, GREEN_T if row["continent"] else RED_T, c["continent"], _fit(c["continent"], 18, w - 10))
+
+
+def _cell_population(draw, image, x, y, w, row, c, level):
+    _amount_tile(draw, x, y, w, row["population"], korean_number(c["population"]), level)
+
+
+def _cell_area(draw, image, x, y, w, row, c, level):
+    _amount_tile(draw, x, y, w, row["area"], area_text(c["area"]), level)
+
+
+def _cell_distance(draw, image, x, y, w, row, c, level):
+    km = row["distance"]
+    text = "정답" if row["correct"] else f"{km:,}km"
+    _tile(draw, x, y, w, GREEN_T if row["correct"] else YELLOW_T if km <= NEAR_KM else GRAY_T, text,
+          _fit(text, 18, w - 10))
+
+
+def _cell_direction(draw, image, x, y, w, row, c, level):
+    if row["correct"]:
+        _tile(draw, x, y, w, GREEN_T)
+        cx, cy = x + w / 2, y + CELL_H / 2
+        draw.line(((cx - 12, cy), (cx - 3, cy + 9), (cx + 13, cy - 9)), fill=WHITE, width=5, joint="curve")
+    elif row["direction"] is None:
+        _tile(draw, x, y, w, GRAY_T, "·", 22)
+    else:
+        _tile(draw, x, y, w, GRAY_T)
+        _arrow(draw, x + w / 2, y + CELL_H / 2, row["direction"])
+
+
+def _cell_hemisphere(draw, image, x, y, w, row, c, level):
+    _tile(draw, x, y, w, GREEN_T if row["hemisphere"] else RED_T, hemisphere(c), 18)
+
+
+def _cell_landlocked(draw, image, x, y, w, row, c, level):
+    text = ("예" if c["landlocked"] else "아니요") if level == HARD else ("내륙국" if c["landlocked"] else "아님")
+    _tile(draw, x, y, w, GREEN_T if row["landlocked"] else RED_T, text, 18)
+
+
+def _cell_neighbor(draw, image, x, y, w, row, c, level):
+    if row["correct"]:
+        _tile(draw, x, y, w, GREEN_T, "정답", 18)
+    else:
+        _tile(draw, x, y, w, GREEN_T if row["neighbor"] else GRAY_T, "예" if row["neighbor"] else "아니요", 18)
+
+
+def _cell_temp(draw, image, x, y, w, row, c, level):
+    _amount_tile(draw, x, y, w, row["temp"], f"{c.get('temp', 0):.1f}°C", level)
+
+
+COLUMNS = [("나라", 220, _cell_name), ("대륙", 112, _cell_continent), ("인구", 130, _cell_population),
+           ("면적", 130, _cell_area), ("거리", 120, _cell_distance), ("방향", 76, _cell_direction),
+           ("반구", 92, _cell_hemisphere), ("내륙국", 92, _cell_landlocked)]
+# 어려움: no distance, direction or hemisphere; whether it borders the answer and its average temperature instead.
+HARD_COLUMNS = [("나라", 220, _cell_name), ("대륙", 112, _cell_continent), ("내륙국", 92, _cell_landlocked),
+                ("이웃", 92, _cell_neighbor), ("평균 기온", 120, _cell_temp), ("인구", 130, _cell_population),
+                ("면적", 130, _cell_area)]
+
+
 def render_board(rows, answer=None, total=None, level=NORMAL):
     """PNG of the guesses so far (each from compare()), newest last. answer: code to show at the bottom when
     the game has ended. total: how many guesses there were (more than the rows drawn when long).
     level: HARD shows fewer details (see the top of this file)."""
     total = total or len(rows)
     hidden = total - len(rows)
-    width = PAD * 2 + sum(w for _, w in COLUMNS) + GAP * (len(COLUMNS) - 1)
+    columns = HARD_COLUMNS if level == HARD else COLUMNS
+    width = PAD * 2 + sum(w for _, w, _ in columns) + GAP * (len(columns) - 1)
     head_h = 70
     extra = 34 if hidden else 0
     foot = 64 if answer else 0
@@ -294,7 +379,7 @@ def render_board(rows, answer=None, total=None, level=NORMAL):
 
     y = PAD + head_h
     x = PAD
-    for title, w in COLUMNS:
+    for title, w, _ in columns:
         draw.text((x + w / 2, y + 10), title, font=cards.font(16, "kr"), fill=MUTED, anchor="mm")
         x += w + GAP
     y += 30
@@ -311,45 +396,9 @@ def render_board(rows, answer=None, total=None, level=NORMAL):
     for row in rows:
         c = data[row["code"]]
         x = PAD
-        cells = iter(w for _, w in COLUMNS)
-        w = next(cells)
-        _tile(draw, x, y, w, GREEN_T if row["correct"] else PANEL, c["ko"], _fit(c["ko"], 20, w - 14))
-        x += w + GAP
-        w = next(cells)
-        _tile(draw, x, y, w, GREEN_T if row["continent"] else RED_T, c["continent"], _fit(c["continent"], 18, w - 10))
-        x += w + GAP
-        w = next(cells)
-        _amount_tile(draw, x, y, w, row["population"], korean_number(c["population"]), level)
-        x += w + GAP
-        w = next(cells)
-        _amount_tile(draw, x, y, w, row["area"], area_text(c["area"]), level)
-        x += w + GAP
-        w = next(cells)
-        km = row["distance"]
-        near = km <= (HARD_NEAR_KM if level == HARD else NEAR_KM)
-        text = "정답" if row["correct"] else ("가까움" if near else "멀음") if level == HARD else f"{km:,}km"
-        _tile(draw, x, y, w, GREEN_T if row["correct"] else YELLOW_T if near else GRAY_T, text, _fit(text, 18, w - 10))
-        x += w + GAP
-        w = next(cells)
-        if row["correct"]:
-            _tile(draw, x, y, w, GREEN_T)
-            cx, cy = x + w / 2, y + CELL_H / 2
-            draw.line(((cx - 12, cy), (cx - 3, cy + 9), (cx + 13, cy - 9)), fill=WHITE, width=5, joint="curve")
-        elif level == HARD:
-            _tile(draw, x, y, w, PANEL, "?", 22)
-        elif row["direction"] is None:
-            _tile(draw, x, y, w, GRAY_T, "·", 22)
-        else:
-            _tile(draw, x, y, w, GRAY_T)
-            _arrow(draw, x + w / 2, y + CELL_H / 2, row["direction"])
-        x += w + GAP
-        w = next(cells)
-        hemi = hemisphere(c)
-        _tile(draw, x, y, w, GREEN_T if row["hemisphere"] else RED_T, hemi, 18)
-        x += w + GAP
-        w = next(cells)
-        land = "내륙국" if c["landlocked"] else "아님"
-        _tile(draw, x, y, w, GREEN_T if row["landlocked"] else RED_T, land, 18)
+        for _, w, cell in columns:
+            cell(draw, image, x, y, w, row, c, level)
+            x += w + GAP
         y += CELL_H + GAP
 
     if answer:
@@ -360,8 +409,8 @@ def render_board(rows, answer=None, total=None, level=NORMAL):
         draw.text((width / 2, y + 25), text, font=cards.font(_fit(text, 24, width - PAD * 4), "kr"), fill=WHITE, anchor="mm")
         y += 50 + GAP
     if level == HARD:
-        legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  가까움: 수도끼리 {HARD_NEAR_KM:,}km 이내  ·  "
-                  f"방향은 숨김  ·  {HARD_MAX_GUESSES}번 안에 맞히기")
+        legend = (f"▲ 정답이 더 많음/넓음/따뜻함  ▼ 더 적음/좁음/추움  ·  이웃: 정답 나라와 국경이 닿음  ·  "
+                  f"{HARD_MAX_GUESSES}번 안에 맞히기")
     else:
         legend = (f"▲ 정답이 더 많음/넓음  ▼ 더 적음/좁음  ·  노란색: 인구·면적 ±{round(CLOSE_RATIO * 100)}% 이내, "
                   f"거리 {NEAR_KM:,}km 이내  ·  거리·방향은 수도 기준")
