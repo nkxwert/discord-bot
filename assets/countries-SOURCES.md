@@ -7,7 +7,7 @@
 - 수도·언어·통화의 한글 이름, 한국어 위키백과 문서 이름: [Wikidata](https://www.wikidata.org/) (CC0)
 - 인구(가장 최근 해), 수도 좌표: [World Bank Open Data](https://data.worldbank.org/) (CC BY 4.0)
 - 대만·바티칸의 인구와 수도 좌표, 팔레스타인의 수도 좌표, 일부 한글 이름과 별칭은 직접 보탰습니다.
-- `!정보`의 소개글은 데이터에 넣지 않고, 쓸 때 한국어 위키백과(CC BY-SA)에서 받아 출처와 함께 보여 줍니다.
+- `!정보`의 소개글(`intro`): 한국어 위키백과 각 나라 문서의 첫 문단입니다. [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/deed.ko)에 따라 이용하며, `!정보`에 출처를 표시하고 원문 문서로 연결합니다. 위키백과 공식 덤프(kowiki pages-articles-multistream)에서 해당 문서만 받아 틀·각주를 걷어 내고 앞부분(약 480자, 문장 단위)만 남겼습니다. 이 소개글 부분은 CC BY-SA 4.0을 따릅니다.
 
 This file is a Database (countries.json) made available under the Open Database License (ODbL 1.0),
 built from world-countries (ODbL) and World Bank data (CC BY 4.0).
