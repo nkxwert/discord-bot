@@ -4156,6 +4156,7 @@ async def before_dday_alerts():
 
 NARA_FILE = "나라맞히기.png"
 _nara_locks = {}  # channel id -> lock, so two guesses at once don't both post a board
+_nara_just_won = {}  # channel id -> (country, winner, when): tells a right guess a moment too late who was first
 
 
 def nara_lock(channel_id):
@@ -4247,6 +4248,11 @@ async def nara_guess_command(ctx, *, name: str = ""):
     async with nara_lock(ctx.channel.id):
         game = nara_game(ctx.channel.id)
         if game is None:
+            last = _nara_just_won.get(ctx.channel.id)
+            if last and last[0] == country["code"] and time.monotonic() - last[2] < FLAG_LATE_SECONDS:
+                await ctx.reply(f"⏱️ 아깝습니다! 방금 <@{last[1]}>님이 **{country['ko']}**{nara.josa(country['ko'], '을', '를')} "
+                                "먼저 맞혔습니다. 새 판: `!나라시작`", mention_author=False)
+                return
             await ctx.reply("이 채널에는 진행 중인 판이 없습니다. `!나라시작`으로 시작해 주세요.", mention_author=False)
             return
         guesses = json.loads(game["guesses"])
@@ -4262,6 +4268,9 @@ async def nara_guess_command(ctx, *, name: str = ""):
         if code == answer:
             content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{answer_name}**입니다. "
                        f"(모두 합쳐 추측 {len(guesses)}번)\n-# {nara.summary(answer)} · 새 판: `!나라시작` · 순위: `!나라순위`")
+            if len(_nara_just_won) >= 300:
+                _nara_just_won.clear()
+            _nara_just_won[ctx.channel.id] = (code, ctx.author.id, time.monotonic())
             await nara_post_board(ctx.channel, game, guesses, content, finished=True)
             column = {nara.EASY: "easy_wins", nara.NORMAL: "wins", nara.HARD: "hard_wins"}[level]
             with connect_db() as conn:
