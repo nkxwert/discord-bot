@@ -144,4 +144,4 @@ def render(title, art_path, out_path):
     for line in lines:
         _draw_text(draw, text_x, y, line, 40, colour)
         y += 52
-    image.convert("RGB").save(out_path, "PNG", optimize=True)
+    image.convert("RGB").save(out_path, "PNG", compress_level=6)

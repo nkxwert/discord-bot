@@ -168,7 +168,7 @@ class Card:
         for args, kwargs in self.texts:
             draw_text(draw, *args, **kwargs)
         buffer = io.BytesIO()
-        self.image.convert("RGB").save(buffer, format="PNG", optimize=True)
+        self.image.convert("RGB").save(buffer, format="PNG", compress_level=6)  # optimize=True: much slower, barely smaller
         buffer.seek(0)
         return buffer
 
