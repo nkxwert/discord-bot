@@ -831,6 +831,27 @@ def save_samples(samples):
         conn.commit()
 
 
+def uptime_stats_many(server_ids, now):
+    """{server id: {"day": (percent, samples, avg latency), "week": (percent, samples, None)}} in one query.
+    A week of checks is ~20,000 rows a server, so !업타임 runs this in a worker thread (asyncio.to_thread):
+    the bot keeps answering everyone else meanwhile."""
+    out = {sid: {"day": (None, 0, None), "week": (None, 0, None)} for sid in server_ids}
+    if not server_ids:
+        return out
+    day, week = now - 86400, now - 7 * 86400
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT server_id, SUM(checked_at >= ?), SUM(CASE WHEN checked_at >= ? THEN online ELSE 0 END), "
+            "COUNT(*), SUM(online), "
+            "AVG(CASE WHEN checked_at >= ? AND online AND latency_ms IS NOT NULL THEN latency_ms END) "
+            f"FROM samples WHERE server_id IN ({','.join('?' * len(server_ids))}) AND checked_at >= ? "
+            "GROUP BY server_id", (day, day, day, *server_ids, week)).fetchall()
+    for sid, day_n, day_up, week_n, week_up, latency in rows:
+        out[sid] = {"day": (day_up / day_n * 100 if day_n else None, day_n or 0, latency),
+                    "week": (week_up / week_n * 100 if week_n else None, week_n or 0, None)}
+    return out
+
+
 def uptime_stats(server_id: int, since: float):
     """(percentage, samples, average latency) since a time. Counted by SQLite: a week of checks every 10
     seconds is ~60,000 rows per server, which used to be loaded into Python on every !업타임."""
@@ -2024,13 +2045,13 @@ async def send_result(ctx, notice, content=None, embed=None, file=None, view=Non
     return await ctx.reply(content=content, embed=embed, mention_author=False, **extra)
 
 
-def build_list_embed(servers, results, now):
+def build_list_embed(servers, results, now, stats=None):
     lines_by_server = []
     online_count = 0
     for server, (online, latency, players_online, players_max, external) in zip(servers, results):
         online_count += int(online)
-        day_percent, _, _ = uptime_stats(server["id"], now - 24 * 60 * 60)
-        week_percent, _, _ = uptime_stats(server["id"], now - 7 * 24 * 60 * 60)
+        st = (stats or uptime_stats_many([server["id"]], now))[server["id"]]
+        day_percent, week_percent = st["day"][0], st["week"][0]
         if online:
             status = f"{latency:.0f} ms" if latency is not None else "외부 조회" if external else "-"
             if players_online is not None and players_max is not None:
@@ -2059,10 +2080,11 @@ def build_list_embed(servers, results, now):
     return embed
 
 
-def build_detail_embed(server, result, now):
+def build_detail_embed(server, result, now, stats=None):
     online, latency, players_online, players_max, external = result
-    day_percent, day_samples, avg_latency = uptime_stats(server["id"], now - 24 * 60 * 60)
-    week_percent, week_samples, _ = uptime_stats(server["id"], now - 7 * 24 * 60 * 60)
+    st = (stats or uptime_stats_many([server["id"]], now))[server["id"]]
+    day_percent, day_samples, avg_latency = st["day"]
+    week_percent, week_samples, _ = st["week"]
 
     embed = discord.Embed(
         title=f"{server['name']} 업타임",
@@ -2132,10 +2154,11 @@ async def uptime(ctx, *, name: str = ""):
                       for server, (online, latency, _, _, _) in zip(servers, results)])
 
     now = time.time()
+    stats = await asyncio.to_thread(uptime_stats_many, [s["id"] for s in servers], now)
     if name:
-        embed = build_detail_embed(servers[0], results[0], now)
+        embed = build_detail_embed(servers[0], results[0], now, stats)
     else:
-        embed = build_list_embed(servers, results, now)
+        embed = build_list_embed(servers, results, now, stats)
     await send_result(ctx, notice, embed=embed)
 
 
@@ -6569,12 +6592,12 @@ async def dashboard_snapshot():
     return snapshot
 
 
-_ping_cache = {"at": 0.0, "value": (None, None)}
+_ping_cache = {"at": None, "value": (None, None)}  # None: never checked (time.monotonic() can be under 60)
 
 
 async def storage_ping_cached():
     """The storage check takes 0.3-1 s; a snapshot after each dashboard button reuses it for a minute."""
-    if time.monotonic() - _ping_cache["at"] > 60 or _ping_cache["value"][1]:
+    if _ping_cache["at"] is None or time.monotonic() - _ping_cache["at"] > 60 or _ping_cache["value"][1]:
         _ping_cache["value"] = await storage.ping()
         _ping_cache["at"] = time.monotonic()
     return _ping_cache["value"]
