@@ -71,8 +71,11 @@ def env_int(name, default, minimum):
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "uptime.db")
-CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 10, 1)
-HISTORY_DAYS = 30
+# Uptime: how often the background check runs and how long its samples are kept. Set in the NKOTE admin
+# panel (settings "uptime_interval" / "uptime_days"); these are the values until then.
+UPTIME_INTERVAL_DEFAULT = 30
+UPTIME_INTERVAL_MIN, UPTIME_INTERVAL_MAX = 10, 3600
+UPTIME_DAYS_CHOICES = (7, 14, 30)
 PRUNE_INTERVAL_SECONDS = 600
 MAX_SERVERS_PER_GUILD = 10
 MAX_NAME_LENGTH = 30
@@ -568,7 +571,8 @@ def switch_keys():
     if "keys" not in _switch_cache:
         with connect_db() as conn:
             _switch_cache["keys"] = {r["key"] for r in conn.execute(
-                "SELECT key FROM settings WHERE key LIKE 'game_off:%' OR key LIKE 'upload_block:%'")}
+                "SELECT key FROM settings WHERE key LIKE 'game_off:%' OR key LIKE 'upload_block:%' "
+                "OR key LIKE 'uptime_off:%'")}
     return _switch_cache["keys"]
 
 
@@ -582,6 +586,29 @@ def set_switch(key, on):
 def game_enabled(game, guild_id=None):
     keys = switch_keys()
     return f"game_off:{game}:all" not in keys and (not guild_id or f"game_off:{game}:{guild_id}" not in keys)
+
+
+def uptime_interval():
+    value = get_setting("uptime_interval")
+    return int(value) if value and value.isdigit() else UPTIME_INTERVAL_DEFAULT
+
+
+def history_days():
+    value = get_setting("uptime_days")
+    return int(value) if value and value.isdigit() and int(value) in UPTIME_DAYS_CHOICES else 30
+
+
+def uptime_background_on():
+    """False when the admin turned the automatic checks off: !업타임 then only checks on the spot."""
+    return "uptime_off:all" not in switch_keys()
+
+
+def uptime_enabled(guild_id):
+    """False when the admin switched the uptime feature off for this server (commands and buttons go)."""
+    return not guild_id or f"uptime_off:{guild_id}" not in switch_keys()
+
+
+UPTIME_OFF_MESSAGE = "지금은 이 서버에서 서버 업타임 기능을 쓸 수 없습니다. (관리자가 꺼 두었습니다)"
 
 
 def game_off_message(game, guild):
@@ -794,7 +821,7 @@ def save_samples(samples):
         if now - last_prune >= PRUNE_INTERVAL_SECONDS:
             conn.execute(
                 "DELETE FROM samples WHERE checked_at < ?",
-                (now - HISTORY_DAYS * 24 * 60 * 60,),
+                (now - history_days() * 24 * 60 * 60,),
             )
             last_prune = now
         conn.commit()
@@ -1414,7 +1441,7 @@ async def db_status_embed():
         size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
         embed.add_field(name="🗄️ 로컬 DB (sqlite)", inline=False, value=(
             f"🟢 연결됨 · 응답 {ping_ms:.1f} ms · 파일 크기 {human_size(size)}\n"
-            f"등록 서버 {servers:,}개 · 업타임 기록 {samples:,}개 (30일 보관)"
+            f"등록 서버 {servers:,}개 · 업타임 기록 {samples:,}개 ({history_days()}일 보관)"
         ))
     except sqlite3.Error as exc:
         embed.add_field(name="🗄️ 로컬 DB (sqlite)", value=f"🔴 오류: {type(exc).__name__}: {exc}", inline=False)
@@ -1514,15 +1541,16 @@ async def help_command(ctx):
 def command_list_embed(guild_id=None):
     """Every ! command; used by !도움말 and the /도움말 명령어 보기 button. Switched-off games are left out."""
     embed = discord.Embed(title="Maco", color=discord.Color.green())
-    embed.add_field(
-        name="!주소추가 <주소> [이름]",
-        value="서버를 추가합니다.\n(예: `!주소추가 hypixel.net 하이픽셀`)",
-        inline=False,
-    )
-    embed.add_field(name="!업타임", value="등록된 모든 서버의 상태를 봅니다.", inline=False)
-    embed.add_field(name="!업타임 <이름>", value="서버 하나의 자세한 업타임을 봅니다.", inline=False)
-    embed.add_field(name="!주소", value="등록된 서버 목록을 봅니다.", inline=False)
-    embed.add_field(name="!주소삭제 <이름>", value="서버를 삭제합니다.", inline=False)
+    if uptime_enabled(guild_id):
+        embed.add_field(
+            name="!주소추가 <주소> [이름]",
+            value="서버를 추가합니다.\n(예: `!주소추가 hypixel.net 하이픽셀`)",
+            inline=False,
+        )
+        embed.add_field(name="!업타임", value="등록된 모든 서버의 상태를 봅니다.", inline=False)
+        embed.add_field(name="!업타임 <이름>", value="서버 하나의 자세한 업타임을 봅니다.", inline=False)
+        embed.add_field(name="!주소", value="등록된 서버 목록을 봅니다.", inline=False)
+        embed.add_field(name="!주소삭제 <이름>", value="서버를 삭제합니다.", inline=False)
     embed.add_field(
         name="!H전적 <닉네임> [bw|sw|duels]",
         value="하이픽셀 전적 카드를 봅니다. 게임을 붙이면 게임 별 전적을 봅니다.",
@@ -1610,6 +1638,9 @@ async def ilchim(ctx):
 @bot.command(name="주소추가")
 @commands.guild_only()
 async def add_server(ctx, address: str = "", *, name: str = ""):
+    if not uptime_enabled(ctx.guild.id):
+        await ctx.reply(UPTIME_OFF_MESSAGE, mention_author=False)
+        return
     if not address:
         await ctx.reply(
             "사용법: `!주소추가 <주소> [이름]` (예: `!주소추가 hypixel.net 하이픽셀`)",
@@ -1679,6 +1710,9 @@ async def register_server(ctx, address, name):
 @bot.command(name="주소")
 @commands.guild_only()
 async def show_address(ctx):
+    if not uptime_enabled(ctx.guild.id):
+        await ctx.reply(UPTIME_OFF_MESSAGE, mention_author=False)
+        return
     servers = guild_servers(ctx.guild.id)
     if not servers:
         await ctx.reply(NO_SERVER_MESSAGE, mention_author=False)
@@ -1693,6 +1727,9 @@ async def show_address(ctx):
 @commands.guild_only()
 @commands.has_guild_permissions(manage_guild=True)
 async def delete_address(ctx, *, name: str = ""):
+    if not uptime_enabled(ctx.guild.id):
+        await ctx.reply(UPTIME_OFF_MESSAGE, mention_author=False)
+        return
     if not name:
         await ctx.reply("사용법: `!주소삭제 <이름>`", mention_author=False)
         return
@@ -1881,7 +1918,8 @@ def build_list_embed(servers, results, now):
                 status = f"접속 {players_online}/{players_max} · {status}"
         else:
             status = "응답 없음"
-        value = f"{status}\n24시간 {percent_text(day_percent)} · 7일 {percent_text(week_percent)}"
+        value = (f"{status}\n24시간 {percent_text(day_percent)} · 7일 {percent_text(week_percent)}"
+                 if uptime_background_on() else status)
         lines_by_server.append((f"{'🟢' if online else '🔴'} {server['name']}", value))
 
     if online_count == len(servers):
@@ -1898,7 +1936,7 @@ def build_list_embed(servers, results, now):
     )
     for name, value in lines_by_server:
         embed.add_field(name=name, value=value, inline=False)
-    embed.set_footer(text=f"{CHECK_INTERVAL_SECONDS}초마다 확인 · 자세히: !업타임 <이름>")
+    embed.set_footer(text=f"{uptime_footer()} · 자세히: !업타임 <이름>")
     return embed
 
 
@@ -1923,6 +1961,9 @@ def build_detail_embed(server, result, now):
     if players_online is not None and players_max is not None:
         embed.add_field(name="접속", value=f"{players_online}/{players_max}", inline=True)
 
+    if not uptime_background_on():
+        embed.set_footer(text=uptime_footer())
+        return embed
     embed.add_field(
         name="24시간 업타임",
         value=f"{day_percent:.2f}% ({day_samples}회)" if day_percent is not None else "수집 중",
@@ -1935,13 +1976,23 @@ def build_detail_embed(server, result, now):
     )
     if avg_latency is not None:
         embed.add_field(name="평균 응답", value=f"{avg_latency:.0f} ms", inline=True)
-    embed.set_footer(text=f"{CHECK_INTERVAL_SECONDS}초마다 확인")
+    embed.set_footer(text=uptime_footer())
     return embed
+
+
+def uptime_footer():
+    if not uptime_background_on():
+        return "지금 상태만 확인 (자동 확인이 꺼져 있어 업타임 %는 없습니다)"
+    seconds = uptime_interval()
+    return f"{human_duration(seconds) if seconds >= 60 else f'{seconds}초'}마다 확인"
 
 
 @bot.command(name="업타임")
 @commands.guild_only()
 async def uptime(ctx, *, name: str = ""):
+    if not uptime_enabled(ctx.guild.id):
+        await ctx.reply(UPTIME_OFF_MESSAGE, mention_author=False)
+        return
     servers = guild_servers(ctx.guild.id)
     if not servers:
         await ctx.reply(NO_SERVER_MESSAGE, mention_author=False)
@@ -1957,8 +2008,9 @@ async def uptime(ctx, *, name: str = ""):
     results, notice = await run_with_notice(
         ctx, asyncio.gather(*(query_server(s["address"]) for s in servers))
     )
-    save_samples([(server["id"], ctx.guild.id, online, latency)
-                  for server, (online, latency, _, _, _) in zip(servers, results)])
+    if uptime_background_on():  # with automatic checks off, a few on-demand samples would only skew the %
+        save_samples([(server["id"], ctx.guild.id, online, latency)
+                      for server, (online, latency, _, _, _) in zip(servers, results)])
 
     now = time.time()
     if name:
@@ -3939,6 +3991,8 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
         else:
             embed.title = "Maco"
         for key, (emoji, title, _) in HELP_CATEGORIES.items():
+            if key == "uptime" and not uptime_enabled(guild_id):
+                continue  # switched off for this server in the admin panel
             button(f"page_{key}", title, emoji)
         # A row holds 5 buttons: categories on the first, the rest on the second.
         button("dm", "DM to Dev.", "✉️", row=1)
@@ -4056,6 +4110,9 @@ class HelpButton(discord.ui.DynamicItem[discord.ui.Button], template=r"maco:help
 async def help_open_page(interaction, page):
     if page == "uptime" and interaction.guild is None:
         await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    if page == "uptime" and not uptime_enabled(interaction.guild.id):
+        await show_help(interaction, notice=UPTIME_OFF_MESSAGE)
         return
     if page == "files" and files_disabled_reason(interaction.guild):
         await show_help(interaction, notice=files_disabled_reason(interaction.guild))
@@ -6193,7 +6250,7 @@ async def textcon_slash(interaction: discord.Interaction, text: app_commands.Ran
 
 @bot.tree.command(name="도움말", description="버튼으로 명령어를 보고 바로 사용합니다")
 async def help_slash(interaction: discord.Interaction):
-    await interaction.response.send_message(ephemeral=True, **help_message())
+    await interaction.response.send_message(ephemeral=True, **help_message(guild_id=interaction.guild_id))
 
 
 # ---------------------------------------------------------------- 대시보드 (nnaco.kro.kr/admin, on NKOTE)
@@ -6250,6 +6307,8 @@ async def dashboard_snapshot():
         "bans": [{"id": str(b["user_id"]), "name": user_name(b["user_id"]), "until": int(b["until"]) if b["until"] else None,
                   "reason": b["reason"], "at": int(b["created_at"])} for b in all_upload_bans()],
         "virusCheck": bool(VIRUSTOTAL_KEY), "blockedFiles": [],
+        "uptime": {"interval": uptime_interval(), "days": history_days(), "background": uptime_background_on(),
+                   "running": monitor_servers.is_running(), "servers": uptime_server_list()},
     }
     with connect_db() as conn:
         usage = {r[0]: (r[1], r[2]) for r in conn.execute(
@@ -6274,6 +6333,7 @@ async def dashboard_snapshot():
             "customQuota": f"file_limit:quota:{guild_id}" in custom, "customMax": f"file_limit:max:{guild_id}" in custom,
             "gamesOff": [game for game in GAME_SWITCHES if f"game_off:{game}:{guild_id}" in switch_keys()],
             "uploadBlocked": f"upload_block:{guild_id}" in switch_keys(),
+            "uptimeOff": not uptime_enabled(guild_id),
         })
     with connect_db() as conn:
         blocked = [dict(r) for r in conn.execute("SELECT * FROM files WHERE status = 'blocked' ORDER BY uploaded_at DESC")]
@@ -6313,6 +6373,36 @@ async def dashboard_snapshot():
             "cleaner": clean_files.is_running(), "shortlinks": shortlinks.host() if shortlinks.configured() else None,
         })
     return snapshot
+
+
+def uptime_server_list():
+    """Every registered Minecraft server with its last result and uptime, for the admin panel (one query each)."""
+    now = time.time()
+    with connect_db() as conn:
+        servers = [dict(r) for r in conn.execute(
+            "SELECT id, guild_id, name, address, registered_at FROM servers ORDER BY guild_id, id")]
+        last = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
+            "SELECT server_id, online, latency_ms, MAX(checked_at) FROM samples GROUP BY server_id")}
+        day = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT server_id, COUNT(*), SUM(online) FROM samples WHERE checked_at >= ? GROUP BY server_id",
+            (now - 86400,))}
+        whole = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT server_id, COUNT(*), SUM(online) FROM samples GROUP BY server_id")}
+    out = []
+    for row in servers:
+        guild = bot.get_guild(row["guild_id"])
+        online, latency, checked = last.get(row["id"], (None, None, None))
+        count, up = day.get(row["id"], (0, 0))
+        all_count, all_up = whole.get(row["id"], (0, 0))
+        out.append({
+            "id": row["id"], "guildId": str(row["guild_id"]), "guild": guild.name if guild else f"(나간 서버) {row['guild_id']}",
+            "name": row["name"], "address": row["address"],
+            "online": None if online is None else bool(online), "latencyMs": round(latency) if latency else None,
+            "checkedAt": int(checked) if checked else None,
+            "day": round(up / count * 100, 2) if count else None,
+            "all": round(all_up / all_count * 100, 2) if all_count else None, "samples": all_count,
+        })
+    return out
 
 
 def dashboard_guild_id(value):
@@ -6359,6 +6449,48 @@ async def dashboard_job(job):
                 set_switch(f"game_off:{game}:{guild_id}", not on)
                 where = "전체" if guild_id == "all" else guild_label(guild_id)
                 message = f"{GAME_SWITCHES[game]} · {where}: {'켜짐' if on else '꺼짐'}"
+        elif kind == "set_uptime":
+            changes = []
+            if "interval" in args:
+                seconds = args.get("interval")
+                if not isinstance(seconds, int) or not UPTIME_INTERVAL_MIN <= seconds <= UPTIME_INTERVAL_MAX:
+                    raise ValueError(f"확인 간격은 {UPTIME_INTERVAL_MIN}초 ~ 1시간 사이로 정해 주세요.")
+                set_setting("uptime_interval", seconds)
+                monitor_servers.change_interval(seconds=seconds)
+                changes.append(f"확인 간격 {human_duration(seconds) if seconds >= 60 else f'{seconds}초'}")
+            if "days" in args:
+                days = args.get("days")
+                if days not in UPTIME_DAYS_CHOICES:
+                    raise ValueError("보관 기간은 7일, 14일, 30일 중에서 골라 주세요.")
+                set_setting("uptime_days", days)
+                with connect_db() as conn:  # a shorter period frees the space right away
+                    conn.execute("DELETE FROM samples WHERE checked_at < ?", (time.time() - days * 86400,))
+                    conn.commit()
+                changes.append(f"기록 보관 {days}일")
+            if "background" in args:
+                set_switch("uptime_off:all", not args.get("background"))
+                changes.append(f"자동 확인 {'켜짐' if args.get('background') else '꺼짐'}")
+            if not changes:
+                ok, message = False, "바꿀 것이 없습니다."
+            else:
+                message = "업타임: " + " · ".join(changes)
+        elif kind == "set_uptime_guild":
+            guild_id = dashboard_guild_id(args.get("scope"))
+            if not guild_id:
+                ok, message = False, "서버를 알 수 없습니다."
+            else:
+                set_switch(f"uptime_off:{guild_id}", not args.get("on"))
+                message = f"서버 업타임 · {guild_label(guild_id)}: {'켜짐' if args.get('on') else '꺼짐'}"
+        elif kind == "delete_uptime_server":
+            server_id = args.get("id")
+            with connect_db() as conn:
+                row = conn.execute("SELECT name, address FROM servers WHERE id = ?", (server_id,)).fetchone() \
+                    if isinstance(server_id, int) else None
+            if not row:
+                ok, message = False, "등록된 마크 서버를 찾지 못했습니다."
+            else:
+                remove_server(server_id)
+                message = f"{row['name']} ({row['address']})와 업타임 기록을 삭제했습니다."
         elif kind == "set_upload_block":
             scope = args.get("scope")
             guild_id = "all" if scope == "all" else dashboard_guild_id(scope)
@@ -6425,6 +6557,8 @@ async def dashboard_job(job):
             message = "저장소 테스트를 마쳤습니다." + ("" if ok else " 🔴 항목을 확인해 주세요.")
         else:
             ok, message = False, "알 수 없는 작업입니다."
+    except ValueError as exc:  # a value the admin typed that the bot refuses, with the reason
+        ok, message = False, str(exc)
     except Exception as exc:
         trace = traceback.format_exc()
         print(f"대시보드 작업 오류 ({kind}):\n{trace}")
@@ -6497,11 +6631,13 @@ MONITOR_CONCURRENCY = 5  # servers checked at once: one slow server no longer de
 _monitor_state = {}  # server id -> online at the last background check (to log only changes)
 
 
-@tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
+@tasks.loop(seconds=UPTIME_INTERVAL_DEFAULT)
 async def monitor_servers():
     # An exception escaping this loop stops background checks for good, so contain every error.
+    if not uptime_background_on():
+        return
     try:
-        rows = all_servers()
+        rows = [r for r in all_servers() if uptime_enabled(r["guild_id"])]
     except sqlite3.Error as exc:
         print(f"백그라운드 확인 오류: {type(exc).__name__}: {exc}")
         notify_admin("백그라운드 서버 확인 오류", f"{type(exc).__name__}: {exc}", "서버 목록 읽기", traceback.format_exc())
@@ -6537,6 +6673,7 @@ async def monitor_servers():
 @monitor_servers.before_loop
 async def before_monitor():
     await bot.wait_until_ready()
+    monitor_servers.change_interval(seconds=uptime_interval())
 
 
 if __name__ == "__main__":
