@@ -860,6 +860,65 @@ _loop_lags = deque(maxlen=500)  # (when, seconds) for each time the event loop w
 _health_hour = {"resumes": 0, "lag": 0.0}
 
 
+# Per-feature health for the public status page (nnaco.kro.kr/status): each outside call a feature makes
+# is marked ok or failed; the last 30 minutes decide 정상 / 일부 오류 / 장애.
+HEALTH_WINDOW_SECONDS = 30 * 60
+_health = {}  # service -> deque of (when, ok)
+
+
+def mark_health(service, ok):
+    _health.setdefault(service, deque(maxlen=60)).append((time.time(), bool(ok)))
+
+
+def health_level(service):
+    """ok / warn / down from the recent marks (no recent use counts as ok)."""
+    now = time.time()
+    marks = [ok for at, ok in _health.get(service, ()) if now - at < HEALTH_WINDOW_SECONDS]
+    fails = marks.count(False)
+    if not fails:
+        return "ok"
+    if fails >= 3 and fails / len(marks) >= 0.5:
+        return "down"
+    return "warn"
+
+
+def status_services():
+    """What the status page shows for each feature: ok / warn / down / off (switched off or not set up)."""
+    return {
+        "uptime": "ok" if monitor_servers.is_running() or not uptime_background_on() else "down",
+        "hypixel": health_level("hypixel") if os.getenv("HYPIXEL_API_KEY", "").strip() else "off",
+        "valorant": health_level("valorant") if os.getenv("HENRIK_API_KEY", "").strip() else "off",
+        "song": health_level("song") if game_enabled("song") else "off",
+        "anime": health_level("anime") if game_enabled("anime") else "off",
+        "files": (("off" if "upload_block:all" in switch_keys() else health_level("files"))
+                  if storage.configured() else "off"),
+        "links": health_level("links") if shortlinks.configured() else "off",
+    }
+
+
+STATUS_HEARTBEAT_SECONDS = 300
+STATUS_PAGE_URL = os.getenv("STATUS_PAGE_URL", "https://nnaco.kro.kr/status").strip()
+
+
+async def status_heartbeat():
+    """Every 5 minutes: tell NKOTE the bot is alive, with each feature's state (no server names or users)."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            latency = bot.latency * 1000
+            await dashboard.status({
+                "guilds": len(bot.guilds), "latencyMs": round(latency) if latency == latency else None,
+                "services": status_services(),
+            })
+            mark_health("links", True)
+        except dashboard.NotBound:
+            pass
+        except Exception as exc:
+            mark_health("links", False)
+            print(f"상태 페이지 신호 실패: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(STATUS_HEARTBEAT_SECONDS)
+
+
 class _ResumeLogFilter(logging.Filter):
     def filter(self, record):
         return "RESUMED session" not in record.getMessage()
@@ -2079,8 +2138,11 @@ async def uptime(ctx, *, name: str = ""):
 async def lookup(ctx, awaitable):
     """Turn a StatsError into a (None, message) pair so it can be shown to the user; API problems also go to the admin."""
     try:
-        return await awaitable, None
+        result = await awaitable, None
+        mark_health("hypixel", True)
+        return result
     except stats.StatsError as exc:
+        mark_health("hypixel", not isinstance(exc, stats.ServiceError))  # a missing player is the API working
         notify_service_error(exc, describe_ctx(ctx))
         return None, str(exc)
 
@@ -2136,10 +2198,12 @@ async def valorant_lookup(name, tag, region, suggest=True, progress=None, where=
     `where` describes the request for admin error DMs."""
     try:
         profile = await stats.valorant_profile(name, tag, region, progress.step if progress else None)
+        mark_health("valorant", not profile.get("matches_error"))
         if profile.get("matches_error"):
             note_match_failure(profile["matches_error"], where)
         return profile, None, []
     except stats.PlayerNotFound:
+        mark_health("valorant", True)
         error = f"`{name}#{tag}` 계정을 찾을 수 없습니다."
         suggestions, failure = [], None
         if suggest:
@@ -2154,6 +2218,7 @@ async def valorant_lookup(name, tag, region, suggest=True, progress=None, where=
             error += " 이름과 태그를 다시 확인해 주세요. (대문자 I와 소문자 l, 숫자 0과 영문 O를 헷갈리기 쉽습니다)"
         return None, error, suggestions
     except stats.StatsError as exc:
+        mark_health("valorant", not isinstance(exc, stats.ServiceError))
         notify_service_error(exc, where)
         return None, str(exc), []
 
@@ -3144,8 +3209,10 @@ async def upload_attachments(ctx, attachments, name=""):
             try:
                 rows.append(await store_attachment(ctx.guild.id, ctx.channel.id, ctx.author.id, attachment,
                                                    name if len(attachments) == 1 else ""))
+                mark_health("files", True)
             except storage.StorageError as exc:
-                if exc.__cause__:
+                if exc.__cause__:  # the storage itself failed (not a size limit or a block)
+                    mark_health("files", False)
                     notify_admin("파일 저장소 오류", f"{type(exc.__cause__).__name__}: {exc.__cause__}", describe_ctx(ctx))
                 errors.append(f"`{attachment.filename}`: {exc}")
             except discord.HTTPException:
@@ -4107,6 +4174,7 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
         # A row holds 5 buttons: categories on the first, the rest on the second.
         button("dm", "DM to Dev.", "✉️", row=1)
         button("commands", "명령어 보기", "📋", row=1)
+        view.add_item(discord.ui.Button(label="서비스 상태", emoji="🟢", url=STATUS_PAGE_URL, row=1))
         return {"embed": embed, "view": view}
 
     emoji, title, keys = HELP_CATEGORIES[page]
@@ -5405,6 +5473,7 @@ async def anime_picture(cid):
             data = await download(url)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
             data = None
+    mark_health("anime", bool(data))
     if not data or len(data) > ANIME_FILE_MAX:
         return None
     ext = url.rsplit(".", 1)[-1].lower() if "." in url.rsplit("/", 1)[-1] else "png"
@@ -5943,6 +6012,12 @@ async def song_preview_url(guild_id, sid):
 
 async def song_preview(guild_id, sid):
     """(bytes, extension) of the song's preview, or None."""
+    result = await _song_preview(guild_id, sid)
+    mark_health("song", result is not None)
+    return result
+
+
+async def _song_preview(guild_id, sid):
     url = await song_preview_url(guild_id, sid)
     if not url:
         return None
@@ -6741,6 +6816,10 @@ async def dashboard_loop():
 
 
 async def setup_hook():
+    if dashboard.configured():
+        heartbeat = asyncio.get_running_loop().create_task(status_heartbeat())
+        _background_tasks.add(heartbeat)
+        heartbeat.add_done_callback(_background_tasks.discard)
     task = asyncio.get_running_loop().create_task(watch_loop_lag())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
