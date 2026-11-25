@@ -1038,6 +1038,29 @@ async def count_messages(message):
         record_traffic("messages", message.guild.id)
 
 
+def welcome_message(guild):
+    """The DM to a server's owner when Maco is added: how to start, and where to ask."""
+    text = (f"👋 마코를 {discord.utils.escape_markdown(guild.name)}에 추가해 주셔서 감사합니다!\n"
+            "`/도움말`이나 `!도움말`로 모든 기능을 볼 수 있어요\n"
+            "궁금한 점, 오류 신고, 건의는 마코 서포트 센터로 와 주세요!")
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="서포트 센터", emoji="💬", url=SUPPORT_SERVER_URL))
+    view.add_item(discord.ui.Button(label="서비스 상태", emoji="🟢", url=STATUS_PAGE_URL))
+    return text, view
+
+
+@bot.listen("on_guild_join")
+async def welcome_owner(guild):
+    """Every time Maco is added to a server, its owner gets the welcome DM. Only a DM: if the owner's DMs
+    are closed nothing is posted in the server instead. Nothing is stored."""
+    try:
+        owner = guild.owner or await bot.fetch_user(guild.owner_id)
+        text, view = welcome_message(guild)
+        await owner.send(text, view=view)
+    except (discord.HTTPException, AttributeError, TypeError) as exc:
+        print(f"환영 DM을 보내지 못함 ({guild.id}): {type(exc).__name__}")
+
+
 @bot.listen("on_guild_remove")
 async def forget_guild_traffic(guild):
     for counts in traffic.values():
