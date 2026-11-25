@@ -6,6 +6,8 @@ import time
 import sqlite3
 import asyncio
 import hashlib
+import logging
+from collections import deque
 import io
 import json
 import shutil
@@ -846,6 +848,56 @@ def percent_text(percentage):
     return f"{percentage:.2f}%" if percentage is not None else "수집 중"
 
 
+# ---------------------------------------------------------------- connection health
+# "Shard ID None has successfully RESUMED session" means the connection to Discord dropped and was picked
+# up again. Usually the network, or the bot was too busy to answer Discord's heartbeat in time (0.25 vCPU).
+# The lines are counted instead of printed one by one, and the event loop's delays are measured so the
+# admin panel can tell which it was.
+_resumes = deque(maxlen=500)  # when each resume / fresh reconnect happened
+_loop_lags = deque(maxlen=500)  # (when, seconds) for each time the event loop was late by over a second
+_health_hour = {"resumes": 0, "lag": 0.0}
+
+
+class _ResumeLogFilter(logging.Filter):
+    def filter(self, record):
+        return "RESUMED session" not in record.getMessage()
+
+
+logging.getLogger("discord.gateway").addFilter(_ResumeLogFilter())
+
+
+@bot.listen("on_resumed")
+async def count_resume():
+    _resumes.append(time.time())
+    _health_hour["resumes"] += 1
+
+
+def connection_health():
+    now = time.time()
+    lags = [lag for at, lag in _loop_lags if now - at < 86400]
+    return {"resumes24h": sum(1 for at in _resumes if now - at < 86400), "lags24h": len(lags),
+            "maxLag": round(max(lags), 1) if lags else 0.0}
+
+
+async def watch_loop_lag():
+    """Sleep a second at a time and note how late the wake-up was: a late wake-up is the bot being
+    blocked or starved of CPU, which is what makes Discord drop the connection."""
+    last_report = time.monotonic()
+    while True:
+        start = time.monotonic()
+        await asyncio.sleep(1)
+        lag = time.monotonic() - start - 1
+        if lag > 1:
+            _loop_lags.append((time.time(), lag))
+            _health_hour["lag"] = max(_health_hour["lag"], lag)
+        if time.monotonic() - last_report >= 3600:
+            last_report = time.monotonic()
+            if _health_hour["resumes"] or _health_hour["lag"] > 1:
+                print(f"연결 상태 (지난 1시간): 재연결 {_health_hour['resumes']}번 · 봇이 가장 오래 멈춘 시간 "
+                      f"{_health_hour['lag']:.1f}초")
+            _health_hour.update(resumes=0, lag=0.0)
+
+
 @bot.event
 async def on_ready():
     init_db()
@@ -1405,7 +1457,7 @@ def memory_usage():
 async def db_status_embed():
     embed = discord.Embed(title="DB 상태", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
     current, peak = memory_usage()
-    limit = env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024
+    limit = env_int("MEMORY_LIMIT_MB", 256, 1) * 1024 * 1024
     parts = []
     if current is not None:
         parts.append(f"지금 **{human_size(current)}** / {human_size(limit)} ({current / limit * 100:.0f}%)")
@@ -6293,7 +6345,8 @@ async def dashboard_snapshot():
         "bot": {
             "name": str(bot.user) if bot.user else "마코", "startedAt": int(STARTED_AT), "guilds": len(bot.guilds),
             "latencyMs": round(bot.latency * 1000) if bot.latency == bot.latency else None,  # NaN before connecting
-            "memory": {"current": current, "peak": peak, "limit": env_int("MEMORY_LIMIT_MB", 128, 1) * 1024 * 1024},
+            "memory": {"current": current, "peak": peak, "limit": env_int("MEMORY_LIMIT_MB", 256, 1) * 1024 * 1024},
+            "connection": connection_health(),
         },
         "retention": {"seconds": file_retention(), "text": retention_text(), "maxText": human_duration(retention_max),
                       "maxSeconds": retention_max},
@@ -6605,6 +6658,9 @@ async def dashboard_loop():
 
 
 async def setup_hook():
+    task = asyncio.get_running_loop().create_task(watch_loop_lag())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton,
