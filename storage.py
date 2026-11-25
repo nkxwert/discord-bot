@@ -251,10 +251,31 @@ def name_for_type(content_type, stem="file"):
 
 # ---------------------------------------------------------------- uploads
 
-async def _file_chunks(path):
+async def _file_chunks(path, hasher=None):
     with open(path, "rb") as f:
         while chunk := await asyncio.to_thread(f.read, CHUNK_SIZE):
+            if hasher is not None:
+                hasher.update(chunk)
             yield chunk
+
+
+async def _hashed(chunks, hasher):
+    """Pass chunks through while feeding them to a hashlib object (the virus check needs the SHA-256)."""
+    async for chunk in chunks:
+        if hasher is not None:
+            hasher.update(chunk)
+        yield chunk
+
+
+async def sha256_of(key):
+    """SHA-256 of a stored object, streamed (nothing kept in memory or on disk)."""
+    hasher = hashlib.sha256()
+    async with net.session().get(URL(link(key, 3600), encoded=True), timeout=aiohttp.ClientTimeout(total=1800)) as response:
+        if response.status != 200:
+            raise StorageError("파일을 받지 못했습니다.")
+        async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 async def put_bytes(key, data, filename, content_type=None, extra_headers=None):
@@ -267,18 +288,18 @@ async def put_bytes(key, data, filename, content_type=None, extra_headers=None):
     return headers["Content-Type"]
 
 
-async def put_path(key, path, filename, content_type=None):
+async def put_path(key, path, filename, content_type=None, hasher=None):
     """Stream a local file up. Returns the stored Content-Type."""
     headers = stored_headers(filename, content_type)
     headers["Content-Length"] = str(os.path.getsize(path))
     try:
-        await _s3("PUT", key, headers=headers, data=_file_chunks(path), unsigned_payload=True, timeout=3600)
+        await _s3("PUT", key, headers=headers, data=_file_chunks(path, hasher), unsigned_payload=True, timeout=3600)
     except Exception as exc:
         raise StorageError("파일 저장소에 올리지 못했습니다. 잠시 후 다시 시도해 주세요.") from exc
     return headers["Content-Type"]
 
 
-async def put_from_url(key, url, size, filename, content_type=None):
+async def put_from_url(key, url, size, filename, content_type=None, hasher=None):
     """Stream a file (a Discord attachment) straight from its URL into storage, a chunk at a time,
     so even a big file only uses a few hundred KB of memory. Returns the stored Content-Type."""
     headers = stored_headers(filename, content_type)
@@ -287,7 +308,7 @@ async def put_from_url(key, url, size, filename, content_type=None):
         async with net.session().get(url, timeout=aiohttp.ClientTimeout(total=3600)) as source:
             if source.status != 200:
                 raise StorageError("디스코드에서 파일을 받지 못했습니다. 다시 시도해 주세요.")
-            await _s3("PUT", key, headers=headers, data=source.content.iter_chunked(CHUNK_SIZE),
+            await _s3("PUT", key, headers=headers, data=_hashed(source.content.iter_chunked(CHUNK_SIZE), hasher),
                       unsigned_payload=True, timeout=3600)
     except StorageError:
         raise

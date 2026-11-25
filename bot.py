@@ -5,6 +5,7 @@ import math
 import time
 import sqlite3
 import asyncio
+import hashlib
 import io
 import json
 import shutil
@@ -188,15 +189,47 @@ bot = MacoBot(
 )
 
 
+# Spam guard for every ! command: a person may use RATE_COUNT commands in RATE_SECONDS (game answers too).
+RATE_COUNT, RATE_SECONDS = 5, 5
+_command_rate = commands.CooldownMapping.from_cooldown(RATE_COUNT, RATE_SECONDS, commands.BucketType.user)
+_rate_warned = {}  # user id -> when they were last told to slow down (told once per burst)
+
+
+class TooFast(commands.CheckFailure):
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__("명령어를 너무 빠르게 사용함")
+
+
 @bot.check
 async def bot_can_answer(ctx):
-    """Stop a ! command before it starts when the bot couldn't post its answer here anyway."""
+    """Stop a ! command before it starts when the bot couldn't post its answer here anyway, or when the
+    person is sending commands faster than RATE_COUNT in RATE_SECONDS."""
+    retry_after = _command_rate.update_rate_limit(ctx.message)
+    if retry_after:
+        raise TooFast(retry_after)
     missing = missing_permissions(ctx.channel)
     if ctx.command and ctx.command.name == "도움말" and "send_messages" not in missing:
         return True  # the command list also works as plain text, so reviewers always see it
     if missing:
         raise BotMissingPermissions(missing)
     return True
+
+
+async def tell_too_fast(ctx, error):
+    """One short notice per burst; further commands in the same burst are ignored silently."""
+    now = time.time()
+    if now - _rate_warned.get(ctx.author.id, 0) < RATE_SECONDS:
+        return
+    if len(_rate_warned) >= 500:
+        for user_id in [u for u, t in _rate_warned.items() if now - t >= RATE_SECONDS]:
+            del _rate_warned[user_id]
+    _rate_warned[ctx.author.id] = now
+    try:
+        await ctx.reply(f"⏳ 명령어를 너무 빠르게 쓰고 있습니다. {math.ceil(error.retry_after)}초 뒤에 다시 써 주세요.",
+                        mention_author=False, delete_after=RATE_SECONDS)
+    except discord.HTTPException:
+        pass
 
 # Per-server activity for £servers: kind -> guild id -> {hour number: count}. Memory only, last 24 hours.
 traffic = {"messages": {}, "commands": {}}
@@ -379,6 +412,20 @@ def init_db():
         if "bar_channel_id" not in columns:
             conn.execute("ALTER TABLE files ADD COLUMN bar_channel_id INTEGER")
             conn.execute("ALTER TABLE files ADD COLUMN bar_message_id INTEGER")
+        # Virus check (VirusTotal hash lookup): the file's SHA-256 and, for a file it flagged, the result.
+        # status 'blocked': the file was flagged and moved out of reach, kept as evidence for the admin.
+        if "sha256" not in columns:
+            conn.execute("ALTER TABLE files ADD COLUMN sha256 TEXT")
+            conn.execute("ALTER TABLE files ADD COLUMN scan TEXT")
+        # People who may not upload: until NULL = for good (영구), else until that time (시간 차단).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS upload_bans (
+                user_id INTEGER PRIMARY KEY,
+                until REAL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            )
+        """)
         # D-Days: per server, visible to everyone, edited only by the person who made them.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ddays (
@@ -495,6 +542,48 @@ def set_setting(key, value):
         conn.execute("INSERT INTO settings(key, value) VALUES (?, ?) "
                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
         conn.commit()
+    _switch_cache.clear()
+
+
+def delete_setting(key):
+    with connect_db() as conn:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.commit()
+    _switch_cache.clear()
+
+
+# On/off switches the NKOTE admin panel sets, kept as settings rows ("game_off:anime:all",
+# "game_off:song:<server id>", "upload_block:all", "upload_block:<server id>"). Read on every command, so
+# they are cached in memory and the cache is dropped whenever a setting changes.
+GAME_SWITCHES = {"anime": "애니캐 맞히기", "song": "노래 맞히기"}
+_switch_cache = {}
+
+
+def switch_keys():
+    if "keys" not in _switch_cache:
+        with connect_db() as conn:
+            _switch_cache["keys"] = {r["key"] for r in conn.execute(
+                "SELECT key FROM settings WHERE key LIKE 'game_off:%' OR key LIKE 'upload_block:%'")}
+    return _switch_cache["keys"]
+
+
+def set_switch(key, on):
+    if on:
+        set_setting(key, "1")
+    else:
+        delete_setting(key)
+
+
+def game_enabled(game, guild_id=None):
+    keys = switch_keys()
+    return f"game_off:{game}:all" not in keys and (not guild_id or f"game_off:{game}:{guild_id}" not in keys)
+
+
+def game_off_message(game, guild):
+    """None while the game may be used here, else what to tell the person."""
+    if game not in GAME_SWITCHES or game_enabled(game, guild.id if guild else None):
+        return None
+    return f"지금은 {GAME_SWITCHES[game]}을(를) 쓸 수 없습니다. (관리자가 꺼 두었습니다)"
 
 
 def validate_address(raw: str) -> str:
@@ -592,15 +681,55 @@ async def query_external(address: str):
     return result
 
 
-async def query_server(address: str, quiet=False):
+INSIDE_ADDRESS_MESSAGE = ("이 주소는 내부 네트워크 주소(사설 IP, localhost 등)를 가리켜서 확인할 수 없습니다. "
+                          "인터넷에서 접속할 수 있는 주소(공인 IP나 그 IP를 가리키는 도메인)를 입력해 주세요.")
+
+
+class InsideAddress(Exception):
+    """The server name resolves to a private/local IP: checking it would probe the bot host's own network."""
+
+
+async def points_inside(host):
+    """True if the host is, or resolves to, an address that isn't on the public internet. A domain
+    pointing at 127.0.0.1 or 192.168.x.x would otherwise let anyone probe the bot host's own network.
+    Lookup failures count as outside: the connection then simply fails."""
+    host = host.strip("[]").rstrip(".")
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, None), timeout=5)
+    except (OSError, asyncio.TimeoutError, UnicodeError):
+        return False
+    for info in infos:
+        try:
+            if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+async def query_server(address: str, quiet=False, strict=False):
     """Returns (online, latency_ms, players_online, players_max, via_external). quiet: no log line on failure
-    (the background check logs only when a server goes down)."""
+    (the background check logs only when a server goes down). An internal address counts as offline, or
+    raises InsideAddress when strict (adding a server)."""
     try:
         # async_lookup: the plain lookup() resolves SRV records synchronously and freezes the whole bot.
         server = await asyncio.wait_for(JavaServer.async_lookup(address), timeout=5)
+        # Checked on every query, not only when added: the domain's IP can be changed afterwards.
+        if await points_inside(server.address.host) or await points_inside(address_host(address)):
+            raise InsideAddress(address)
         status = await asyncio.wait_for(server.async_status(), timeout=5)
         latency = float(status.latency) if status.latency is not None else None
         return True, latency, status.players.online, status.players.max, False
+    except InsideAddress:
+        if strict:
+            raise
+        if not quiet:
+            print(f"내부 주소라서 확인하지 않음: {address}")
+        return False, None, None, None, False
     except Exception as exc:
         if not quiet:
             print(f"상태 확인 실패 ({address}): {type(exc).__name__}: {exc}")
@@ -1346,7 +1475,7 @@ async def owner_servers(message, args):
 
 @bot.command(name="도움말", aliases=["help"])
 async def help_command(ctx):
-    embed = command_list_embed()
+    embed = command_list_embed(ctx.guild.id if ctx.guild else None)
     if not missing_permissions(ctx.channel, ("embed_links",)):
         await ctx.reply(embed=embed, mention_author=False)
         return
@@ -1364,8 +1493,8 @@ async def help_command(ctx):
     await ctx.send(chunk)
 
 
-def command_list_embed():
-    """Every ! command; used by !도움말 and the /도움말 명령어 보기 button."""
+def command_list_embed(guild_id=None):
+    """Every ! command; used by !도움말 and the /도움말 명령어 보기 button. Switched-off games are left out."""
     embed = discord.Embed(title="Maco", color=discord.Color.green())
     embed.add_field(
         name="!주소추가 <주소> [이름]",
@@ -1407,13 +1536,15 @@ def command_list_embed():
     embed.add_field(name="!지도시작 [쉬움|보통|어려움] [문제 수] · !지도 <나라> · !힌트 · !지도순위",
                     value="지도 맞히기: 지도(어려움은 나라 모양)를 보고 가장 먼저 나라를 맞힌 사람의 개수가 기록됩니다.",
                     inline=False)
-    embed.add_field(name="!캐릭시작 [쉬움|보통] [문제 수] · !캐릭 <이름> · !힌트 · !캐릭순위",
-                    value="애니캐 맞히기: 애니 캐릭터 그림을 보고 가장 먼저 이름을 맞힌 사람의 개수가 기록됩니다. "
-                          "`!애니 리스트`로 작품 목록, `!애니 추천 <작품>`으로 작품 추천.",
-                    inline=False)
-    embed.add_field(name="!노래시작 [쉬움|보통|어려움] [장르] [문제 수] · !노래 <제목> · !노래추가 <곡>",
-                    value="노래 맞히기: 노래 일부분(공식 미리듣기)을 듣고 가장 먼저 제목을 맞힌 사람의 개수가 기록됩니다. "
-                          "`!노래추가`로 이 서버에 곡을 넣을 수 있습니다.", inline=False)
+    if game_enabled("anime", guild_id):
+        embed.add_field(name="!캐릭시작 [쉬움|보통] [문제 수] · !캐릭 <이름> · !힌트 · !캐릭순위",
+                        value="애니캐 맞히기: 애니 캐릭터 그림을 보고 가장 먼저 이름을 맞힌 사람의 개수가 기록됩니다. "
+                              "`!애니 리스트`로 작품 목록, `!애니 추천 <작품>`으로 작품 추천.",
+                        inline=False)
+    if game_enabled("song", guild_id):
+        embed.add_field(name="!노래시작 [쉬움|보통|어려움] [장르] [문제 수] · !노래 <제목> · !노래추가 <곡>",
+                        value="노래 맞히기: 노래 일부분(공식 미리듣기)을 듣고 가장 먼저 제목을 맞힌 사람의 개수가 기록됩니다. "
+                              "`!노래추가`로 이 서버에 곡을 넣을 수 있습니다.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -1500,7 +1631,14 @@ def check_new_server(guild_id, address, name):
 
 async def register_server(ctx, address, name):
     # Register even if temporarily offline, but tell the user the initial probe result.
-    result, notice = await run_with_notice(ctx, query_server(address))
+    if await points_inside(address_host(address)):
+        await ctx.reply(INSIDE_ADDRESS_MESSAGE, mention_author=False)
+        return
+    try:
+        result, notice = await run_with_notice(ctx, query_server(address, strict=True))
+    except InsideAddress:
+        await send_result(ctx, getattr(ctx, "notice", None), content=INSIDE_ADDRESS_MESSAGE)
+        return
     online, latency, players_online, players_max, external = result
     with connect_db() as conn:
         conn.execute(
@@ -1603,6 +1741,9 @@ async def tell_missing_permissions(ctx, missing=None):
 async def report_error(ctx, error):
     """Log an unexpected command error and tell the user, replacing the waiting notice if one is up."""
     original = getattr(error, "original", error)
+    if isinstance(original, TooFast):
+        await tell_too_fast(ctx, original)
+        return
     if isinstance(original, BotMissingPermissions):
         await tell_missing_permissions(ctx, original.missing)
         return
@@ -2452,7 +2593,9 @@ async def store_attachment(guild_id, channel_id, user_id, attachment, name=""):
     """Stream one Discord attachment into storage and record it. The file never sits in memory as a whole
     (the bot host has 128MB). Videos are converted only when FILE_CONVERT_VIDEO is on."""
     filename, size = attachment.filename, attachment.size
+    check_upload_allowed(guild_id, user_id)
     check_file_size(guild_id, size)
+    hasher = hashlib.sha256()  # worked out while the file streams through, for the virus check
     converted = await storage.convert_url(attachment.url, filename) if storage.should_convert(filename, size) else None
     if converted:
         path, filename, size, cleanup = converted
@@ -2460,15 +2603,21 @@ async def store_attachment(guild_id, channel_id, user_id, attachment, name=""):
             check_file_size(guild_id, size)
             check_file_quota(guild_id, size)
             key = storage.new_key(guild_id, filename)
-            content_type = await storage.put_path(key, path, filename)
+            content_type = await storage.put_path(key, path, filename, hasher=hasher)
         finally:
             cleanup()
     else:
         check_file_quota(guild_id, size)
         key = storage.new_key(guild_id, filename)
-        content_type = await storage.put_from_url(key, attachment.url, size, filename)
+        content_type = await storage.put_from_url(key, attachment.url, size, filename, hasher=hasher)
     name = unique_file_name(guild_id, user_id, file_display_name(name, filename))
-    return save_file_row(guild_id, channel_id, user_id, name, key, content_type, size)
+    row = save_file_row(guild_id, channel_id, user_id, name, key, content_type, size)
+    with connect_db() as conn:
+        conn.execute("UPDATE files SET sha256 = ? WHERE id = ?", (hasher.hexdigest(), row["id"]))
+        conn.commit()
+    row["sha256"] = hasher.hexdigest()
+    queue_virus_scan(row["id"])
+    return row
 
 
 async def store_file(guild_id, channel_id, user_id, filename, data, name=""):
@@ -2848,7 +2997,8 @@ _upload_locks = {}
 
 async def start_browser_upload(guild_id, channel_id, user_id, name=""):
     """A pending upload and the page link where the user picks the file (up to the server's limits).
-    Raises StorageError when the server has no space left."""
+    Raises StorageError when the server has no space left or uploads are blocked."""
+    check_upload_allowed(guild_id, user_id)
     max_bytes = guild_upload_max(guild_id)
     if max_bytes <= 0:
         check_file_quota(guild_id, 1)  # raises with the server's numbers
@@ -2926,6 +3076,7 @@ async def finish_upload(row_id):
             done = dict(conn.execute("SELECT * FROM files WHERE id = ?", (row_id,)).fetchone())
     _upload_locks.pop(row_id, None)
     await post_upload(done)
+    queue_virus_scan(row_id)  # read back from storage to hash it (files up to VIRUS_SCAN_MAX_BYTES)
     return "done", f"✅ **{discord.utils.escape_markdown(name)}** 올리기를 마쳤습니다. 채널에 올렸습니다."
 
 
@@ -3144,6 +3295,198 @@ async def set_file_expiry(row_id, expires_at):
     return True, (f"**{discord.utils.escape_markdown(row['name'])}** 만료일을 <t:{int(expires_at)}:f>(으)로 바꿨습니다." + note)
 
 
+# ---------------------------------------------------------------- 업로드 차단 · 바이러스 검사
+
+def upload_ban(user_id):
+    """The person's upload ban row as a dict, or None (expired bans are removed here)."""
+    with connect_db() as conn:
+        row = conn.execute("SELECT * FROM upload_bans WHERE user_id = ?", (user_id,)).fetchone()
+        if row and row["until"] is not None and row["until"] <= time.time():
+            conn.execute("DELETE FROM upload_bans WHERE user_id = ?", (user_id,))
+            conn.commit()
+            row = None
+    return dict(row) if row else None
+
+
+def set_upload_ban(user_id, seconds, reason=""):
+    """seconds None: for good. A shorter ban never replaces a longer one that is already there."""
+    current = upload_ban(user_id)
+    until = None if seconds is None else time.time() + seconds
+    if current and (current["until"] is None or (until is not None and current["until"] >= until)):
+        return current
+    with connect_db() as conn:
+        conn.execute("INSERT INTO upload_bans(user_id, until, reason, created_at) VALUES (?, ?, ?, ?) "
+                     "ON CONFLICT(user_id) DO UPDATE SET until = excluded.until, reason = excluded.reason, "
+                     "created_at = excluded.created_at", (user_id, until, reason[:200], time.time()))
+        conn.commit()
+    return upload_ban(user_id)
+
+
+def remove_upload_ban(user_id):
+    with connect_db() as conn:
+        conn.execute("DELETE FROM upload_bans WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def all_upload_bans():
+    now = time.time()
+    with connect_db() as conn:
+        conn.execute("DELETE FROM upload_bans WHERE until IS NOT NULL AND until <= ?", (now,))
+        conn.commit()
+        return [dict(r) for r in conn.execute("SELECT * FROM upload_bans ORDER BY created_at DESC")]
+
+
+def upload_blocked_reason(guild_id, user_id):
+    """Why this person can't upload here right now (admin panel: everyone, this server or this person)."""
+    keys = switch_keys()
+    if "upload_block:all" in keys:
+        return "🚫 지금은 파일 올리기가 잠시 막혀 있습니다. (봇 관리자 설정)"
+    if guild_id and f"upload_block:{guild_id}" in keys:
+        return "🚫 이 서버에서는 파일 올리기가 막혀 있습니다. (봇 관리자 설정)"
+    ban = upload_ban(user_id) if user_id else None
+    if ban:
+        when = "영구 차단" if ban["until"] is None else f"{human_duration(ban['until'] - time.time())} 남음"
+        reason = f" · 사유: {ban['reason']}" if ban["reason"] else ""
+        return f"🚫 파일 올리기가 차단된 계정입니다. ({when}{reason})"
+    return None
+
+
+def check_upload_allowed(guild_id, user_id):
+    reason = upload_blocked_reason(guild_id, user_id)
+    if reason:
+        raise storage.StorageError(reason)
+
+
+VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
+VIRUSTOTAL_URL = "https://www.virustotal.com/api/v3/files/"
+VIRUSTOTAL_GAP_SECONDS = 16  # free key: 4 lookups a minute
+VIRUSTOTAL_DAILY = 480  # free key: 500 a day (a little kept back)
+VIRUSTOTAL_MIN_ENGINES = 3  # flagged by this many engines -> blocked; fewer -> the admin is only told
+VIRUS_SCAN_MAX_BYTES = 50 * 1024 * 1024  # page uploads bigger than this aren't read back just to hash them
+VIRUS_FREEZE_SECONDS = 24 * 3600  # uploader's ban after a flagged file
+BLOCKED_KEEP_SECONDS = 90 * 24 * 3600  # a flagged file is kept this long as evidence (or until deleted)
+_scan_queue = None  # asyncio.Queue of file row ids, made when the first scan is queued
+_scan_day = {"day": "", "count": 0}
+
+
+def queue_virus_scan(row_id):
+    """Look the file up on VirusTotal in the background (only its SHA-256 is sent, never the file)."""
+    global _scan_queue
+    if not VIRUSTOTAL_KEY:
+        return
+    if _scan_queue is None:
+        _scan_queue = asyncio.Queue(maxsize=1000)
+        task = asyncio.get_running_loop().create_task(virus_scan_worker())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    try:
+        _scan_queue.put_nowait(row_id)
+    except asyncio.QueueFull:
+        print(f"바이러스 검사 대기열이 가득 차서 건너뜀: 파일 {row_id}")
+
+
+async def virustotal_lookup(sha256):
+    """(malicious, suspicious, engines) for a known file, None if VirusTotal has never seen it.
+    Raises RuntimeError("rate") when the key's limit is reached."""
+    async with net.session().get(VIRUSTOTAL_URL + sha256, headers={"x-apikey": VIRUSTOTAL_KEY},
+                                 timeout=aiohttp.ClientTimeout(total=20)) as response:
+        if response.status == 404:
+            return None
+        if response.status == 429:
+            raise RuntimeError("rate")
+        if response.status != 200:
+            raise RuntimeError(f"VirusTotal HTTP {response.status}")
+        body = await response.json(content_type=None)
+    stats = (body.get("data") or {}).get("attributes", {}).get("last_analysis_stats") or {}
+    engines = sum(v for v in stats.values() if isinstance(v, int))
+    return int(stats.get("malicious") or 0), int(stats.get("suspicious") or 0), engines
+
+
+async def virus_scan_worker():
+    while True:
+        row_id = await _scan_queue.get()
+        try:
+            await virus_scan(row_id)
+        except Exception as exc:
+            print(f"바이러스 검사 오류 (파일 {row_id}): {type(exc).__name__}: {exc}")
+        await asyncio.sleep(VIRUSTOTAL_GAP_SECONDS)
+
+
+async def virus_scan(row_id):
+    with connect_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (row_id,)).fetchone()
+    row = dict(row) if row else None
+    if not row or row["status"] != "ready":
+        return
+    if not row["sha256"]:
+        if row["size"] > VIRUS_SCAN_MAX_BYTES:
+            return
+        sha = await storage.sha256_of(row["key"])
+        with connect_db() as conn:
+            conn.execute("UPDATE files SET sha256 = ? WHERE id = ?", (sha, row_id))
+            conn.commit()
+        row["sha256"] = sha
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if _scan_day["day"] != today:
+        _scan_day.update(day=today, count=0)
+    if _scan_day["count"] >= VIRUSTOTAL_DAILY:
+        return  # today's free lookups are used up
+    _scan_day["count"] += 1
+    for attempt in range(3):
+        try:
+            result = await virustotal_lookup(row["sha256"])
+            break
+        except RuntimeError as exc:
+            if str(exc) != "rate" or attempt == 2:
+                raise
+            await asyncio.sleep(60)
+    if result is None:
+        return
+    malicious, suspicious, engines = result
+    if malicious >= VIRUSTOTAL_MIN_ENGINES:
+        await block_flagged_file(row, malicious, engines)
+    elif malicious or suspicious:
+        notify_admin("의심 파일 (차단 기준 미만)", f"악성 {malicious} · 의심 {suspicious} / 엔진 {engines}개",
+                     flagged_file_text(row))
+
+
+def flagged_file_text(row):
+    guild = bot.get_guild(row["guild_id"]) if row["guild_id"] else None
+    return "\n".join([
+        f"올린 사람: <@{row['uploaded_by']}> · 디스코드 ID `{row['uploaded_by']}` · {user_name(row['uploaded_by']) or '(이름 모름)'}",
+        f"서버: {guild.name if guild else '(알 수 없음)'} (`{row['guild_id']}`) · 채널 `{row['channel_id']}`",
+        f"파일: {row['name']} · {human_size(row['size'])} · 올린 시각 <t:{int(row['uploaded_at'])}:F>",
+        f"SHA-256: `{row['sha256']}`",
+        f"VirusTotal: https://www.virustotal.com/gui/file/{row['sha256']}",
+    ])
+
+
+async def block_flagged_file(row, malicious, engines):
+    """Take a flagged file out of reach but keep it as evidence: it moves to a new random name (old links
+    stop working), its short link and song bar go, and only the admin panel can open or delete it.
+    The uploader can't upload for a day; the admin is told who it was."""
+    new_key = storage.new_key("quarantine", row["key"].rsplit("/", 1)[-1])
+    moved = True
+    try:
+        await storage.copy(row["key"], new_key, row["key"].rsplit("/", 1)[-1], row["content_type"])
+        await storage.delete(row_keys(row))
+    except Exception as exc:
+        moved = False
+        print(f"악성 파일 옮기기 실패: {type(exc).__name__}: {exc}")
+    await shortlinks.delete(row.get("url"))
+    await delete_bar_message(row)
+    scan = f"악성 {malicious} / 엔진 {engines}개"
+    with connect_db() as conn:
+        conn.execute("UPDATE files SET status = 'blocked', key = ?, url = '', player_key = NULL, scan = ?, "
+                     "expires_at = ? WHERE id = ?",
+                     (new_key if moved else row["key"], scan, time.time() + BLOCKED_KEEP_SECONDS, row["id"]))
+        conn.commit()
+    set_upload_ban(row["uploaded_by"], VIRUS_FREEZE_SECONDS, "악성 파일 업로드 (자동 1일 차단)")
+    notify_admin("🦠 악성 파일을 차단했습니다", f"{scan} · 파일을 비활성화하고 올린 사람의 업로드를 1일 막았습니다."
+                 + ("" if moved else " (저장소에서 옮기지 못해 원래 자리에 있습니다)"),
+                 flagged_file_text(row) + "\n증거 파일은 NKOTE 관리자 패널의 '차단된 파일'에서 받을 수 있습니다 (90일 보관).")
+
+
 async def remove_file(row):
     """Delete from storage and the list; False if storage refused (the row is kept so cleanup retries)."""
     if not await storage.delete(row_keys(row)):
@@ -3187,7 +3530,7 @@ def files_disabled_reason(guild):
 @bot.command(name="올리기")
 @commands.cooldown(1, FILE_COOLDOWN_SECONDS, commands.BucketType.user)
 async def upload_command(ctx, *, name: str = ""):
-    reason = files_disabled_reason(ctx.guild)
+    reason = files_disabled_reason(ctx.guild) or upload_blocked_reason(ctx.guild.id, ctx.author.id)
     if reason:
         ctx.command.reset_cooldown(ctx)
         await ctx.reply(reason, mention_author=False)
@@ -3568,7 +3911,7 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
         view.add_item(HelpButton(action, label, emoji, style, row))
 
     if page == "commands":
-        embed = command_list_embed()
+        embed = command_list_embed(guild_id)
         button("home", "◀ 처음으로", style=discord.ButtonStyle.secondary)
         return {"embed": embed, "view": view}
     if page == "home":
@@ -3585,6 +3928,7 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
         return {"embed": embed, "view": view}
 
     emoji, title, keys = HELP_CATEGORIES[page]
+    keys = [k for k in keys if game_enabled(k, guild_id)]  # switched-off games have no button
     if selected:
         _, command, _ = HELP_COMMANDS[selected]
         text = help_text(selected)
@@ -3639,8 +3983,8 @@ async def show_help(interaction, **page):
         else:
             await interaction.response.edit_message(**changes)
 
-    if page.get("page") == "files" and interaction.guild:
-        page["guild_id"] = interaction.guild.id
+    if interaction.guild:
+        page.setdefault("guild_id", interaction.guild.id)
     wants_link = (page.get("page") == "files" and "upload_url" not in page and interaction.guild
                   and storage.configured())
     if wants_link:
@@ -4936,6 +5280,10 @@ def quiz_works(q, guild_id):
 
 
 async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFAULT_COUNT, genre=None):
+    off = game_off_message(q.key, guild)
+    if off:  # a /도움말 message opened before the game was switched off
+        await channel.send(f"-# {user.mention}님의 요청 · {q.title}\n{off}")
+        return
     async with quiz_lock(q, channel.id):
         game = quiz_game(q, channel.id)
         header = f"-# {user.mention}님의 요청 · {q.title}"
@@ -4966,6 +5314,10 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
 
 
 async def quiz_start_command(q, ctx, options):
+    off = game_off_message(q.key, ctx.guild)
+    if off:
+        await ctx.reply(off, mention_author=False)
+        return
     genre = None
     if q is SONG_QUIZ:
         genre, options = quiz.split_song_options(options)
@@ -5167,6 +5519,10 @@ async def anime_settings_link(guild):
 @commands.guild_only()
 async def anime_settings_command(ctx):
     """The link goes by DM: anyone with it can change the server's works for 10 minutes."""
+    off = game_off_message("anime", ctx.guild)
+    if off:
+        await ctx.reply(off, mention_author=False)
+        return
     url, problem = await anime_settings_link(ctx.guild)
     if problem:
         await ctx.reply(problem, mention_author=False)
@@ -5185,6 +5541,10 @@ async def anime_settings_command(ctx):
 async def help_anime_settings(interaction):
     if interaction.guild is None:
         await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    off = game_off_message("anime", interaction.guild)
+    if off:
+        await show_help(interaction, page="game", notice=off)
         return
     await interaction.response.defer()
     url, problem = await anime_settings_link(interaction.guild)
@@ -5242,6 +5602,10 @@ async def anilist_find(title):
 @bot.command(name="애니", aliases=["애니메이션"])
 async def anime_command(ctx, action: str = "", *, rest: str = ""):
     """!애니 리스트 [작품] · !애니 추천 <작품>"""
+    off = game_off_message("anime", ctx.guild)
+    if off:
+        await ctx.reply(off, mention_author=False)
+        return
     rest = rest.strip()
     if action in ("리스트", "목록", "list"):
         embed = anime_list_embed(ctx.guild.id if ctx.guild else None, rest or None)
@@ -5571,6 +5935,10 @@ def song_add(guild_id, song, aliases, user_id):
 @commands.guild_only()
 async def song_add_command(ctx, *, text: str = ""):
     """!노래추가 <검색어> [| 다른 이름, 다른 이름]"""
+    off = game_off_message("song", ctx.guild)
+    if off:
+        await ctx.reply(off, mention_author=False)
+        return
     query, _, extra = text.partition("|")
     query = query.strip()
     aliases = [a.strip() for a in extra.split(",") if a.strip()][:5]
@@ -5638,6 +6006,10 @@ def quiz_buttons(q):
 
 async def show_quiz_page(q, interaction, details=None, extra=()):
     """/도움말 → 게임 → one quiz's page."""
+    off = game_off_message(q.key, interaction.guild)
+    if off:  # a button from before the game was switched off
+        await show_help(interaction, page="game", notice=off)
+        return
     if q is ANIME_QUIZ and interaction.guild and details is None:
         works = anime_works_of(interaction.guild.id)
         details = f"-# 이 서버: 고른 작품 {len(works)}개" if works else "-# 이 서버: 모든 작품"
@@ -5854,6 +6226,12 @@ async def dashboard_snapshot():
                    "hardMax": FILE_MAX_HARD, "totalQuota": FILE_TOTAL_QUOTA},
         "storage": {"configured": storage.configured()},
         "guilds": [], "admins": [], "files": [], "filesTotal": 0,
+        # 관리자 패널의 켜기/끄기와 차단
+        "games": {game: {"title": title, "on": game_enabled(game)} for game, title in GAME_SWITCHES.items()},
+        "uploadBlocked": "upload_block:all" in switch_keys(),
+        "bans": [{"id": str(b["user_id"]), "name": user_name(b["user_id"]), "until": int(b["until"]) if b["until"] else None,
+                  "reason": b["reason"], "at": int(b["created_at"])} for b in all_upload_bans()],
+        "virusCheck": bool(VIRUSTOTAL_KEY), "blockedFiles": [],
     }
     with connect_db() as conn:
         usage = {r[0]: (r[1], r[2]) for r in conn.execute(
@@ -5876,6 +6254,20 @@ async def dashboard_snapshot():
             "members": guild.member_count if guild else None, "used": used, "files": count,
             "quota": json_limit(guild_quota(guild_id)), "max": json_limit(guild_limit(guild_id, "max")),
             "customQuota": f"file_limit:quota:{guild_id}" in custom, "customMax": f"file_limit:max:{guild_id}" in custom,
+            "gamesOff": [game for game in GAME_SWITCHES if f"game_off:{game}:{guild_id}" in switch_keys()],
+            "uploadBlocked": f"upload_block:{guild_id}" in switch_keys(),
+        })
+    with connect_db() as conn:
+        blocked = [dict(r) for r in conn.execute("SELECT * FROM files WHERE status = 'blocked' ORDER BY uploaded_at DESC")]
+    for row in blocked:
+        guild = bot.get_guild(row["guild_id"]) if row["guild_id"] else None
+        snapshot["blockedFiles"].append({
+            "id": row["id"], "guild": guild.name if guild else str(row["guild_id"]), "guildId": str(row["guild_id"]),
+            "name": row["name"], "size": row["size"], "uploader": str(row["uploaded_by"]),
+            "uploaderName": user_name(row["uploaded_by"]), "uploadedAt": int(row["uploaded_at"]),
+            "expiresAt": int(row["expires_at"]), "sha256": row["sha256"] or "", "scan": row["scan"] or "",
+            # evidence download: a storage link made now (on a private bucket it lasts at most 7 days)
+            "url": file_link(row) if storage.configured() else None,
         })
     for row in files:
         guild = bot.get_guild(row["guild_id"]) if row["guild_id"] else None
@@ -5939,6 +6331,45 @@ async def dashboard_job(job):
                         conn.execute("INSERT OR REPLACE INTO anime_works(guild_id, works) VALUES (?, ?)",
                                      (guild_id, json.dumps(chosen, ensure_ascii=False)))
                     message = f"애니캐 맞히기: 작품 {len(chosen)}개"
+        elif kind == "set_game":
+            game, scope = args.get("game"), args.get("scope")
+            guild_id = "all" if scope == "all" else dashboard_guild_id(scope)
+            if game not in GAME_SWITCHES or not guild_id:
+                ok, message = False, "게임이나 서버를 알 수 없습니다."
+            else:
+                on = bool(args.get("on"))
+                set_switch(f"game_off:{game}:{guild_id}", not on)
+                where = "전체" if guild_id == "all" else guild_label(guild_id)
+                message = f"{GAME_SWITCHES[game]} · {where}: {'켜짐' if on else '꺼짐'}"
+        elif kind == "set_upload_block":
+            scope = args.get("scope")
+            guild_id = "all" if scope == "all" else dashboard_guild_id(scope)
+            if not guild_id:
+                ok, message = False, "서버를 알 수 없습니다."
+            else:
+                blocked_now = bool(args.get("blocked"))
+                set_switch(f"upload_block:{guild_id}", blocked_now)
+                where = "전체" if guild_id == "all" else guild_label(guild_id)
+                message = f"파일 업로드 · {where}: {'차단' if blocked_now else '허용'}"
+        elif kind == "ban_user":
+            user_id = dashboard_guild_id(args.get("userId"))  # same rule: digits only
+            hours = args.get("hours")
+            if not user_id or len(str(user_id)) < 15:
+                ok, message = False, "디스코드 ID(숫자 17~20자리)를 확인해 주세요."
+            elif hours is not None and (not isinstance(hours, (int, float)) or not 0 < hours <= 24 * 365):
+                ok, message = False, "차단 시간은 1시간 ~ 1년 사이로 정해 주세요."
+            else:
+                remove_upload_ban(user_id)  # the admin's choice replaces the current ban, shorter or not
+                set_upload_ban(user_id, None if hours is None else hours * 3600, str(args.get("reason") or "")[:200])
+                who = user_name(user_id) or user_id
+                message = f"{who}: 업로드 {'영구 차단' if hours is None else human_duration(hours * 3600) + ' 차단'}"
+        elif kind == "unban_user":
+            user_id = dashboard_guild_id(args.get("userId"))
+            if not user_id:
+                ok, message = False, "디스코드 ID를 확인해 주세요."
+            else:
+                remove_upload_ban(user_id)
+                message = f"{user_name(user_id) or user_id}: 업로드 차단을 풀었습니다."
         elif kind == "set_limits":
             scope = "default" if args.get("scope") == "default" else dashboard_guild_id(args.get("scope"))
             changes = limit_changes(args.get("quota"), args.get("max")) if scope else "서버를 알 수 없습니다."
