@@ -58,8 +58,15 @@
 ## 봇 설정
 1. Discord Developer Portal에서 봇을 만들고 **Message Content Intent**를 켭니다.
 2. OAuth2 URL Generator에서 `bot`, `applications.commands` 스코프와 아래 권한을 선택해 초대합니다. (`applications.commands`는 `/도움말` 같은 슬래시 명령어용이며, 예전 링크로 초대한 서버는 새 링크로 다시 초대하면 됩니다. 다시 초대해도 봇이 나가지 않습니다.)
-   - View Channels, Send Messages, Embed Links, Attach Files, Read Message History (권한 값 `117760`)
+   - View Channels, Send Messages, Send Messages in Threads, Embed Links, Attach Files, Read Message History, Add Reactions, Use External Emojis, Manage Webhooks(`/글자콘`), Use Application Commands (권한 값 `277562641472`)
+   - 권한이 모자라면 봇이 어떤 권한이 없는지 채널(못 쓰면 DM)로 알려 줍니다. `!도움말`은 메시지 보내기만 있어도 글자로 나옵니다.
    - 이미 초대한 봇은 서버 설정 → 역할에서 봇 역할에 **파일 첨부** 권한을 켜면 됩니다.
+
+## 보호 기능
+- **명령어 도배 방지:** 한 사람당 `!` 명령어는 5초에 5번까지입니다. 넘기면 한 번만 알려 주고 나머지는 무시합니다.
+- **내부 주소 차단:** `!주소추가`의 도메인이 사설 IP·localhost 같은 내부 주소를 가리키면 등록하지 않고, 등록한 뒤 바뀌어도 확인하지 않습니다(봇 호스트 내부망을 떠보는 것 방지). 인터넷에서 접속되는 서버는 그대로 됩니다.
+- **NKOTE 관리자 패널 → 🛡️ 차단·게임:** 애니캐·노래 맞히기를 전체/서버별로 켜고 끄기(끄면 시작 명령어와 버튼이 사라지고, 진행 중인 판은 끝날 때까지 둠), 파일 업로드를 전체/서버별로 막기, 사용자별 시간 차단·영구 차단.
+- **바이러스 검사 (`VIRUSTOTAL_API_KEY`):** 올린 파일의 SHA-256을 VirusTotal에서 조회합니다. 파일 내용은 보내지 않아서, VirusTotal이 이미 아는 악성 파일만 잡습니다. 엔진 3개 이상이 악성으로 보면 파일을 비활성화(링크가 열리지 않게 옮기고 90일 동안 증거로 보관)하고, 올린 사람의 업로드를 1일 막고, 봇 관리자에게 디스코드 ID와 함께 DM으로 알립니다. 1~2개면 알리기만 합니다. 무료 키 한도(분당 4번, 하루 500번)에 맞춰 차례대로 검사하고, 업로드 페이지로 올린 50MB 넘는 파일은 검사하지 않습니다.
 
 ## 전적 API 키
 - `HYPIXEL_API_KEY`: developer.hypixel.net에서 발급합니다. 개발용 키는 약 3일마다 만료되므로 계속 쓰려면 Personal 키를 신청하세요.
