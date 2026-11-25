@@ -33,11 +33,15 @@
   .notice label { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: .95rem; cursor: pointer; }
   .notice button { margin-top: 14px; }
   .done { text-align: center; font-size: 1.05rem; }
+  .warn { color: var(--error); font-weight: 700; }
+  p.warn { margin: 0 0 14px; font-size: .9rem; }
+  .notice .warn { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--error); border-radius: 10px; line-height: 1.5; }
 </style>
 </head>
 <body>
 <main>
   <h1>마코 파일 올리기</h1>
+  <p class="warn">⚠️ 악성 프로그램 업로드 시 형사처벌 대상입니다.</p>
   <label class="pick" for="file" id="pick">눌러서 파일 고르기</label>
   <input type="file" id="file">
   <button id="send" disabled>올리기</button>
@@ -53,6 +57,8 @@
       <li>링크가 있으면 누구나 볼 수 있습니다.</li>
       <li>개인정보가 담긴 파일은 올리지 마세요.</li>
     </ul>
+    <p class="warn">⚠️ 악성 프로그램 업로드 시 형사처벌 대상입니다.<br>
+      <span style="font-weight:400">올린 파일은 바이러스 검사 대상이며, 악성 파일은 차단되고 올린 사람의 디스코드 정보가 보관됩니다.</span></p>
     <label><input type="checkbox" id="hide-notice"> 다시 보지 않기</label>
     <button id="notice-ok">확인</button>
   </div>
