@@ -192,6 +192,7 @@ bot = MacoBot(
 # Spam guard for every ! command: a person may use RATE_COUNT commands in RATE_SECONDS (game answers too).
 RATE_COUNT, RATE_SECONDS = 5, 5
 _command_rate = commands.CooldownMapping.from_cooldown(RATE_COUNT, RATE_SECONDS, commands.BucketType.user)
+RATE_MESSAGE = "⏳ 명령어 도배 방지 - 잠시 기다려주세요"
 _rate_warned = {}  # user id -> when they were last told to slow down (told once per burst)
 
 
@@ -225,11 +226,15 @@ async def tell_too_fast(ctx, error):
         for user_id in [u for u, t in _rate_warned.items() if now - t >= RATE_SECONDS]:
             del _rate_warned[user_id]
     _rate_warned[ctx.author.id] = now
+    # Only the person should see it: a ! command can't answer privately, so it goes by DM. With DMs closed
+    # it is posted in the channel and removed again after a few seconds.
     try:
-        await ctx.reply(f"⏳ 명령어를 너무 빠르게 쓰고 있습니다. {math.ceil(error.retry_after)}초 뒤에 다시 써 주세요.",
-                        mention_author=False, delete_after=RATE_SECONDS)
-    except discord.HTTPException:
-        pass
+        await ctx.author.send(RATE_MESSAGE)
+    except (discord.HTTPException, AttributeError):
+        try:
+            await ctx.channel.send(f"{ctx.author.mention} {RATE_MESSAGE}", delete_after=RATE_SECONDS)
+        except discord.HTTPException:
+            pass
 
 # Per-server activity for £servers: kind -> guild id -> {hour number: count}. Memory only, last 24 hours.
 traffic = {"messages": {}, "commands": {}}
@@ -685,6 +690,11 @@ INSIDE_ADDRESS_MESSAGE = ("이 주소는 내부 네트워크 주소(사설 IP, l
                           "인터넷에서 접속할 수 있는 주소(공인 IP나 그 IP를 가리키는 도메인)를 입력해 주세요.")
 
 
+# The background check asks every 10 seconds; one DNS answer is reused for a few minutes.
+INSIDE_CACHE_SECONDS = 300
+_inside_cache = {}  # host -> (when looked up, points inside)
+
+
 class InsideAddress(Exception):
     """The server name resolves to a private/local IP: checking it would probe the bot host's own network."""
 
@@ -698,17 +708,25 @@ async def points_inside(host):
         return not ipaddress.ip_address(host).is_global
     except ValueError:
         pass
+    cached = _inside_cache.get(host.lower())
+    if cached and time.monotonic() - cached[0] < INSIDE_CACHE_SECONDS:
+        return cached[1]
     try:
         infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, None), timeout=5)
     except (OSError, asyncio.TimeoutError, UnicodeError):
         return False
+    inside = False
     for info in infos:
         try:
             if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
-                return True
+                inside = True
+                break
         except ValueError:
             continue
-    return False
+    if len(_inside_cache) >= 500:
+        _inside_cache.clear()
+    _inside_cache[host.lower()] = (time.monotonic(), inside)
+    return inside
 
 
 async def query_server(address: str, quiet=False, strict=False):
