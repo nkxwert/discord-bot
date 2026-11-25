@@ -424,6 +424,8 @@ def init_db():
             conn.execute("ALTER TABLE files ADD COLUMN bar_message_id INTEGER")
         # Virus check (VirusTotal hash lookup): the file's SHA-256 and, for a file it flagged, the result.
         # status 'blocked': the file was flagged and moved out of reach, kept as evidence for the admin.
+        if "link_at" not in columns:  # when the file's short link was last pointed at a fresh storage link
+            conn.execute("ALTER TABLE files ADD COLUMN link_at REAL")
         if "sha256" not in columns:
             conn.execute("ALTER TABLE files ADD COLUMN sha256 TEXT")
             conn.execute("ALTER TABLE files ADD COLUMN scan TEXT")
@@ -1060,7 +1062,8 @@ async def owner_db_files(message, args):
         return
     lines = []
     for row in rows:
-        state = "업로드 중" if row["status"] == "pending" else f"<t:{int(row['expires_at'])}:R> 삭제"
+        state = ("업로드 중" if row["status"] == "pending" else "삭제 안 함" if kept_for_good(row["expires_at"])
+                 else f"<t:{int(row['expires_at'])}:R> 삭제")
         lines.append(f"`#{row['id']}` **{discord.utils.escape_markdown(row['name'] or '(이름 없음)')}** · "
                      f"{guild_label(row['guild_id'])} · {human_size(row['size'])} · {state}")
     text = ""
@@ -1189,7 +1192,7 @@ def parse_duration(text):
 
 async def owner_db_retention(message, args):
     current = retention_text()
-    limit = human_duration(file_retention_max())
+    limit = "삭제 안 함" if is_forever(file_retention_max()) else human_duration(file_retention_max())
     if not args:
         await message.reply(f"자동 삭제 기간: **{current}** (설정할 수 있는 범위: 1시간 ~ {limit})\n"
                             "바꾸려면 `£DB 기간 3일`처럼 입력해 주세요.", mention_author=False)
@@ -1200,14 +1203,15 @@ async def owner_db_retention(message, args):
 def apply_retention(text):
     """(ok, message): set the auto-delete period from text like '3일' (£DB 기간 and the dashboard)."""
     current = retention_text()
-    seconds = parse_duration(text)
+    keep = text.strip().replace(" ", "") in ("삭제안함", "무제한", "영구", "없음", "forever")
+    seconds = FILE_RETENTION_FOREVER if keep else parse_duration(text)
     if seconds is None:
         return False, "기간을 알아보지 못했습니다. 예: `3일`, `12시간`, `1일 6시간`"
     if not FILE_RETENTION_MIN <= seconds <= file_retention_max():
-        reason = " 비공개 저장소의 링크는 최대 7일까지만 쓸 수 있습니다." if not storage.PUBLIC_URL else ""
-        return False, f"1시간 ~ {human_duration(file_retention_max())} 사이로 정해 주세요.{reason}"
+        return False, ("1시간 ~ 7일 사이로 정해 주세요. 비공개 저장소는 단축 링크(NKOTE)가 설정돼 있어야 "
+                       "7일보다 길게 보관할 수 있습니다.")
     set_setting("file_retention_seconds", seconds)
-    return True, (f"자동 삭제 기간을 **{current} → {human_duration(seconds)}**(으)로 바꿨습니다. "
+    return True, (f"자동 삭제 기간을 **{current} → {retention_text()}**(으)로 바꿨습니다. "
                   "새로 올리는 파일부터 적용되며, 이미 올라간 파일은 원래 기간대로 지워집니다.")
 
 
@@ -1614,7 +1618,7 @@ def command_list_embed(guild_id=None):
         inline=False,
     )
     embed.add_field(name="!올리기 [이름]", value="파일을 첨부하면 올리고 미리보기로 보여 줍니다(영상은 바로 재생, 노래는 바 형태·영상 형태 중 고름). 첨부 없이 쓰면 큰 파일용 링크를 DM으로 받습니다. "
-                    f"{retention_text()} 후 자동 삭제됩니다.", inline=False)
+                    f"{retention_phrase()}.", inline=False)
     embed.add_field(name="!파일 [이름]", value="내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다.", inline=False)
     embed.add_field(name="!파일삭제 <이름>", value="내가 올린 파일을 지웁니다.", inline=False)
     embed.add_field(name="!운세", value="오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다.", inline=False)
@@ -2524,9 +2528,31 @@ FILE_MAX_PER_MESSAGE = 5
 FILE_COOLDOWN_SECONDS = 10
 
 
+# "삭제 안 함": kept for 100 years, i.e. until someone deletes it.
+FILE_RETENTION_FOREVER = 100 * 365 * 24 * 60 * 60
+# A short link is made to expire at most this far ahead (NKOTE allows up to 365 days) and is pushed
+# further out again as it is refreshed.
+SHORT_LINK_MAX_SECONDS = 300 * 24 * 60 * 60
+# On a private bucket the storage links behind the short links are presigned for at most 7 days, so short
+# links of files kept longer are pointed at a fresh one this often (public buckets: just to extend them).
+SHORT_LINK_REFRESH_SECONDS = 5 * 24 * 60 * 60
+
+
 def file_retention_max():
-    # On a private bucket links are presigned, and those last at most 7 days.
-    return 30 * 24 * 60 * 60 if storage.PUBLIC_URL else storage.MAX_LINK_SECONDS
+    """Any period, "삭제 안 함" included, when links can outlive 7 days: a public bucket's plain links, or
+    short links the bot keeps refreshing. Only private storage without NKOTE stays at 7 days."""
+    if storage.PUBLIC_URL or shortlinks.configured():
+        return FILE_RETENTION_FOREVER
+    return storage.MAX_LINK_SECONDS
+
+
+def is_forever(seconds):
+    return seconds >= FILE_RETENTION_FOREVER - 86400
+
+
+def kept_for_good(expires_at):
+    """A file set to 삭제 안 함 (its expiry is decades away)."""
+    return expires_at - time.time() > 50 * 365 * 86400
 
 
 def file_retention():
@@ -2547,12 +2573,18 @@ def human_duration(seconds):
 
 
 def retention_text():
-    return human_duration(file_retention())
+    return "삭제 안 함" if is_forever(file_retention()) else human_duration(file_retention())
+
+
+def retention_phrase():
+    """'7일 후 자동 삭제' or, when files are kept, '자동으로 삭제되지 않음'."""
+    return "자동으로 삭제되지 않음" if is_forever(file_retention()) else f"{retention_text()} 후 자동 삭제"
 
 
 def file_notice():
-    return (f"📦 올린 파일은 봇의 파일 저장소에 올라가며 **{retention_text()} 후 자동으로 삭제**됩니다. "
-            "링크가 있으면 누구나 볼 수 있습니다.")
+    kept = ("**자동으로 삭제되지 않습니다** (직접 지울 때까지 보관)" if is_forever(file_retention())
+            else f"**{retention_text()} 후 자동으로 삭제**됩니다")
+    return f"📦 올린 파일은 봇의 파일 저장소에 올라가며 {kept}. 링크가 있으면 누구나 볼 수 있습니다."
 FILE_NOT_CONFIGURED = "파일 저장소가 설정되지 않았습니다. 봇 관리자에게 문의해 주세요."
 
 
@@ -2831,11 +2863,33 @@ async def add_short_links(rows):
     for row in rows:
         if row.get("url") or not shortlinks.configured():
             continue
-        short = await shortlinks.shorten(file_link(row), row["expires_at"])
+        short = await shortlinks.shorten(file_link(row), short_link_expiry(row["expires_at"]))
         if short:
             row["url"] = short
             with connect_db() as conn:
-                conn.execute("UPDATE files SET url = ? WHERE id = ?", (short, row["id"]))
+                conn.execute("UPDATE files SET url = ?, link_at = ? WHERE id = ?", (short, time.time(), row["id"]))
+
+
+def short_link_expiry(expires_at):
+    return min(expires_at, time.time() + SHORT_LINK_MAX_SECONDS)
+
+
+async def refresh_short_links():
+    """Keep the short links of long-kept files working: point them at a fresh storage link (private
+    buckets' links last 7 days) and push their expiry out again. Runs with the 10-minute cleanup."""
+    if not shortlinks.configured():
+        return
+    now = time.time()
+    with connect_db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM files WHERE status = 'ready' AND url != '' AND expires_at > ? "
+            "AND COALESCE(link_at, uploaded_at) < ? ORDER BY COALESCE(link_at, uploaded_at) LIMIT 50",
+            (now + 3600, now - SHORT_LINK_REFRESH_SECONDS))]
+    for row in rows:
+        if await shortlinks.update(row["url"], file_link(row), short_link_expiry(row["expires_at"])):
+            with connect_db() as conn:
+                conn.execute("UPDATE files SET link_at = ? WHERE id = ?", (time.time(), row["id"]))
+                conn.commit()
 
 
 def file_title(row):
@@ -3127,7 +3181,7 @@ async def start_browser_upload(guild_id, channel_id, user_id, name=""):
         raise storage.StorageError("봇 전체 저장 공간이 가득 찼습니다. 오래된 파일이 자동 삭제된 뒤 다시 시도해 주세요.")
     key = storage.new_key(guild_id, "upload")
     row = save_file_row(guild_id, channel_id, user_id, name.strip()[:MAX_NAME_LENGTH], key, "", 0, status="pending")
-    link = await storage.upload_page_link(key, retention_text(), shortlinks.signal_url(key), max_bytes)
+    link = await storage.upload_page_link(key, retention_text(), shortlinks.signal_url(key), max_bytes)  # page shows "삭제 안 함" itself
     # nnaco.kro.kr/xxxx: fits a link button, and has no "#|" for Discord to rewrite. Lives as long as the row.
     return row, await shortlinks.shorten(link, row["expires_at"]) or link
 
@@ -3403,18 +3457,18 @@ async def set_file_expiry(row_id, expires_at):
     if expires_at < now + FILE_EXPIRY_MIN_SECONDS:
         return False, "만료일은 지금부터 5분 뒤 이후로 정해 주세요."
     if expires_at > latest + 60:
-        reason = "비공개 저장소의 링크는 최대 7일까지만 쓸 수 있습니다. " if not storage.PUBLIC_URL else ""
-        return False, f"{reason}지금부터 {human_duration(file_retention_max())} 안으로 정해 주세요. (최대 <t:{int(latest)}:f>)"
+        return False, f"비공개 저장소의 링크는 최대 7일까지만 쓸 수 있습니다. 지금부터 7일 안으로 정해 주세요. (최대 <t:{int(latest)}:f>)"
     expires_at = min(expires_at, latest)
     row["expires_at"] = expires_at
     note = ""
-    if row.get("url") and not await shortlinks.update(row["url"], file_link(row), expires_at):
+    if row.get("url") and not await shortlinks.update(row["url"], file_link(row), short_link_expiry(expires_at)):
         note = "\n-# 단축 링크는 바꾸지 못해서, 이미 올라간 링크는 원래 만료일까지만 열립니다."
     with connect_db() as conn:
-        conn.execute("UPDATE files SET expires_at = ? WHERE id = ?", (expires_at, row_id))
+        conn.execute("UPDATE files SET expires_at = ?, link_at = ? WHERE id = ?", (expires_at, now, row_id))
     if not storage.PUBLIC_URL and not note:
-        note = "\n-# 채팅에 이미 올라간 미리보기는 원래 만료일 뒤에 안 보일 수 있습니다. [원본 열기]·[링크 복사]는 새 만료일까지 열립니다."
-    return True, (f"**{discord.utils.escape_markdown(row['name'])}** 만료일을 <t:{int(expires_at)}:f>(으)로 바꿨습니다." + note)
+        note = "\n-# 채팅에 이미 올라간 미리보기(사진·영상)는 올린 지 7일이 지나면 안 보일 수 있습니다. [원본 열기]·[링크 복사]는 새 만료일까지 열립니다."
+    when = "**삭제 안 함**" if kept_for_good(expires_at) else f"<t:{int(expires_at)}:f>"
+    return True, (f"**{discord.utils.escape_markdown(row['name'])}** 만료일을 {when}(으)로 바꿨습니다." + note)
 
 
 # ---------------------------------------------------------------- 업로드 차단 · 바이러스 검사
@@ -3628,7 +3682,7 @@ def file_list_text(files, everyone):
     lines = [
         f"• **{discord.utils.escape_markdown(f['name'])}** · {human_size(f['size'])}"
         + (f" · <@{f['uploaded_by']}>" if everyone else "")
-        + f" · 만료 <t:{int(f['expires_at'])}:f> (<t:{int(f['expires_at'])}:R>)"
+        + (" · 삭제 안 함" if kept_for_good(f["expires_at"]) else f" · 만료 <t:{int(f['expires_at'])}:f> (<t:{int(f['expires_at'])}:R>)")
         for f in files
     ]
     text = ""
@@ -3699,7 +3753,7 @@ async def files_command(ctx, *, name: str = ""):
         await ctx.reply("올린 파일이 없습니다. 파일을 첨부해서 `!올리기`를 해 보세요.", mention_author=False)
         return
     embed = discord.Embed(description=text, color=discord.Color.green())
-    embed.set_footer(text=f"!파일 <이름>으로 미리보기 · {retention_text()} 후 자동 삭제")
+    embed.set_footer(text=f"!파일 <이름>으로 미리보기 · {retention_phrase()}")
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -3751,6 +3805,10 @@ async def sweep_orphans():
 @tasks.loop(minutes=10)
 async def clean_files():
     """Delete files older than 7 days (and unfinished browser uploads) from storage and the list."""
+    try:
+        await refresh_short_links()
+    except Exception as exc:
+        print(f"단축 링크 새로 고침 오류: {type(exc).__name__}: {exc}")
     if time.time() - _last_orphan_sweep[0] > ORPHAN_SWEEP_SECONDS:
         try:
             await sweep_orphans()
@@ -3802,7 +3860,7 @@ HELP_COMMANDS = {
     "upload": ("올리기", "!올리기", "`!올리기 [이름]` + 파일 첨부 · 첨부 없이 쓰면 웹 업로드 링크\n"
                "**🌐 올리기**를 누르면 업로드 페이지가 바로 열리고, 올리면 **자동으로 채널에 올라갑니다**.\n"
                "사진은 바로 보이고 영상은 채팅창에서 바로 재생되며, 노래는 **바 형태**(빠르게)·**영상 형태** 중 고를 수 있습니다. 작은 파일은 **📎 첨부**로도 올릴 수 있습니다.\n"
-               "올린 파일은 봇의 파일 저장소에 올라가며 **{보관} 후 자동으로 삭제**됩니다."),
+               "올린 파일은 봇의 파일 저장소에 올라가며 {보관}."),
     "files": ("목록", "!파일", "`!파일 [이름]`\n내가 올린 파일 목록을 봅니다. 이름을 붙이면 그 파일을 미리보기로 보냅니다."),
     "filedelete": ("삭제", "!파일삭제", "`!파일삭제 <이름>`\n내가 올린 파일을 지웁니다."),
     "fortune": ("운세", "!운세", "`!운세`\n오늘의 운세를 봅니다. 칠 때마다 무작위로 나옵니다."),
@@ -4089,7 +4147,9 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
 
 
 def help_text(key):
-    return HELP_COMMANDS[key][2].replace("{보관}", retention_text())
+    kept = ("**자동으로 삭제되지 않습니다**" if is_forever(file_retention())
+            else f"**{retention_text()} 후 자동으로 삭제**됩니다")
+    return HELP_COMMANDS[key][2].replace("{보관}", kept)
 
 
 def help_page_of(key):
@@ -6310,7 +6370,7 @@ async def help_slash(interaction: discord.Interaction):
 # no extra library, nothing kept between polls, so it costs next to no memory.
 
 STARTED_AT = time.time()
-DASHBOARD_IDLE_SECONDS = 30  # nobody has the dashboard open
+DASHBOARD_IDLE_SECONDS = 20  # nobody has the dashboard open (the most the page waits for the bot to wake)
 DASHBOARD_AWAKE_SECONDS = 3  # someone does
 DASHBOARD_IDLE_SNAPSHOT_SECONDS = 30 * 60  # so the page opens with fairly recent numbers
 DASHBOARD_MAX_FILES = 300
@@ -6348,7 +6408,8 @@ async def dashboard_snapshot():
             "memory": {"current": current, "peak": peak, "limit": env_int("MEMORY_LIMIT_MB", 256, 1) * 1024 * 1024},
             "connection": connection_health(),
         },
-        "retention": {"seconds": file_retention(), "text": retention_text(), "maxText": human_duration(retention_max),
+        "retention": {"seconds": file_retention(), "text": retention_text(), "forever": is_forever(file_retention()),
+                      "maxText": "삭제 안 함" if is_forever(retention_max) else human_duration(retention_max),
                       "maxSeconds": retention_max},
         "limits": {"quota": json_limit(default_limit("quota")), "max": json_limit(default_limit("max")),
                    "hardMax": FILE_MAX_HARD, "totalQuota": FILE_TOTAL_QUOTA},
@@ -6418,7 +6479,7 @@ async def dashboard_snapshot():
                           for i in sorted(owners) + sorted(file_admin_ids() - owners)]
     if storage.configured():
         host, bucket, mode = storage.describe()
-        ping_ms, error = await storage.ping()
+        ping_ms, error = await storage_ping_cached()
         snapshot["storage"].update({
             "host": host, "bucket": bucket, "mode": mode, "ok": not error, "error": error,
             "pingMs": round(ping_ms) if ping_ms is not None else None, "used": file_usage(), "total": FILE_TOTAL_QUOTA,
@@ -6428,33 +6489,55 @@ async def dashboard_snapshot():
     return snapshot
 
 
+_ping_cache = {"at": 0.0, "value": (None, None)}
+
+
+async def storage_ping_cached():
+    """The storage check takes 0.3-1 s; a snapshot after each dashboard button reuses it for a minute."""
+    if time.monotonic() - _ping_cache["at"] > 60 or _ping_cache["value"][1]:
+        _ping_cache["value"] = await storage.ping()
+        _ping_cache["at"] = time.monotonic()
+    return _ping_cache["value"]
+
+
+_period_uptime = {"at": 0.0, "values": {}}  # server id -> (samples, online) over the whole kept period
+
+
 def uptime_server_list():
-    """Every registered Minecraft server with its last result and uptime, for the admin panel (one query each)."""
+    """Every registered Minecraft server with its last result and uptime, for the admin panel. Each server is
+    read through its (server_id, checked_at) index; the whole-period numbers (up to ~90,000 samples a server)
+    are counted at most every 10 minutes, so a snapshot after each dashboard button stays quick."""
     now = time.time()
-    with connect_db() as conn:
-        servers = [dict(r) for r in conn.execute(
-            "SELECT id, guild_id, name, address, registered_at FROM servers ORDER BY guild_id, id")]
-        last = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
-            "SELECT server_id, online, latency_ms, MAX(checked_at) FROM samples GROUP BY server_id")}
-        day = {r[0]: (r[1], r[2]) for r in conn.execute(
-            "SELECT server_id, COUNT(*), SUM(online) FROM samples WHERE checked_at >= ? GROUP BY server_id",
-            (now - 86400,))}
-        whole = {r[0]: (r[1], r[2]) for r in conn.execute(
-            "SELECT server_id, COUNT(*), SUM(online) FROM samples GROUP BY server_id")}
+    refresh_period = now - _period_uptime["at"] > 600
     out = []
-    for row in servers:
-        guild = bot.get_guild(row["guild_id"])
-        online, latency, checked = last.get(row["id"], (None, None, None))
-        count, up = day.get(row["id"], (0, 0))
-        all_count, all_up = whole.get(row["id"], (0, 0))
-        out.append({
-            "id": row["id"], "guildId": str(row["guild_id"]), "guild": guild.name if guild else f"(나간 서버) {row['guild_id']}",
-            "name": row["name"], "address": row["address"],
-            "online": None if online is None else bool(online), "latencyMs": round(latency) if latency else None,
-            "checkedAt": int(checked) if checked else None,
-            "day": round(up / count * 100, 2) if count else None,
-            "all": round(all_up / all_count * 100, 2) if all_count else None, "samples": all_count,
-        })
+    with connect_db() as conn:
+        servers = [dict(r) for r in conn.execute("SELECT id, guild_id, name, address FROM servers ORDER BY guild_id, id")]
+        for row in servers:
+            sid = row["id"]
+            last = conn.execute("SELECT online, latency_ms, checked_at FROM samples WHERE server_id = ? "
+                                "ORDER BY checked_at DESC LIMIT 1", (sid,)).fetchone()
+            count, up = conn.execute("SELECT COUNT(*), COALESCE(SUM(online), 0) FROM samples "
+                                     "WHERE server_id = ? AND checked_at >= ?", (sid, now - 86400)).fetchone()
+            if refresh_period or sid not in _period_uptime["values"]:
+                _period_uptime["values"][sid] = tuple(conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(online), 0) FROM samples WHERE server_id = ?", (sid,)).fetchone())
+            all_count, all_up = _period_uptime["values"][sid]
+            guild = bot.get_guild(row["guild_id"])
+            out.append({
+                "id": sid, "guildId": str(row["guild_id"]),
+                "guild": guild.name if guild else f"(나간 서버) {row['guild_id']}",
+                "name": row["name"], "address": row["address"],
+                "online": None if last is None else bool(last["online"]),
+                "latencyMs": round(last["latency_ms"]) if last and last["latency_ms"] else None,
+                "checkedAt": int(last["checked_at"]) if last else None,
+                "day": round(up / count * 100, 2) if count else None,
+                "all": round(all_up / all_count * 100, 2) if all_count else None, "samples": all_count,
+            })
+    if refresh_period:
+        _period_uptime["at"] = now
+        known = {r["id"] for r in servers}
+        for sid in [k for k in _period_uptime["values"] if k not in known]:
+            del _period_uptime["values"][sid]
     return out
 
 
