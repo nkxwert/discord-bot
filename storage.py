@@ -756,9 +756,21 @@ def should_convert(filename, size):
     return can_convert() and is_video(filename) and size <= CONVERT_MAX_BYTES
 
 
+def _low_priority():
+    """Run ffmpeg below the bot: on a 0.25-vCPU host a conversion could otherwise take all the CPU, the bot
+    misses Discord's heartbeat and the connection drops (the log then shows "RESUMED session")."""
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+
+
+_LOW = {"preexec_fn": _low_priority} if os.name == "posix" else {}
+
+
 async def _run(*args, timeout):
     process = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **_LOW,
     )
     try:
         out, _ = await asyncio.wait_for(process.communicate(), timeout)
@@ -850,7 +862,7 @@ def ffmpeg_path():
 async def _run_capture(*args, timeout):
     """(return code, stderr text), or (None, "") on timeout."""
     process = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, **_LOW,
     )
     try:
         _, err = await asyncio.wait_for(process.communicate(), timeout)
