@@ -885,7 +885,9 @@ def health_level(service):
 def status_services():
     """What the status page shows for each feature: ok / warn / down / off (switched off or not set up)."""
     return {
-        "uptime": "ok" if monitor_servers.is_running() or not uptime_background_on() else "down",
+        # (the first beat can go out a moment before on_ready starts the check loop)
+        "uptime": ("ok" if monitor_servers.is_running() or not uptime_background_on()
+                   or time.time() - STARTED_AT < 180 else "down"),
         "hypixel": health_level("hypixel") if os.getenv("HYPIXEL_API_KEY", "").strip() else "off",
         "valorant": health_level("valorant") if os.getenv("HENRIK_API_KEY", "").strip() else "off",
         "song": health_level("song") if game_enabled("song") else "off",
@@ -6575,15 +6577,41 @@ async def storage_ping_cached():
     return _ping_cache["value"]
 
 
-_period_uptime = {"at": 0.0, "values": {}}  # server id -> (samples, online) over the whole kept period
+_period_uptime = {"at": 0.0, "values": {}, "task": None}  # server id -> (samples, online) over the kept period
+
+
+def count_period_uptime():
+    """Whole-period samples and online count per server. Up to ~90,000 rows a server, which can take
+    seconds on a slow disk, so it runs in a worker thread (its own SQLite connection) every 10 minutes."""
+    with connect_db() as conn:
+        return {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT server_id, COUNT(*), COALESCE(SUM(online), 0) FROM samples GROUP BY server_id")}
+
+
+def refresh_period_uptime():
+    task = _period_uptime["task"]
+    if time.time() - _period_uptime["at"] < 600 or (task and not task.done()):
+        return
+
+    async def run():
+        try:
+            _period_uptime["values"] = await asyncio.to_thread(count_period_uptime)
+            _period_uptime["at"] = time.time()
+        except sqlite3.Error as exc:
+            print(f"업타임 기간 계산 오류: {type(exc).__name__}: {exc}")
+
+    _period_uptime["task"] = asyncio.get_running_loop().create_task(run())
 
 
 def uptime_server_list():
     """Every registered Minecraft server with its last result and uptime, for the admin panel. Each server is
-    read through its (server_id, checked_at) index; the whole-period numbers (up to ~90,000 samples a server)
-    are counted at most every 10 minutes, so a snapshot after each dashboard button stays quick."""
+    read through its (server_id, checked_at) index; the whole-period numbers come from the background count
+    (shown as soon as it is done), so a snapshot never waits on the big table."""
     now = time.time()
-    refresh_period = now - _period_uptime["at"] > 600
+    try:
+        refresh_period_uptime()
+    except RuntimeError:  # no running loop (tests)
+        pass
     out = []
     with connect_db() as conn:
         servers = [dict(r) for r in conn.execute("SELECT id, guild_id, name, address FROM servers ORDER BY guild_id, id")]
@@ -6593,10 +6621,7 @@ def uptime_server_list():
                                 "ORDER BY checked_at DESC LIMIT 1", (sid,)).fetchone()
             count, up = conn.execute("SELECT COUNT(*), COALESCE(SUM(online), 0) FROM samples "
                                      "WHERE server_id = ? AND checked_at >= ?", (sid, now - 86400)).fetchone()
-            if refresh_period or sid not in _period_uptime["values"]:
-                _period_uptime["values"][sid] = tuple(conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(online), 0) FROM samples WHERE server_id = ?", (sid,)).fetchone())
-            all_count, all_up = _period_uptime["values"][sid]
+            all_count, all_up = _period_uptime["values"].get(sid, (0, 0))
             guild = bot.get_guild(row["guild_id"])
             out.append({
                 "id": sid, "guildId": str(row["guild_id"]),
@@ -6608,11 +6633,6 @@ def uptime_server_list():
                 "day": round(up / count * 100, 2) if count else None,
                 "all": round(all_up / all_count * 100, 2) if all_count else None, "samples": all_count,
             })
-    if refresh_period:
-        _period_uptime["at"] = now
-        known = {r["id"] for r in servers}
-        for sid in [k for k in _period_uptime["values"] if k not in known]:
-            del _period_uptime["values"][sid]
     return out
 
 
