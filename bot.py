@@ -900,6 +900,7 @@ def status_services():
 
 STATUS_HEARTBEAT_SECONDS = 300
 STATUS_PAGE_URL = os.getenv("STATUS_PAGE_URL", "https://nnaco.kro.kr/status").strip()
+SUPPORT_SERVER_URL = os.getenv("SUPPORT_SERVER_URL", "https://discord.gg/JRmaf2CV5W").strip()  # 마코 서포트 센터
 
 
 async def status_heartbeat():
@@ -1716,7 +1717,8 @@ def command_list_embed(guild_id=None):
     embed.add_field(name="​", value="─" * 24, inline=False)
     embed.add_field(
         name="!개발자소통",
-        value="개발자에게 메시지를 보냅니다.\n(`/도움말`의 ✉️ DM to Dev. 버튼으로도 보낼 수 있습니다)",
+        value="개발자에게 메시지를 보냅니다.\n(`/도움말`의 ✉️ DM to Dev. 버튼으로도 보낼 수 있습니다)\n"
+              f"사용법 질문·오류 신고·건의는 [마코 서포트 센터]({SUPPORT_SERVER_URL})에서도 받습니다.",
         inline=False,
     )
     return embed
@@ -4177,6 +4179,7 @@ def help_message(page="home", selected=None, notice=None, details=None, extra_it
         button("dm", "DM to Dev.", "✉️", row=1)
         button("commands", "명령어 보기", "📋", row=1)
         view.add_item(discord.ui.Button(label="서비스 상태", emoji="🟢", url=STATUS_PAGE_URL, row=1))
+        view.add_item(discord.ui.Button(label="서포트 센터", emoji="💬", url=SUPPORT_SERVER_URL, row=1))
         return {"embed": embed, "view": view}
 
     emoji, title, keys = HELP_CATEGORIES[page]
