@@ -45,6 +45,16 @@ async def report(snapshot=None, results=None):
             raise RuntimeError(f"NKOTE 대시보드 보고 HTTP {response.status}")
 
 
+async def status(body):
+    """The 5-minute heartbeat for the public status page: bot alive, server count, each feature's state."""
+    async with net.session().post(f"{shortlinks.BASE_URL}/api/bot/status", headers=shortlinks._headers(),
+                                  json=body, timeout=TIMEOUT) as response:
+        if response.status == 403:
+            raise NotBound()
+        if response.status not in (200, 404):  # 404: an NKOTE without the status page yet
+            raise RuntimeError(f"NKOTE 상태 페이지 HTTP {response.status}")
+
+
 async def anime_link(guild_id, guild_name, works, selected):
     """The 10-minute 작품 고르기 page for a server: its URL. Raises NotBound, or RuntimeError with a message."""
     body = {"guild_id": str(guild_id), "guild_name": guild_name, "works": works, "selected": selected}
