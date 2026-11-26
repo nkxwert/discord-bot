@@ -241,21 +241,47 @@ async def tell_too_fast(ctx, error):
         except discord.HTTPException:
             pass
 
-# Per-server activity for £servers: kind -> guild id -> {hour number: count}. Memory only, last 24 hours.
-traffic = {"messages": {}, "commands": {}}
+# Per-server activity for £servers: counts only (no content, no authors), by hour. Kept in the DB so a
+# restart doesn't lose them; anything older than TRAFFIC_KEEP_HOURS (a week) is deleted.
+# Messages are counted in memory (kind -> guild id -> {hour: count}) and written once a minute, so a busy
+# server doesn't mean a DB write per message.
+TRAFFIC_KEEP_HOURS = 7 * 24
+traffic = {"messages": {}, "commands": {}}  # counts not yet written to the DB
 
 
 def record_traffic(kind, guild_id):
     hour = int(time.time() // 3600)
     buckets = traffic[kind].setdefault(guild_id, {})
     buckets[hour] = buckets.get(hour, 0) + 1
-    for old in [h for h in buckets if h <= hour - 24]:
-        del buckets[old]
 
 
-def traffic_24h(kind, guild_id):
-    hour = int(time.time() // 3600)
-    return sum(count for h, count in traffic[kind].get(guild_id, {}).items() if h > hour - 24)
+def flush_traffic():
+    """Write the pending counts and delete hours older than a week."""
+    rows = [(kind, gid, hour, n) for kind, guilds in traffic.items() for gid, hours in guilds.items()
+            for hour, n in hours.items()]
+    for guilds in traffic.values():
+        guilds.clear()
+    oldest = int(time.time() // 3600) - TRAFFIC_KEEP_HOURS
+    with connect_db() as conn:
+        if rows:
+            conn.executemany("INSERT INTO traffic(kind, guild_id, hour, count) VALUES (?, ?, ?, ?) "
+                             "ON CONFLICT(kind, guild_id, hour) DO UPDATE SET count = count + excluded.count", rows)
+        conn.execute("DELETE FROM traffic WHERE hour <= ?", (oldest,))
+        conn.commit()
+
+
+def traffic_totals(hours):
+    """{(kind, guild id): count} over the last `hours` hours, every server at once (DB + not yet written)."""
+    since = int(time.time() // 3600) - hours
+    with connect_db() as conn:
+        totals = {(r[0], r[1]): r[2] for r in conn.execute(
+            "SELECT kind, guild_id, SUM(count) FROM traffic WHERE hour > ? GROUP BY kind, guild_id", (since,))}
+    for kind, guilds in traffic.items():
+        for gid, by_hour in guilds.items():
+            add = sum(n for h, n in by_hour.items() if h > since)
+            if add:
+                totals[(kind, gid)] = totals.get((kind, gid), 0) + add
+    return totals
 
 
 # ---------------------------------------------------------------- admin error DMs
@@ -540,6 +566,16 @@ def init_db():
         conn.execute("CREATE TABLE IF NOT EXISTS anime_works (guild_id INTEGER PRIMARY KEY, works TEXT NOT NULL)")
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        # £servers activity: message / command counts per server per hour, a week at most (no content, no authors)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS traffic (
+                kind TEXT NOT NULL,
+                guild_id INTEGER NOT NULL,
+                hour INTEGER NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (kind, guild_id, hour)
+            )
+        """)
         conn.commit()
 
 
@@ -1030,6 +1066,8 @@ async def on_ready():
         dday_alerts.start()
     if not tidy_memory.is_running():
         tidy_memory.start()
+    if not save_traffic.is_running():
+        save_traffic.start()
     print(f"로그인 완료: {bot.user} (ID: {bot.user.id})")
 
 
@@ -1099,8 +1137,12 @@ async def welcome_owner(guild):
 
 @bot.listen("on_guild_remove")
 async def forget_guild_traffic(guild):
+    """The bot left: its activity counts for that server go too."""
     for counts in traffic.values():
         counts.pop(guild.id, None)
+    with connect_db() as conn:
+        conn.execute("DELETE FROM traffic WHERE guild_id = ?", (guild.id,))
+        conn.commit()
 
 
 @bot.event
@@ -1695,10 +1737,12 @@ async def db_status_embed():
 async def owner_servers(message, args):
     # £servers: lists the servers the bot is in.
     guilds = sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)
+    day, week = traffic_totals(24), traffic_totals(TRAFFIC_KEEP_HOURS)
     lines = [
         f"**{discord.utils.escape_markdown(g.name)}** · 멤버 "
         f"{f'{g.member_count:,}' if g.member_count is not None else '?'}명 · "
-        f"메시지 {traffic_24h('messages', g.id):,} · 명령어 {traffic_24h('commands', g.id):,}"
+        f"메시지 {day.get(('messages', g.id), 0):,} (7일 {week.get(('messages', g.id), 0):,}) · "
+        f"명령어 {day.get(('commands', g.id), 0):,} (7일 {week.get(('commands', g.id), 0):,})"
         for g in guilds
     ]
     description = ""
@@ -1712,7 +1756,7 @@ async def owner_servers(message, args):
         description=description or "참여 중인 서버가 없습니다.",
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="메시지·명령어 수: 최근 24시간, 봇이 켜진 뒤부터 집계")
+    embed.set_footer(text="메시지·명령어 수: 최근 24시간 (괄호는 7일) · 1주일이 지난 기록은 자동 삭제")
     await message.reply(embed=embed, mention_author=False)
 
 
@@ -5073,6 +5117,14 @@ async def dday_alerts():
         notify_admin("D-Day 알림 오류", f"{type(exc).__name__}: {exc}", "", traceback.format_exc())
 
 
+@tasks.loop(minutes=1)
+async def save_traffic():
+    try:
+        flush_traffic()
+    except sqlite3.Error as exc:
+        print(f"활동 집계 저장 오류: {type(exc).__name__}: {exc}")
+
+
 @tasks.loop(minutes=10)
 async def tidy_memory():
     """Drop in-memory entries nothing will use again. Each is small, but these only ever grew: an unused
@@ -7360,3 +7412,4 @@ if __name__ == "__main__":
         raise SystemExit("DISCORD_TOKEN이 .env 파일에 설정되어 있지 않습니다.")
     init_db()
     bot.run(TOKEN)
+    flush_traffic()  # the last minute's counts, when the bot is stopped normally
