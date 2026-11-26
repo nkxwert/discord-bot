@@ -5832,16 +5832,28 @@ async def rank_name(user_id):
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
+_global_xp = {"at": 0.0, "rows": []}  # the all-servers ranking, reused for a minute
+
+
+async def global_xp_totals():
+    """Every server's records added up: grows with every player everywhere, so it is counted in a worker
+    thread (the bot keeps answering meanwhile) and reused for a minute."""
+    if time.time() - _global_xp["at"] > 60:
+        _global_xp["rows"] = await asyncio.to_thread(xp_totals, None)
+        _global_xp["at"] = time.time()
+    return _global_xp["rows"]
+
+
 async def ranking_embed(guild, viewer_id, everywhere=False):
-    totals = xp_totals(None if everywhere else guild.id)
+    totals = await global_xp_totals() if everywhere else xp_totals(guild.id)
     title = "🏆 전체 서버 랭킹" if everywhere else "🏆 서버 랭킹"
     if not totals:
         return discord.Embed(title=title, description="아직 게임 기록이 없습니다. `/도움말` → 게임에서 시작해 보세요!",
                              color=discord.Color.gold())
-    lines = []
-    for i, (uid, xp) in enumerate(totals[:RANK_SIZE], 1):
-        who = await rank_name(uid) if everywhere else f"<@{uid}>"
-        lines.append(f"{MEDALS.get(i, f'`{i}.`')} {who} · **{xp_text(xp)}**")
+    top = totals[:RANK_SIZE]
+    # Names of people from other servers are looked up all at once, not one after another.
+    names = await asyncio.gather(*(rank_name(uid) for uid, _ in top)) if everywhere else [f"<@{uid}>" for uid, _ in top]
+    lines = [f"{MEDALS.get(i, f'`{i}.`')} {who} · **{xp_text(xp)}**" for i, ((uid, xp), who) in enumerate(zip(top, names), 1)]
     embed = discord.Embed(title=title, description="\n".join(lines), color=discord.Color.gold())
     mine = next(((i, xp) for i, (uid, xp) in enumerate(totals, 1) if uid == viewer_id), None)
     embed.set_footer(text=(f"내 순위: {mine[0]}위 · {xp_text(mine[1])}" if mine else "내 순위: 아직 기록 없음")
