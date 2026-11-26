@@ -5923,7 +5923,8 @@ async def help_run_ranking_me(interaction):
 
 
 def ranking_buttons():
-    return [HelpButton("run_ranking", "서버 랭킹", "🏆", discord.ButtonStyle.secondary, row=2),
+    # (not "run_ranking": that is the 랭킹 tab button on the same page, and Discord refuses repeated ids)
+    return [HelpButton("ranking_server", "서버 랭킹", "🏆", discord.ButtonStyle.secondary, row=2),
             HelpButton("ranking_all", "전체 서버", "🌐", discord.ButtonStyle.secondary, row=2),
             HelpButton("ranking_me", "내 기록", "📊", discord.ButtonStyle.secondary, row=2)]
 
@@ -6559,6 +6560,7 @@ HELP_ACTIONS = {
     "nara_hard": help_run_nara(nara.HARD),
     "nara_rank": help_run_nara_rank,
     "run_ranking": help_run_ranking,
+    "ranking_server": help_run_ranking,
     "ranking_all": lambda interaction: help_run_ranking(interaction, everywhere=True),
     "ranking_me": help_run_ranking_me,
     "nara_info": lambda interaction: interaction.response.send_modal(NaraInfoModal()),
