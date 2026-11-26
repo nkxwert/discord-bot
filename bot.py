@@ -1753,6 +1753,9 @@ def command_list_embed(guild_id=None):
         embed.add_field(name="!노래시작 [쉬움|보통|어려움] [장르] [문제 수] · !노래 <제목> · !노래추가 <곡>",
                         value="노래 맞히기: 노래 일부분(공식 미리듣기)을 듣고 가장 먼저 제목을 맞힌 사람의 개수가 기록됩니다. "
                               "`!노래추가`로 이 서버에 곡을 넣을 수 있습니다.", inline=False)
+    embed.add_field(name="!랭킹 · !랭킹 전체 · !랭킹 자세히 [이름]",
+                    value="모든 게임을 합친 XP 순위: 지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP. "
+                          "`자세히`는 게임별 기록.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -3962,7 +3965,7 @@ HELP_CATEGORIES = {
     "stats": ("📊", "전적", ["hypixel", "valorant"]),
     "files": ("📁", "파일", ["upload", "files", "filedelete"]),
     "etc": ("🎲", "기타", ["fortune", "ilchim", "dday"]),
-    "game": ("🎮", "게임", ["nara", "flag", "capital", "map", "anime", "song"]),
+    "game": ("🎮", "게임", ["nara", "flag", "capital", "map", "anime", "song", "ranking"]),
 }
 # key -> (button label, command name, description shown on the help page and at the top of its input form)
 HELP_COMMANDS = {
@@ -3986,6 +3989,10 @@ HELP_COMMANDS = {
              "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
+    "ranking": ("랭킹", "!랭킹",
+                "`!랭킹` · `!랭킹 전체` · `!랭킹 자세히 [이름 또는 @멘션]`\n"
+                "모든 게임을 합친 **XP 순위**예요. 🌍 나라(한 판)·🏛️ 수도·🗺️ 지도는 1 XP, "
+                "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. `!랭킹 자세히`로 게임별 기록을 봅니다."),
     "nara": ("나라 맞히기", "!나라시작",
              "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다.\n\n"
              "**명령어**\n"
@@ -4082,7 +4089,7 @@ HELP_BANNER_URL = os.getenv(
 HELP_EMOJI_FILES = {"hypixel": "hypixel.png", "valorant": "valorant.png"}
 HELP_EMOJI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "emojis")
 help_emojis = {}
-HELP_BUTTON_EMOJIS = {"fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "map": "🗺️", "anime": "🎌", "song": "🎵", "upload": "📤", "files": "📄",
+HELP_BUTTON_EMOJIS = {"ranking": "🏆", "fortune": "🔮", "ilchim": "💢", "dday": "📅", "nara": "🌍", "flag": "🚩", "capital": "🏛️", "map": "🗺️", "anime": "🎌", "song": "🎵", "upload": "📤", "files": "📄",
                       "filedelete": "🗑️"}  # plain emoji for command buttons without an uploaded icon
 
 
@@ -5303,7 +5310,7 @@ async def nara_ranking_send(target):
         await target.reply("아직 이 서버에서 나라를 맞힌 사람이 없습니다. `!나라시작`으로 시작해 보세요!", mention_author=False)
         return
     embed = discord.Embed(title="🏆 나라 맞히기 순위", description=text, color=discord.Color.green())
-    embed.set_footer(text="어려움 승리가 많은 순, 같으면 보통·쉬움 승리 순")
+    embed.set_footer(text="어려움 승리가 많은 순, 같으면 보통·쉬움 승리 순 · 모든 게임을 합친 순위: !랭킹")
     await target.reply(embed=embed, mention_author=False)
 
 
@@ -5747,8 +5754,178 @@ async def quiz_ranking_command(q, ctx):
                         mention_author=False)
         return
     embed = discord.Embed(title=f"🏆 {q.title} 순위", description=text, color=discord.Color.green())
-    embed.set_footer(text="맞힌 개수 · 어려움이 많은 순, 같으면 보통·쉬움 순")
+    embed.set_footer(text="맞힌 개수 · 어려움이 많은 순, 같으면 보통·쉬움 순 · 모든 게임을 합친 순위: !랭킹")
     await ctx.reply(embed=embed, mention_author=False)
+
+
+# ---------------------------------------------------------------- 랭킹 (XP)
+# One ranking over all games, worked out from the per-game records that are already kept (so past
+# answers count and nothing new is stored). 지리 (나라 한 판, 수도·지도 한 문제) 1 XP; 국기·애니캐·노래 0.5 XP.
+XP_SOURCES = [  # (key, title, emoji, table, count SQL, XP each, unit)
+    ("nara", "나라 맞히기", "🌍", "nara_scores", "easy_wins + wins + hard_wins", 1.0, "승"),
+    ("capital", "수도 맞히기", "🏛️", "capital_scores", "easy + normal + hard", 1.0, "개"),
+    ("map", "지도 맞히기", "🗺️", "map_scores", "easy + normal + hard", 1.0, "개"),
+    ("flag", "국기 맞히기", "🚩", "flag_scores", "easy + normal + hard", 0.5, "개"),
+    ("anime", "애니캐 맞히기", "🎌", "anime_scores", "easy + normal + hard", 0.5, "개"),
+    ("song", "노래 맞히기", "🎵", "song_scores", "easy + normal + hard", 0.5, "개"),
+]
+RANK_SIZE = 10
+
+
+def xp_text(xp):
+    return f"{xp:g} XP"
+
+
+def xp_totals(guild_id=None):
+    """[(user id, xp)] best first, for one server or (guild_id None) every server added up."""
+    where = "WHERE guild_id = ?" if guild_id else ""
+    parts = [f"SELECT user_id, ({count}) * {weight} AS xp FROM {table} {where}"
+             for _, _, _, table, count, weight, _ in XP_SOURCES]
+    params = [guild_id] * len(parts) if guild_id else []
+    with connect_db() as conn:
+        rows = conn.execute(f"SELECT user_id, SUM(xp) AS xp FROM ({' UNION ALL '.join(parts)}) "
+                            "GROUP BY user_id HAVING SUM(xp) > 0 ORDER BY SUM(xp) DESC, user_id", params).fetchall()
+    return [(r["user_id"], r["xp"]) for r in rows]
+
+
+def xp_breakdown(guild_id, user_id):
+    """[(key, title, emoji, count, levels text, xp, unit)] of one person's records in one server."""
+    out = []
+    with connect_db() as conn:
+        for key, title, emoji, table, count, weight, unit in XP_SOURCES:
+            if key == "nara":
+                row = conn.execute("SELECT easy_wins, wins, hard_wins FROM nara_scores WHERE guild_id = ? AND user_id = ?",
+                                   (guild_id, user_id)).fetchone()
+                levels = (row["easy_wins"], row["wins"], row["hard_wins"]) if row else (0, 0, 0)
+            else:
+                row = conn.execute(f"SELECT easy, normal, hard FROM {table} WHERE guild_id = ? AND user_id = ?",
+                                   (guild_id, user_id)).fetchone()
+                levels = (row["easy"], row["normal"], row["hard"]) if row else (0, 0, 0)
+            total = sum(levels)
+            names = ("쉬움", "보통") if key == "anime" else ("쉬움", "보통", "어려움")  # 애니캐 has no 어려움
+            detail = " · ".join(f"{n} {v}" for n, v in zip(names, levels) if v)
+            out.append((key, title, emoji, total, detail, total * weight, unit))
+    return out
+
+
+_rank_names = {}  # user id -> (name, when looked up), for the all-servers ranking
+
+
+async def rank_name(user_id):
+    """A display name for someone who may not be in this server (mentions of strangers show as @알 수 없음)."""
+    cached = _rank_names.get(user_id)
+    if cached and time.time() - cached[1] < 3600:
+        return cached[0]
+    user = bot.get_user(user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.HTTPException:
+            user = None
+    name = discord.utils.escape_markdown(user.display_name if user else "알 수 없는 사용자")
+    if len(_rank_names) >= 500:
+        _rank_names.clear()
+    _rank_names[user_id] = (name, time.time())
+    return name
+
+
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+async def ranking_embed(guild, viewer_id, everywhere=False):
+    totals = xp_totals(None if everywhere else guild.id)
+    title = "🏆 전체 서버 랭킹" if everywhere else "🏆 서버 랭킹"
+    if not totals:
+        return discord.Embed(title=title, description="아직 게임 기록이 없습니다. `/도움말` → 게임에서 시작해 보세요!",
+                             color=discord.Color.gold())
+    lines = []
+    for i, (uid, xp) in enumerate(totals[:RANK_SIZE], 1):
+        who = await rank_name(uid) if everywhere else f"<@{uid}>"
+        lines.append(f"{MEDALS.get(i, f'`{i}.`')} {who} · **{xp_text(xp)}**")
+    embed = discord.Embed(title=title, description="\n".join(lines), color=discord.Color.gold())
+    mine = next(((i, xp) for i, (uid, xp) in enumerate(totals, 1) if uid == viewer_id), None)
+    embed.set_footer(text=(f"내 순위: {mine[0]}위 · {xp_text(mine[1])}" if mine else "내 순위: 아직 기록 없음")
+                     + " · 지리 1 XP · 국기·애니캐·노래 0.5 XP"
+                     + ("" if everywhere else " · 모든 서버: !랭킹 전체"))
+    return embed
+
+
+def ranking_detail_embed(guild, member):
+    rows = xp_breakdown(guild.id, member.id)
+    total = sum(r[5] for r in rows)
+    totals = xp_totals(guild.id)
+    place = next((i for i, (uid, _) in enumerate(totals, 1) if uid == member.id), None)
+    name = discord.utils.escape_markdown(member.display_name)
+    embed = discord.Embed(title=f"📊 {name}님의 기록",
+                          description=f"**{xp_text(total)}**" + (f" · 서버 {place}위" if place else " · 아직 순위 없음"),
+                          color=discord.Color.gold())
+    for key, title, emoji, count, detail, xp, unit in rows:
+        embed.add_field(name=f"{emoji} {title}",
+                        value=f"**{count}{unit}**" + (f" ({detail})" if detail else "") + f"\n→ {xp_text(xp)}", inline=True)
+    embed.set_footer(text="지리(나라 한 판·수도·지도) 1 XP · 국기·애니캐·노래 0.5 XP · 출제 판은 제외")
+    return embed
+
+
+async def find_member(ctx, text):
+    """@멘션, ID or (display/user) name in this server, or None."""
+    text = text.strip()
+    if not text:
+        return ctx.author
+    try:
+        return await commands.MemberConverter().convert(ctx, text)
+    except commands.BadArgument:
+        pass
+    try:
+        found = await ctx.guild.query_members(query=text, limit=1)
+    except (discord.HTTPException, discord.ClientException, asyncio.TimeoutError):
+        found = []
+    return found[0] if found else None
+
+
+@bot.command(name="랭킹", aliases=["xp", "경험치"])
+@commands.guild_only()
+async def ranking_command(ctx, action: str = "", *, rest: str = ""):
+    """!랭킹 · !랭킹 전체 · !랭킹 자세히 [이름|@멘션]"""
+    if action in ("전체", "모든서버", "all"):
+        await ctx.reply(embed=await ranking_embed(ctx.guild, ctx.author.id, everywhere=True), mention_author=False)
+        return
+    if action in ("자세히", "상세", "기록", "detail"):
+        member = await find_member(ctx, rest)
+        if member is None:
+            await ctx.reply(f"이 서버에서 `{discord.utils.escape_markdown(rest[:40])}`님을 찾지 못했습니다. "
+                            "`!랭킹 자세히 @멘션`처럼 써 주세요.", mention_author=False)
+            return
+        await ctx.reply(embed=ranking_detail_embed(ctx.guild, member), mention_author=False)
+        return
+    if action:
+        await ctx.reply("`!랭킹`, `!랭킹 전체`, `!랭킹 자세히 [이름]`처럼 써 주세요.", mention_author=False)
+        return
+    await ctx.reply(embed=await ranking_embed(ctx.guild, ctx.author.id), mention_author=False)
+
+
+async def help_run_ranking(interaction, everywhere=False):
+    if interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    embed = await ranking_embed(interaction.guild, interaction.user.id, everywhere)
+    await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(),
+                    details=f"**{embed.title}**\n{embed.description}\n-# {embed.footer.text}")
+
+
+async def help_run_ranking_me(interaction):
+    if interaction.guild is None:
+        await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
+        return
+    embed = ranking_detail_embed(interaction.guild, interaction.user)
+    lines = [embed.description] + [f"{f.name} · {f.value.replace(chr(10), ' ')}" for f in embed.fields]
+    await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(),
+                    details=f"**{embed.title}**\n" + "\n".join(lines))
+
+
+def ranking_buttons():
+    return [HelpButton("run_ranking", "서버 랭킹", "🏆", discord.ButtonStyle.secondary, row=2),
+            HelpButton("ranking_all", "전체 서버", "🌐", discord.ButtonStyle.secondary, row=2),
+            HelpButton("ranking_me", "내 기록", "📊", discord.ButtonStyle.secondary, row=2)]
 
 
 def quiz_register(q, start_aliases, answer_aliases, skip_aliases, stop_aliases, rank_aliases):
@@ -6381,6 +6558,9 @@ HELP_ACTIONS = {
     "nara_normal": help_run_nara(nara.NORMAL),
     "nara_hard": help_run_nara(nara.HARD),
     "nara_rank": help_run_nara_rank,
+    "run_ranking": help_run_ranking,
+    "ranking_all": lambda interaction: help_run_ranking(interaction, everywhere=True),
+    "ranking_me": help_run_ranking_me,
     "nara_info": lambda interaction: interaction.response.send_modal(NaraInfoModal()),
     **help_quiz_actions(FLAG_QUIZ),
     **help_quiz_actions(CAPITAL_QUIZ),
