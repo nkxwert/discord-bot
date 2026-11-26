@@ -884,17 +884,37 @@ _health_hour = {"resumes": 0, "lag": 0.0}
 # Per-feature health for the public status page (nnaco.kro.kr/status): each outside call a feature makes
 # is marked ok or failed; the last 30 minutes decide 정상 / 일부 오류 / 장애.
 HEALTH_WINDOW_SECONDS = 30 * 60
-_health = {}  # service -> deque of (when, ok)
+_health = {}  # service -> deque of (when, ok, failure reason)
 
 
-def mark_health(service, ok):
-    _health.setdefault(service, deque(maxlen=60)).append((time.time(), bool(ok)))
+def mark_health(service, ok, reason=None):
+    """reason: a short cause for a failure (error kind, status code), shown only in the admin panel.
+    Never anything about servers or people, never addresses or keys."""
+    entry = (time.time(), bool(ok), None if ok else health_reason_text(reason))
+    _health.setdefault(service, deque(maxlen=60)).append(entry)
+
+
+def health_reason_text(reason):
+    if isinstance(reason, BaseException):
+        reason = f"{type(reason).__name__}: {reason}" if str(reason) else type(reason).__name__
+    text = re.sub(r"https?://\S+", "(주소)", str(reason or "알 수 없는 오류"))
+    text = re.sub(r"\b\d{1,3}(\.\d{1,3}){3}\b", "(IP)", text)  # never an IP address
+    text = re.sub(r"[A-Za-z0-9_\-]{32,}", "(…)", text)  # nor anything that could be a key or token
+    return text[:120]
+
+
+def health_last_reason(service):
+    now = time.time()
+    for at, ok, reason in reversed(_health.get(service, ())):
+        if now - at < HEALTH_WINDOW_SECONDS and not ok:
+            return reason
+    return None
 
 
 def health_level(service):
     """ok / warn / down from the recent marks (no recent use counts as ok)."""
     now = time.time()
-    marks = [ok for at, ok in _health.get(service, ()) if now - at < HEALTH_WINDOW_SECONDS]
+    marks = [ok for at, ok, _ in _health.get(service, ()) if now - at < HEALTH_WINDOW_SECONDS]
     fails = marks.count(False)
     if not fails:
         return "ok"
@@ -916,7 +936,20 @@ def status_services():
         "files": (("off" if "upload_block:all" in switch_keys() else health_level("files"))
                   if storage.configured() else "off"),
         "links": health_level("links") if shortlinks.configured() else "off",
+        "ranking": health_level("ranking"),
     }
+
+
+def status_reasons(services):
+    """The last failure cause of each feature that isn't fine right now (for the admin panel only)."""
+    reasons = {}
+    for name, level in services.items():
+        if level in ("warn", "down"):
+            reasons[name] = ("자동 확인 반복이 멈춤" if name == "uptime" else health_last_reason(name)) or "원인 기록 없음"
+    return reasons
+
+
+_resume_count = [0]  # resumes since start, so NKOTE can tell a dropped connection from a restart
 
 
 STATUS_HEARTBEAT_SECONDS = 300
@@ -930,15 +963,17 @@ async def status_heartbeat():
     while not bot.is_closed():
         try:
             latency = bot.latency * 1000
+            services = status_services()
             await dashboard.status({
                 "guilds": len(bot.guilds), "latencyMs": round(latency) if latency == latency else None,
-                "services": status_services(),
+                "services": services, "reasons": status_reasons(services),
+                "startedAt": int(STARTED_AT * 1000), "resumes": _resume_count[0],
             })
             mark_health("links", True)
         except dashboard.NotBound:
             pass
         except Exception as exc:
-            mark_health("links", False)
+            mark_health("links", False, exc)
             print(f"상태 페이지 신호 실패: {type(exc).__name__}: {exc}")
         await asyncio.sleep(STATUS_HEARTBEAT_SECONDS)
 
@@ -954,6 +989,7 @@ logging.getLogger("discord.gateway").addFilter(_ResumeLogFilter())
 @bot.listen("on_resumed")
 async def count_resume():
     _resumes.append(time.time())
+    _resume_count[0] += 1
     _health_hour["resumes"] += 1
 
 
@@ -2195,7 +2231,8 @@ async def lookup(ctx, awaitable):
         mark_health("hypixel", True)
         return result
     except stats.StatsError as exc:
-        mark_health("hypixel", not isinstance(exc, stats.ServiceError))  # a missing player is the API working
+        # a missing player is the API working
+        mark_health("hypixel", not isinstance(exc, stats.ServiceError), getattr(exc, "detail", exc))
         notify_service_error(exc, describe_ctx(ctx))
         return None, str(exc)
 
@@ -2251,7 +2288,8 @@ async def valorant_lookup(name, tag, region, suggest=True, progress=None, where=
     `where` describes the request for admin error DMs."""
     try:
         profile = await stats.valorant_profile(name, tag, region, progress.step if progress else None)
-        mark_health("valorant", not profile.get("matches_error"))
+        mark_health("valorant", not profile.get("matches_error"),
+                    getattr(profile.get("matches_error"), "detail", "최근 경기 불러오기 실패"))
         if profile.get("matches_error"):
             note_match_failure(profile["matches_error"], where)
         return profile, None, []
@@ -2271,7 +2309,7 @@ async def valorant_lookup(name, tag, region, suggest=True, progress=None, where=
             error += " 이름과 태그를 다시 확인해 주세요. (대문자 I와 소문자 l, 숫자 0과 영문 O를 헷갈리기 쉽습니다)"
         return None, error, suggestions
     except stats.StatsError as exc:
-        mark_health("valorant", not isinstance(exc, stats.ServiceError))
+        mark_health("valorant", not isinstance(exc, stats.ServiceError), getattr(exc, "detail", exc))
         notify_service_error(exc, where)
         return None, str(exc), []
 
@@ -3265,7 +3303,7 @@ async def upload_attachments(ctx, attachments, name=""):
                 mark_health("files", True)
             except storage.StorageError as exc:
                 if exc.__cause__:  # the storage itself failed (not a size limit or a block)
-                    mark_health("files", False)
+                    mark_health("files", False, f"파일 저장소 오류 · {type(exc.__cause__).__name__}")
                     notify_admin("파일 저장소 오류", f"{type(exc.__cause__).__name__}: {exc.__cause__}", describe_ctx(ctx))
                 errors.append(f"`{attachment.filename}`: {exc}")
             except discord.HTTPException:
@@ -5316,8 +5354,8 @@ def nara_ranking_text(guild_id, limit=10):
             "AND easy_wins + wins + hard_wins > 0 ORDER BY hard_wins DESC, wins DESC, easy_wins DESC LIMIT ?",
             (guild_id, limit),
         ).fetchall()
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · 쉬움 {r['easy_wins']}승 · "
+    place = rank_prefix(guild_id)
+    return "\n".join(f"{place(i)}<@{r['user_id']}> · 쉬움 {r['easy_wins']}승 · "
                      f"보통 {r['wins']}승 · 어려움 {r['hard_wins']}승"
                      for i, r in enumerate(rows, 1))
 
@@ -5549,22 +5587,22 @@ async def anime_picture(cid):
             data = await download(url)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
             data = None
-    mark_health("anime", bool(data))
+    mark_health("anime", bool(data), "AniList 캐릭터 그림을 받지 못함")
     if not data or len(data) > ANIME_FILE_MAX:
         return None
     ext = url.rsplit(".", 1)[-1].lower() if "." in url.rsplit("/", 1)[-1] else "png"
     return discord.File(io.BytesIO(data), f"캐릭터.{ext if ext in ('png', 'jpg', 'jpeg', 'gif', 'webp') else 'png'}")
 
 
-def quiz_session_text(scores):
-    """This quiz's scorers, best first: '🥇 @a 3개 · 🥈 @b 1개'"""
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+def quiz_session_text(scores, guild_id=None):
+    """This quiz's scorers, best first: '🥇 @a 3개 · 🥈 @b 1개' (no medals while 순위 보이기 is off)."""
+    place = rank_prefix(guild_id, plain=True)
     ranked = sorted(scores.items(), key=lambda kv: -kv[1])
-    return " · ".join(f"{medals.get(i, f'{i}.')} <@{uid}> {n}개" for i, (uid, n) in enumerate(ranked, 1))
+    return " · ".join(f"{place(i)}<@{uid}> {n}개" for i, (uid, n) in enumerate(ranked, 1))
 
 
 def quiz_result_line(game):
-    result = quiz_session_text(json.loads(game["scores"]))
+    result = quiz_session_text(json.loads(game["scores"]), game["guild_id"])
     return f"이번에 맞힌 개수: {result}" if result else "이번에는 맞힌 사람이 없습니다."
 
 
@@ -5759,9 +5797,9 @@ def quiz_ranking_text(q, guild_id, limit=10):
             "ORDER BY hard DESC, normal DESC, easy DESC LIMIT ?",
             (guild_id, limit),
         ).fetchall()
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    place = rank_prefix(guild_id)
     hard = (lambda r: "") if q is ANIME_QUIZ else (lambda r: f" · 어려움 {r['hard']}개")  # 애니캐 has no 어려움
-    return "\n".join(f"{medals.get(i, f'`{i}.`')} <@{r['user_id']}> · 쉬움 {r['easy']}개 · 보통 {r['normal']}개{hard(r)}"
+    return "\n".join(f"{place(i)}<@{r['user_id']}> · 쉬움 {r['easy']}개 · 보통 {r['normal']}개{hard(r)}"
                       for i, r in enumerate(rows, 1))
 
 
@@ -5880,6 +5918,14 @@ async def rank_name(user_id):
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
+def rank_prefix(guild_id, plain=False):
+    """place -> '🥇 ' / '`4.` ' (or '4. ' when plain), or '' for every place while 순위 보이기 is off here.
+    Used by !순위 and by each game's own ranking, so the admin switch hides places everywhere."""
+    if not rank_setting("show", guild_id):
+        return lambda place: ""
+    return lambda place: MEDALS.get(place, f"{place}." if plain else f"`{place}.`") + " "
+
+
 _global_xp = {"at": 0.0, "rows": [], "guilds": None}  # the all-servers ranking, reused for a minute
 
 
@@ -5900,7 +5946,12 @@ def rank_line(place, who, xp, show):
 
 async def ranking_embed(guild, viewer_id, everywhere=False, page=0):
     """One page (RANK_PAGE_SIZE people) of the XP list, best first. Returns (embed, page, pages)."""
-    totals = await global_xp_totals() if everywhere else xp_totals(guild.id)
+    try:
+        totals = await global_xp_totals() if everywhere else xp_totals(guild.id)
+    except sqlite3.Error as exc:
+        mark_health("ranking", False, f"순위 계산 오류 · {type(exc).__name__}")
+        raise
+    mark_health("ranking", True)
     show = rank_setting("show", guild.id)
     title = "🏆 전체 서버 순위" if everywhere else "🏆 서버 순위"
     if not totals:
@@ -6369,7 +6420,8 @@ async def song_preview_url(guild_id, sid):
 async def song_preview(guild_id, sid):
     """(bytes, extension) of the song's preview, or None."""
     result = await _song_preview(guild_id, sid)
-    mark_health("song", result is not None)
+    mark_health("song", result is not None,
+                "Deezer·Apple 미리듣기를 받지 못함" + (" (Deezer 1시간 건너뜀 중)" if time.time() < _deezer_down_until[0] else ""))
     return result
 
 
