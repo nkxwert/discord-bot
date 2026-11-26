@@ -575,7 +575,7 @@ def switch_keys():
     if "keys" not in _switch_cache:
         with connect_db() as conn:
             _switch_cache["keys"] = {r["key"] for r in conn.execute(
-                "SELECT key FROM settings WHERE key LIKE 'game_off:%' OR key LIKE 'upload_block:%' "
+                "SELECT key FROM settings WHERE key LIKE 'game_off:%' OR key LIKE 'upload_block:%' OR key LIKE 'upload_allow:%' "
                 "OR key LIKE 'uptime_off:%'")}
     return _switch_cache["keys"]
 
@@ -1753,8 +1753,8 @@ def command_list_embed(guild_id=None):
         embed.add_field(name="!노래시작 [쉬움|보통|어려움] [장르] [문제 수] · !노래 <제목> · !노래추가 <곡>",
                         value="노래 맞히기: 노래 일부분(공식 미리듣기)을 듣고 가장 먼저 제목을 맞힌 사람의 개수가 기록됩니다. "
                               "`!노래추가`로 이 서버에 곡을 넣을 수 있습니다.", inline=False)
-    embed.add_field(name="!랭킹 · !랭킹 전체 · !랭킹 자세히 [이름]",
-                    value="모든 게임을 합친 XP 순위: 지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP. "
+    embed.add_field(name="!순위 · !순위 자세히 [이름]" + (" · !순위 전체" if rank_setting("global", guild_id) else ""),
+                    value="모든 게임을 합친 XP 순서: 지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP. "
                           "`자세히`는 게임별 기록.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
@@ -3632,13 +3632,31 @@ def all_upload_bans():
         return [dict(r) for r in conn.execute("SELECT * FROM upload_bans ORDER BY created_at DESC")]
 
 
-def upload_blocked_reason(guild_id, user_id):
-    """Why this person can't upload here right now (admin panel: everyone, this server or this person)."""
+def upload_server_setting(guild_id):
+    """This server's own 파일 업로드 setting: True (켜짐), False (꺼짐) or None (follows the default)."""
     keys = switch_keys()
-    if "upload_block:all" in keys:
-        return "🚫 지금은 파일 올리기가 잠시 막혀 있습니다. (봇 관리자 설정)"
     if guild_id and f"upload_block:{guild_id}" in keys:
-        return "🚫 이 서버에서는 파일 올리기가 막혀 있습니다. (봇 관리자 설정)"
+        return False
+    if guild_id and f"upload_allow:{guild_id}" in keys:
+        return True
+    return None
+
+
+def upload_default_on():
+    return "upload_block:all" not in switch_keys()
+
+
+def upload_enabled(guild_id):
+    own = upload_server_setting(guild_id)
+    return upload_default_on() if own is None else own
+
+
+def upload_blocked_reason(guild_id, user_id):
+    """Why this person can't upload here right now (admin panel: the default, this server or this person)."""
+    if not upload_enabled(guild_id):
+        if upload_server_setting(guild_id) is False:
+            return "🚫 이 서버에서는 파일 올리기가 막혀 있습니다. (봇 관리자 설정)"
+        return "🚫 지금은 파일 올리기가 잠시 막혀 있습니다. (봇 관리자 설정)"
     ban = upload_ban(user_id) if user_id else None
     if ban:
         when = "영구 차단" if ban["until"] is None else f"{human_duration(ban['until'] - time.time())} 남음"
@@ -3989,10 +4007,10 @@ HELP_COMMANDS = {
              "**➕ 만들기**로 날짜·문구·자동 알림을 정하고, 만든 뒤 **🎉 축하 문구**(당일 문구)도 정할 수 있습니다. "
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
-    "ranking": ("랭킹", "!랭킹",
-                "`!랭킹` · `!랭킹 전체` · `!랭킹 자세히 [이름 또는 @멘션]`\n"
-                "모든 게임을 합친 **XP 순위**예요. 🌍 나라(한 판)·🏛️ 수도·🗺️ 지도는 1 XP, "
-                "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. `!랭킹 자세히`로 게임별 기록을 봅니다."),
+    "ranking": ("순위", "!순위",
+                "`!순위` · `!순위 자세히 [이름 또는 @멘션]` · `!순위 전체`(켜진 서버만)\n"
+                "모든 게임을 합친 **XP 순서**예요. 🌍 나라(한 판)·🏛️ 수도·🗺️ 지도는 1 XP, "
+                "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. `!순위 자세히`로 게임별 기록을 봅니다."),
     "nara": ("나라 맞히기", "!나라시작",
              "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다.\n\n"
              "**명령어**\n"
@@ -5310,7 +5328,7 @@ async def nara_ranking_send(target):
         await target.reply("아직 이 서버에서 나라를 맞힌 사람이 없습니다. `!나라시작`으로 시작해 보세요!", mention_author=False)
         return
     embed = discord.Embed(title="🏆 나라 맞히기 순위", description=text, color=discord.Color.green())
-    embed.set_footer(text="어려움 승리가 많은 순, 같으면 보통·쉬움 승리 순 · 모든 게임을 합친 순위: !랭킹")
+    embed.set_footer(text="어려움 승리가 많은 순, 같으면 보통·쉬움 승리 순 · 모든 게임을 합친 순위: !순위")
     await target.reply(embed=embed, mention_author=False)
 
 
@@ -5754,7 +5772,7 @@ async def quiz_ranking_command(q, ctx):
                         mention_author=False)
         return
     embed = discord.Embed(title=f"🏆 {q.title} 순위", description=text, color=discord.Color.green())
-    embed.set_footer(text="맞힌 개수 · 어려움이 많은 순, 같으면 보통·쉬움 순 · 모든 게임을 합친 순위: !랭킹")
+    embed.set_footer(text="맞힌 개수 · 어려움이 많은 순, 같으면 보통·쉬움 순 · 모든 게임을 합친 순위: !순위")
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -5769,19 +5787,49 @@ XP_SOURCES = [  # (key, title, emoji, table, count SQL, XP each, unit)
     ("anime", "애니캐 맞히기", "🎌", "anime_scores", "easy + normal + hard", 0.5, "개"),
     ("song", "노래 맞히기", "🎵", "song_scores", "easy + normal + hard", 0.5, "개"),
 ]
-RANK_SIZE = 10
+RANK_PAGE_SIZE = 15
+# Admin panel switches (settings rows "rank:show:default", "rank:show:<server id>", "rank:global:..."):
+# show  = 순위 보이기 (medals, 1. 2. 3., "n위"); global = 전체 랭킹 (!순위 전체, and the server's records count in it).
+# A server without its own value follows the default; the defaults start off.
+RANK_SETTINGS = {"show": "순위 보이기", "global": "전체 랭킹"}
+
+
+def rank_values():
+    if "rank" not in _switch_cache:
+        with connect_db() as conn:
+            _switch_cache["rank"] = {r["key"]: r["value"] == "1" for r in conn.execute(
+                "SELECT key, value FROM settings WHERE key LIKE 'rank:%'")}
+    return _switch_cache["rank"]
+
+
+def rank_setting(name, guild_id=None):
+    values = rank_values()
+    if guild_id and f"rank:{name}:{guild_id}" in values:
+        return values[f"rank:{name}:{guild_id}"]
+    return values.get(f"rank:{name}:default", False)
+
+
+def global_rank_guilds():
+    """Servers whose records make up the 전체 랭킹: those where it is switched on."""
+    return [g.id for g in bot.guilds if rank_setting("global", g.id)]
 
 
 def xp_text(xp):
     return f"{xp:g} XP"
 
 
-def xp_totals(guild_id=None):
-    """[(user id, xp)] best first, for one server or (guild_id None) every server added up."""
-    where = "WHERE guild_id = ?" if guild_id else ""
+def xp_totals(guild_id=None, guild_ids=None):
+    """[(user id, xp)] best first, for one server, or those servers (guild_ids) added up."""
+    if guild_id:
+        where, ids = "WHERE guild_id = ?", [guild_id]
+    else:
+        ids = list(guild_ids or [])
+        if not ids:
+            return []
+        where = f"WHERE guild_id IN ({','.join('?' * len(ids))})"
     parts = [f"SELECT user_id, ({count}) * {weight} AS xp FROM {table} {where}"
              for _, _, _, table, count, weight, _ in XP_SOURCES]
-    params = [guild_id] * len(parts) if guild_id else []
+    params = ids * len(parts)
     with connect_db() as conn:
         rows = conn.execute(f"SELECT user_id, SUM(xp) AS xp FROM ({' UNION ALL '.join(parts)}) "
                             "GROUP BY user_id HAVING SUM(xp) > 0 ORDER BY SUM(xp) DESC, user_id", params).fetchall()
@@ -5832,44 +5880,96 @@ async def rank_name(user_id):
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
-_global_xp = {"at": 0.0, "rows": []}  # the all-servers ranking, reused for a minute
+_global_xp = {"at": 0.0, "rows": [], "guilds": None}  # the all-servers ranking, reused for a minute
 
 
 async def global_xp_totals():
-    """Every server's records added up: grows with every player everywhere, so it is counted in a worker
-    thread (the bot keeps answering meanwhile) and reused for a minute."""
-    if time.time() - _global_xp["at"] > 60:
-        _global_xp["rows"] = await asyncio.to_thread(xp_totals, None)
-        _global_xp["at"] = time.time()
+    """The servers that take part, added up: grows with every player everywhere, so it is counted in a
+    worker thread (the bot keeps answering meanwhile) and reused for a minute."""
+    guilds = global_rank_guilds()
+    if time.time() - _global_xp["at"] > 60 or _global_xp["guilds"] != guilds:
+        _global_xp["rows"] = await asyncio.to_thread(xp_totals, None, guilds)
+        _global_xp.update(at=time.time(), guilds=guilds)
     return _global_xp["rows"]
 
 
-async def ranking_embed(guild, viewer_id, everywhere=False):
+def rank_line(place, who, xp, show):
+    prefix = f"{MEDALS.get(place, f'`{place}.`')} " if show else ""
+    return f"{prefix}{who} · **{xp_text(xp)}**"
+
+
+async def ranking_embed(guild, viewer_id, everywhere=False, page=0):
+    """One page (RANK_PAGE_SIZE people) of the XP list, best first. Returns (embed, page, pages)."""
     totals = await global_xp_totals() if everywhere else xp_totals(guild.id)
-    title = "🏆 전체 서버 랭킹" if everywhere else "🏆 서버 랭킹"
+    show = rank_setting("show", guild.id)
+    title = "🏆 전체 서버 순위" if everywhere else "🏆 서버 순위"
     if not totals:
         return discord.Embed(title=title, description="아직 게임 기록이 없습니다. `/도움말` → 게임에서 시작해 보세요!",
-                             color=discord.Color.gold())
-    top = totals[:RANK_SIZE]
+                             color=discord.Color.gold()), 0, 1
+    pages = (len(totals) + RANK_PAGE_SIZE - 1) // RANK_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    chunk = totals[page * RANK_PAGE_SIZE:(page + 1) * RANK_PAGE_SIZE]
     # Names of people from other servers are looked up all at once, not one after another.
-    names = await asyncio.gather(*(rank_name(uid) for uid, _ in top)) if everywhere else [f"<@{uid}>" for uid, _ in top]
-    lines = [f"{MEDALS.get(i, f'`{i}.`')} {who} · **{xp_text(xp)}**" for i, ((uid, xp), who) in enumerate(zip(top, names), 1)]
+    names = await asyncio.gather(*(rank_name(uid) for uid, _ in chunk)) if everywhere else [f"<@{uid}>" for uid, _ in chunk]
+    first = page * RANK_PAGE_SIZE + 1
+    lines = [rank_line(first + i, who, xp, show) for i, ((uid, xp), who) in enumerate(zip(chunk, names))]
     embed = discord.Embed(title=title, description="\n".join(lines), color=discord.Color.gold())
     mine = next(((i, xp) for i, (uid, xp) in enumerate(totals, 1) if uid == viewer_id), None)
-    embed.set_footer(text=(f"내 순위: {mine[0]}위 · {xp_text(mine[1])}" if mine else "내 순위: 아직 기록 없음")
-                     + " · 지리 1 XP · 국기·애니캐·노래 0.5 XP"
-                     + ("" if everywhere else " · 모든 서버: !랭킹 전체"))
-    return embed
+    me = ("아직 기록 없음" if not mine else f"{mine[0]}위 · {xp_text(mine[1])}" if show else xp_text(mine[1]))
+    extra = " · 모든 서버: !순위 전체" if rank_setting("global", guild.id) and not everywhere else ""
+    embed.set_footer(text=f"{'내 순위' if show else '내 XP'}: {me} · {page + 1}/{pages}쪽 · "
+                          f"지리 1 XP · 국기·애니캐·노래 0.5 XP{extra}")
+    return embed, page, pages
+
+
+class RankPageButton(discord.ui.DynamicItem[discord.ui.Button],
+                     template=r"maco:rank:(?P<scope>[sg]):(?P<page>\d+):(?P<way>[pn])"):
+    """◀ / ▶ under a ranking (the ! command's message or the /도움말 page). Anyone may turn the pages."""
+
+    def __init__(self, scope, page, way, disabled=False):
+        super().__init__(discord.ui.Button(
+            emoji="◀" if way == "p" else "▶", label="이전" if way == "p" else "다음", disabled=disabled, row=3,
+            style=discord.ButtonStyle.secondary, custom_id=f"maco:rank:{scope}:{page}:{way}"))
+        self.scope, self.page = scope, page
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["scope"], int(match["page"]), match["way"])
+
+    async def callback(self, interaction):
+        if interaction.guild is None:
+            return
+        if interaction.message is not None and interaction.message.flags.ephemeral:  # the /도움말 page
+            await help_run_ranking(interaction, everywhere=self.scope == "g", page=self.page)
+            return
+        embed, page, pages = await ranking_embed(interaction.guild, interaction.user.id, self.scope == "g", self.page)
+        await interaction.response.edit_message(embed=embed, view=rank_page_view(self.scope, page, pages))
+
+
+def rank_page_items(scope, page, pages):
+    if pages <= 1:
+        return []
+    return [RankPageButton(scope, max(page - 1, 0), "p", disabled=page == 0),
+            RankPageButton(scope, min(page + 1, pages - 1), "n", disabled=page >= pages - 1)]
+
+
+def rank_page_view(scope, page, pages):
+    view = discord.ui.View(timeout=None)
+    for item in rank_page_items(scope, page, pages):
+        view.add_item(item)
+    return view
 
 
 def ranking_detail_embed(guild, member):
     rows = xp_breakdown(guild.id, member.id)
     total = sum(r[5] for r in rows)
-    totals = xp_totals(guild.id)
-    place = next((i for i, (uid, _) in enumerate(totals, 1) if uid == member.id), None)
+    place = None
+    if rank_setting("show", guild.id):
+        totals = xp_totals(guild.id)
+        place = next((i for i, (uid, _) in enumerate(totals, 1) if uid == member.id), None)
     name = discord.utils.escape_markdown(member.display_name)
     embed = discord.Embed(title=f"📊 {name}님의 기록",
-                          description=f"**{xp_text(total)}**" + (f" · 서버 {place}위" if place else " · 아직 순위 없음"),
+                          description=f"**{xp_text(total)}**" + (f" · 서버 {place}위" if place else ""),
                           color=discord.Color.gold())
     for key, title, emoji, count, detail, xp, unit in rows:
         embed.add_field(name=f"{emoji} {title}",
@@ -5894,34 +5994,47 @@ async def find_member(ctx, text):
     return found[0] if found else None
 
 
-@bot.command(name="랭킹", aliases=["xp", "경험치"])
+GLOBAL_RANK_OFF = "이 서버에서는 전체 랭킹을 쓸 수 없습니다. (관리자 설정)"
+
+
+@bot.command(name="순위", aliases=["랭킹", "xp", "경험치"])
 @commands.guild_only()
 async def ranking_command(ctx, action: str = "", *, rest: str = ""):
-    """!랭킹 · !랭킹 전체 · !랭킹 자세히 [이름|@멘션]"""
+    """!순위 · !순위 전체 · !순위 자세히 [이름|@멘션]"""
     if action in ("전체", "모든서버", "all"):
-        await ctx.reply(embed=await ranking_embed(ctx.guild, ctx.author.id, everywhere=True), mention_author=False)
+        if not rank_setting("global", ctx.guild.id):
+            await ctx.reply(GLOBAL_RANK_OFF, mention_author=False)
+            return
+        embed, page, pages = await ranking_embed(ctx.guild, ctx.author.id, everywhere=True)
+        await ctx.reply(embed=embed, view=rank_page_view("g", page, pages), mention_author=False)
         return
     if action in ("자세히", "상세", "기록", "detail"):
         member = await find_member(ctx, rest)
         if member is None:
             await ctx.reply(f"이 서버에서 `{discord.utils.escape_markdown(rest[:40])}`님을 찾지 못했습니다. "
-                            "`!랭킹 자세히 @멘션`처럼 써 주세요.", mention_author=False)
+                            "`!순위 자세히 @멘션`처럼 써 주세요.", mention_author=False)
             return
         await ctx.reply(embed=ranking_detail_embed(ctx.guild, member), mention_author=False)
         return
     if action:
-        await ctx.reply("`!랭킹`, `!랭킹 전체`, `!랭킹 자세히 [이름]`처럼 써 주세요.", mention_author=False)
+        await ctx.reply("`!순위`, `!순위 전체`, `!순위 자세히 [이름]`처럼 써 주세요.", mention_author=False)
         return
-    await ctx.reply(embed=await ranking_embed(ctx.guild, ctx.author.id), mention_author=False)
+    embed, page, pages = await ranking_embed(ctx.guild, ctx.author.id)
+    await ctx.reply(embed=embed, view=rank_page_view("s", page, pages), mention_author=False)
 
 
-async def help_run_ranking(interaction, everywhere=False):
+async def help_run_ranking(interaction, everywhere=False, page=0):
     if interaction.guild is None:
         await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
         return
-    embed = await ranking_embed(interaction.guild, interaction.user.id, everywhere)
-    await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(),
-                    details=f"**{embed.title}**\n{embed.description}\n-# {embed.footer.text}")
+    if everywhere and not rank_setting("global", interaction.guild.id):
+        await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(interaction.guild.id),
+                        notice=GLOBAL_RANK_OFF)
+        return
+    embed, page, pages = await ranking_embed(interaction.guild, interaction.user.id, everywhere, page)
+    await show_help(interaction, page="game", selected="ranking",
+                    extra_items=ranking_buttons(interaction.guild.id) + rank_page_items("g" if everywhere else "s", page, pages),
+                    details=f"**{embed.title}**\n{embed.description}\n-# {embed.footer.text if embed.footer else ''}")
 
 
 async def help_run_ranking_me(interaction):
@@ -5930,15 +6043,17 @@ async def help_run_ranking_me(interaction):
         return
     embed = ranking_detail_embed(interaction.guild, interaction.user)
     lines = [embed.description] + [f"{f.name} · {f.value.replace(chr(10), ' ')}" for f in embed.fields]
-    await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(),
+    await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(interaction.guild.id),
                     details=f"**{embed.title}**\n" + "\n".join(lines))
 
 
-def ranking_buttons():
-    # (not "run_ranking": that is the 랭킹 tab button on the same page, and Discord refuses repeated ids)
-    return [HelpButton("ranking_server", "서버 랭킹", "🏆", discord.ButtonStyle.secondary, row=2),
-            HelpButton("ranking_all", "전체 서버", "🌐", discord.ButtonStyle.secondary, row=2),
-            HelpButton("ranking_me", "내 기록", "📊", discord.ButtonStyle.secondary, row=2)]
+def ranking_buttons(guild_id=None):
+    # (not "run_ranking": that is the 순위 tab button on the same page, and Discord refuses repeated ids)
+    items = [HelpButton("ranking_server", "서버 순위", "🏆", discord.ButtonStyle.secondary, row=2)]
+    if rank_setting("global", guild_id):
+        items.append(HelpButton("ranking_all", "전체 서버", "🌐", discord.ButtonStyle.secondary, row=2))
+    items.append(HelpButton("ranking_me", "내 기록", "📊", discord.ButtonStyle.secondary, row=2))
+    return items
 
 
 def quiz_register(q, start_aliases, answer_aliases, skip_aliases, stop_aliases, rank_aliases):
@@ -6737,10 +6852,11 @@ async def dashboard_snapshot():
         "guilds": [], "admins": [], "files": [], "filesTotal": 0,
         # 관리자 패널의 켜기/끄기와 차단
         "games": {game: {"title": title, "on": game_enabled(game)} for game, title in GAME_SWITCHES.items()},
-        "uploadBlocked": "upload_block:all" in switch_keys(),
+        "uploadBlocked": "upload_block:all" in switch_keys(),  # i.e. the default is 꺼짐
         "bans": [{"id": str(b["user_id"]), "name": user_name(b["user_id"]), "until": int(b["until"]) if b["until"] else None,
                   "reason": b["reason"], "at": int(b["created_at"])} for b in all_upload_bans()],
         "virusCheck": bool(VIRUSTOTAL_KEY), "blockedFiles": [],
+        "ranking": {name: rank_setting(name) for name in RANK_SETTINGS},
         "uptime": {"interval": uptime_interval(), "days": history_days(), "background": uptime_background_on(),
                    "running": monitor_servers.is_running(), "servers": uptime_server_list()},
     }
@@ -6766,8 +6882,11 @@ async def dashboard_snapshot():
             "quota": json_limit(guild_quota(guild_id)), "max": json_limit(guild_limit(guild_id, "max")),
             "customQuota": f"file_limit:quota:{guild_id}" in custom, "customMax": f"file_limit:max:{guild_id}" in custom,
             "gamesOff": [game for game in GAME_SWITCHES if f"game_off:{game}:{guild_id}" in switch_keys()],
-            "uploadBlocked": f"upload_block:{guild_id}" in switch_keys(),
+            "uploadBlocked": not upload_enabled(guild_id),
+            "upload": upload_server_setting(guild_id),  # True / False / None (follows the default)
             "uptimeOff": not uptime_enabled(guild_id),
+            # 순위 보이기 / 전체 랭킹 for this server: True, False, or None (follows the default)
+            "ranking": {name: rank_values().get(f"rank:{name}:{guild_id}") for name in RANK_SETTINGS},
         })
     with connect_db() as conn:
         blocked = [dict(r) for r in conn.execute("SELECT * FROM files WHERE status = 'blocked' ORDER BY uploaded_at DESC")]
@@ -6948,6 +7067,20 @@ async def dashboard_job(job):
                 ok, message = False, "바꿀 것이 없습니다."
             else:
                 message = "업타임: " + " · ".join(changes)
+        elif kind == "set_ranking":
+            name, scope, value = args.get("name"), args.get("scope"), args.get("value")
+            guild_id = "default" if scope == "default" else dashboard_guild_id(scope)
+            if name not in RANK_SETTINGS or not guild_id or (value is None and guild_id == "default") \
+                    or value not in (True, False, None):
+                ok, message = False, "설정을 알 수 없습니다."
+            else:
+                key = f"rank:{name}:{guild_id}"
+                if value is None:
+                    delete_setting(key)
+                else:
+                    set_setting(key, "1" if value else "0")
+                where = "기본값" if guild_id == "default" else guild_label(guild_id)
+                message = f"{RANK_SETTINGS[name]} · {where}: " + ("기본값 따름" if value is None else "켜짐" if value else "꺼짐")
         elif kind == "set_uptime_guild":
             guild_id = dashboard_guild_id(args.get("scope"))
             if not guild_id:
@@ -6965,6 +7098,19 @@ async def dashboard_job(job):
             else:
                 remove_server(server_id)
                 message = f"{row['name']} ({row['address']})와 업타임 기록을 삭제했습니다."
+        elif kind == "set_upload":
+            scope, value = args.get("scope"), args.get("value")
+            guild_id = "all" if scope == "all" else dashboard_guild_id(scope)
+            if not guild_id or value not in (True, False, None) or (guild_id == "all" and value is None):
+                ok, message = False, "설정을 알 수 없습니다."
+            elif guild_id == "all":
+                set_switch("upload_block:all", not value)
+                message = f"파일 업로드 · 기본값: {'켜짐' if value else '꺼짐'}"
+            else:
+                set_switch(f"upload_block:{guild_id}", value is False)
+                set_switch(f"upload_allow:{guild_id}", value is True)
+                message = (f"파일 업로드 · {guild_label(guild_id)}: "
+                           + ("기본값 따름" if value is None else "켜짐" if value else "꺼짐"))
         elif kind == "set_upload_block":
             scope = args.get("scope")
             guild_id = "all" if scope == "all" else dashboard_guild_id(scope)
@@ -7089,7 +7235,7 @@ async def setup_hook():
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton,
-                          DdayPick, DdayAfter, DdayCelebrateButton, SongDisplayButton, NaraSetButton)
+                          DdayPick, DdayAfter, DdayCelebrateButton, SongDisplayButton, NaraSetButton, RankPageButton)
     await load_help_emojis()
     if dashboard.configured():
         task = asyncio.get_running_loop().create_task(dashboard_loop())
