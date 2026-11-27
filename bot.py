@@ -1854,9 +1854,9 @@ def command_list_embed(guild_id=None):
         embed.add_field(name="!노래시작 [쉬움|보통|어려움] [장르] [문제 수] · !노래 <제목> · !노래추가 <곡>",
                         value="노래 맞히기: 노래 일부분(공식 미리듣기)을 듣고 가장 먼저 제목을 맞힌 사람의 개수가 기록됩니다. "
                               "`!노래추가`로 이 서버에 곡을 넣을 수 있습니다.", inline=False)
-    embed.add_field(name="!순위 · !순위 자세히 [이름]" + (" · !순위 전체" if rank_setting("global", guild_id) else ""),
-                    value="모든 게임을 합친 XP 순서: 지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP. "
-                          "`자세히`는 게임별 기록.", inline=False)
+    embed.add_field(name="!xp [이름] · !순위" + (" · !순위 전체" if rank_setting("global", guild_id) else ""),
+                    value="`!xp`는 내 XP와 게임별 기록(`!xp @사람`은 그 사람), `!순위`는 모든 게임을 합친 XP 순서. "
+                          "지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP.", inline=False)
     if rank_setting("bet", guild_id):
         embed.add_field(name="!○○시작 ... 배팅 · !배팅 <XP>",
                         value="게임 시작 명령어 끝에 `배팅`을 붙이면 배팅 판(예: `!국기시작 보통 배팅`, `!나라시작 배팅`). "
@@ -4116,9 +4116,10 @@ HELP_COMMANDS = {
              "내가 만든 D-Day는 **✏️ 편집**·**🗑️ 삭제**할 수 있습니다.\n"
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
     "ranking": ("순위", "!순위",
-                "`!순위` · `!순위 자세히 [이름 또는 @멘션]` · `!순위 전체`(켜진 서버만)\n"
+                "`!xp [이름 또는 @멘션]` 내(또는 그 사람) XP · `!순위` · `!순위 전체`(켜진 서버만)\n"
                 "모든 게임을 합친 **XP 순서**예요. 🌍 나라(한 판)·🏛️ 수도·🗺️ 지도는 1 XP, "
-                "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. `!순위 자세히`로 게임별 기록을 봅니다.\n"
+                "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. 아래 **🏆 전체**는 서버 순서, **👤 개인**은 고른 사람의 게임별 기록 "
+                "(📢 채팅방에 보내기로 공유).\n"
                 "🎲 각 게임의 **배팅 판** 버튼(또는 `!국기시작 보통 배팅`)으로 XP를 걸고 겨룰 수 있어요."),
     "nara": ("나라 맞히기", "!나라시작",
              "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다.\n\n"
@@ -5497,7 +5498,6 @@ def nara_buttons(bet=False, guild_id=None):
     return [HelpButton(f"{start}easy", f"쉬움 {word}", "🟢", discord.ButtonStyle.success, row=2),
             HelpButton(f"{start}normal", f"보통 {word}", "🌍", discord.ButtonStyle.primary, row=2),
             HelpButton(f"{start}hard", f"어려움 {word}", "🔥", discord.ButtonStyle.danger, row=2),
-            HelpButton("nara_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2),
             HelpButton("nara_info", "나라 정보", "📖", discord.ButtonStyle.secondary, row=2)] + bet_toggle("nara", bet, guild_id)
 
 
@@ -6302,7 +6302,7 @@ class RankPageButton(discord.ui.DynamicItem[discord.ui.Button],
         if interaction.guild is None:
             return
         if interaction.message is not None and interaction.message.flags.ephemeral:  # the /도움말 page
-            await help_run_ranking(interaction, everywhere=self.scope == "g", page=self.page)
+            await help_run_ranking(interaction, everywhere=self.scope == "g", page=self.page, shown=True)
             return
         embed, page, pages = await ranking_embed(interaction.guild, interaction.user.id, self.scope == "g", self.page)
         await interaction.response.edit_message(embed=embed, view=rank_page_view(self.scope, page, pages))
@@ -6362,7 +6362,19 @@ async def find_member(ctx, text):
 GLOBAL_RANK_OFF = "이 서버에서는 전체 랭킹을 쓸 수 없습니다. (관리자 설정)"
 
 
-@bot.command(name="순위", aliases=["랭킹", "xp", "경험치"])
+@bot.command(name="xp", aliases=["내xp", "XP확인"])
+@commands.guild_only()
+async def xp_command(ctx, *, who: str = ""):
+    """!xp: my XP · !xp @사람 / 이름: someone else's."""
+    member = await find_member(ctx, who)
+    if member is None:
+        await ctx.reply(f"이 서버에서 `{discord.utils.escape_markdown(who[:40])}`님을 찾지 못했습니다. "
+                        "`!xp @멘션`처럼 써 주세요.", mention_author=False)
+        return
+    await ctx.reply(embed=ranking_detail_embed(ctx.guild, member), mention_author=False)
+
+
+@bot.command(name="순위", aliases=["랭킹", "경험치"])
 @commands.guild_only()
 async def ranking_command(ctx, action: str = "", *, rest: str = ""):
     """!순위 · !순위 전체 · !순위 자세히 [이름|@멘션]"""
@@ -6388,7 +6400,19 @@ async def ranking_command(ctx, action: str = "", *, rest: str = ""):
     await ctx.reply(embed=embed, view=rank_page_view("s", page, pages), mention_author=False)
 
 
-async def help_run_ranking(interaction, everywhere=False, page=0):
+def embed_as_text(embed):
+    """An embed's content as the /도움말 page text (title, lines, fields, footer)."""
+    lines = [f"**{embed.title}**"]
+    if embed.description:
+        lines.append(embed.description)
+    lines += [f"{f.name} · {f.value.replace(chr(10), ' ')}" for f in embed.fields]
+    if embed.footer and embed.footer.text:
+        lines.append(f"-# {embed.footer.text}")
+    return "\n".join(lines)
+
+
+async def help_run_ranking(interaction, everywhere=False, page=0, shown=False):
+    """/도움말 → 게임 → 🏆 순위. shown=True: the ranking itself; else just the [전체] [개인] choice."""
     if interaction.guild is None:
         await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
         return
@@ -6396,28 +6420,100 @@ async def help_run_ranking(interaction, everywhere=False, page=0):
         await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(interaction.guild.id),
                         notice=GLOBAL_RANK_OFF)
         return
+    if not shown and not everywhere:
+        await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(interaction.guild.id),
+                        details="**🏆 전체**는 서버 XP 순서, **👤 개인**은 원하는 사람의 게임별 기록이에요.")
+        return
+    scope = "g" if everywhere else "s"
     embed, page, pages = await ranking_embed(interaction.guild, interaction.user.id, everywhere, page)
     await show_help(interaction, page="game", selected="ranking",
-                    extra_items=ranking_buttons(interaction.guild.id) + rank_page_items("g" if everywhere else "s", page, pages),
-                    details=f"**{embed.title}**\n{embed.description}\n-# {embed.footer.text if embed.footer else ''}")
+                    extra_items=ranking_buttons(interaction.guild.id) + [RankShareButton(scope, 0, page)]
+                    + rank_page_items(scope, page, pages),
+                    details=embed_as_text(embed))
+
+
+class PersonPickModal(discord.ui.Modal, title="개인 XP 보기"):
+    """[👤 개인]: a member picker (Discord's own search), starting on the person who opened it."""
+
+    def __init__(self, user_id):
+        super().__init__()
+        self.who = discord.ui.UserSelect(placeholder="이름으로 검색해서 고르세요", min_values=1, max_values=1,
+                                         default_values=[discord.Object(id=user_id)])
+        self.add_item(discord.ui.Label(text="누구의 XP를 볼까요?", description="처음에는 '나'가 골라져 있어요",
+                                       component=self.who))
+
+    async def on_submit(self, interaction):
+        picked = self.who.values[0] if self.who.values else interaction.user
+        member = interaction.guild.get_member(picked.id) or picked
+        await help_show_person(interaction, member)
+
+
+async def help_show_person(interaction, member):
+    embed = ranking_detail_embed(interaction.guild, member)
+    await show_help(interaction, page="game", selected="ranking",
+                    extra_items=ranking_buttons(interaction.guild.id) + [RankShareButton("u", member.id, 0)],
+                    details=embed_as_text(embed))
 
 
 async def help_run_ranking_me(interaction):
     if interaction.guild is None:
         await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
         return
-    embed = ranking_detail_embed(interaction.guild, interaction.user)
-    lines = [embed.description] + [f"{f.name} · {f.value.replace(chr(10), ' ')}" for f in embed.fields]
-    await show_help(interaction, page="game", selected="ranking", extra_items=ranking_buttons(interaction.guild.id),
-                    details=f"**{embed.title}**\n" + "\n".join(lines))
+    await interaction.response.send_modal(PersonPickModal(interaction.user.id))
+
+
+_share_last = {}  # user id -> when they last posted a ranking to the channel (a small spam guard)
+
+
+class RankShareButton(discord.ui.DynamicItem[discord.ui.Button],
+                      template=r"maco:rankshare:(?P<kind>[sgu]):(?P<target>\d+):(?P<page>\d+)"):
+    """📢 채팅방에 보내기 under a ranking or a person's XP on the private /도움말 page: posts that view to the
+    channel for everyone. Only the person whose /도움말 it is can see (and so press) it."""
+
+    def __init__(self, kind, target, page):
+        super().__init__(discord.ui.Button(label="채팅방에 보내기", emoji="📢", style=discord.ButtonStyle.primary, row=3,
+                                           custom_id=f"maco:rankshare:{kind}:{target}:{page}"))
+        self.kind, self.target, self.page = kind, target, page
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["kind"], int(match["target"]), int(match["page"]))
+
+    async def callback(self, interaction):
+        if interaction.guild is None:
+            return
+        now = time.time()
+        if now - _share_last.get(interaction.user.id, 0) < 10:
+            await interaction.response.send_message("⏳ 잠시 뒤에 다시 보내 주세요.", ephemeral=True)
+            return
+        _share_last[interaction.user.id] = now
+        if len(_share_last) > 500:
+            _share_last.clear()
+        if self.kind == "u":
+            member = interaction.guild.get_member(self.target)
+            if member is None:
+                try:
+                    member = await interaction.guild.fetch_member(self.target)
+                except discord.HTTPException:  # left the server: their records are still there
+                    member = type("Gone", (), {"id": self.target, "display_name": "알 수 없는 사용자"})()
+            embed, what = ranking_detail_embed(interaction.guild, member), "XP"
+        else:
+            if self.kind == "g" and not rank_setting("global", interaction.guild.id):
+                await interaction.response.send_message(GLOBAL_RANK_OFF, ephemeral=True)
+                return
+            embed, _, _ = await ranking_embed(interaction.guild, interaction.user.id, self.kind == "g", self.page)
+            what = "전체 서버 순위" if self.kind == "g" else "서버 순위"
+        await interaction.response.defer()
+        ctx = HelpContext(interaction, what)
+        await run_from_help(ctx, ctx.reply(embed=embed))
 
 
 def ranking_buttons(guild_id=None):
     # (not "run_ranking": that is the 순위 tab button on the same page, and Discord refuses repeated ids)
-    items = [HelpButton("ranking_server", "서버 순위", "🏆", discord.ButtonStyle.secondary, row=2)]
+    items = [HelpButton("ranking_server", "전체", "🏆", discord.ButtonStyle.primary, row=2),
+             HelpButton("ranking_me", "개인", "👤", discord.ButtonStyle.primary, row=2)]
     if rank_setting("global", guild_id):
-        items.append(HelpButton("ranking_all", "전체 서버", "🌐", discord.ButtonStyle.secondary, row=2))
-    items.append(HelpButton("ranking_me", "내 기록", "📊", discord.ButtonStyle.secondary, row=2))
+        items.append(HelpButton("ranking_all", "모든 서버", "🌐", discord.ButtonStyle.secondary, row=2))
     return items
 
 
@@ -6995,8 +7091,8 @@ def quiz_buttons(q, bet=False, guild_id=None):
     word = "배팅" if bet else "시작"
     buttons = [HelpButton(f"{start}easy", f"쉬움 {word}", "🟢", discord.ButtonStyle.success, row=2),
                HelpButton(f"{start}normal", f"보통 {word}", "🌍", discord.ButtonStyle.primary, row=2),
-               HelpButton(f"{start}hard", f"어려움 {word}", "🔥", discord.ButtonStyle.danger, row=2),
-               HelpButton(f"{q.key}_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2)]
+               HelpButton(f"{start}hard", f"어려움 {word}", "🔥", discord.ButtonStyle.danger, row=2)]
+    # (each game's own 순위 button went: rankings now live under 🏆 순위 on the 게임 tab)
     if q is ANIME_QUIZ:
         buttons = [b for b in buttons if not b.action.endswith("_hard")]
         buttons.append(HelpButton("anime_settings", "작품 고르기", "⚙️", discord.ButtonStyle.secondary, row=2))
@@ -7079,7 +7175,7 @@ HELP_ACTIONS = {
     "nara_betmode": lambda interaction: show_nara_page(interaction, bet=True),
     "nara_plain": lambda interaction: show_nara_page(interaction),
     "run_ranking": help_run_ranking,
-    "ranking_server": help_run_ranking,
+    "ranking_server": lambda interaction: help_run_ranking(interaction, shown=True),
     "ranking_all": lambda interaction: help_run_ranking(interaction, everywhere=True),
     "ranking_me": help_run_ranking_me,
     "nara_info": lambda interaction: interaction.response.send_modal(NaraInfoModal()),
@@ -7627,7 +7723,8 @@ async def setup_hook():
     # Card drawing runs in threads; two are enough and keep memory down (the default can start a dozen).
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="maco"))
     bot.add_dynamic_items(AdminReplyButton, UserAnswerButton, HelpButton, UploadDoneButton, CopyLinkButton,
-                          DdayPick, DdayAfter, DdayCelebrateButton, SongDisplayButton, NaraSetButton, RankPageButton)
+                          DdayPick, DdayAfter, DdayCelebrateButton, SongDisplayButton, NaraSetButton, RankPageButton,
+                          RankShareButton)
     await load_help_emojis()
     if dashboard.configured():
         task = asyncio.get_running_loop().create_task(dashboard_loop())
