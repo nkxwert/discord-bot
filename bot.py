@@ -587,6 +587,27 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_xp_bets_user ON xp_bets(guild_id, user_id)")
+        # XP 2배 (!xpx2, bot owner only): who has it in which server until when, and the extra XP it gave
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS xp_boosts (
+                guild_id INTEGER NOT NULL,
+                target TEXT NOT NULL,
+                until REAL NOT NULL,
+                given_by INTEGER NOT NULL,
+                at REAL NOT NULL,
+                PRIMARY KEY (guild_id, target)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS xp_bonus (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                delta REAL NOT NULL,
+                game TEXT NOT NULL,
+                at REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_xp_bonus_user ON xp_bonus(guild_id, user_id)")
         # £servers activity: message / command counts per server per hour, a week at most (no content, no authors)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS traffic (
@@ -1188,6 +1209,8 @@ async def count_commands(ctx):
 
 OWNER_COMMANDS = [
     ("£도움말", "이 목록을 봅니다."),
+    ("!xpx2 <@사람|all> <시간>", "이 서버에서 그 사람(all: 모두)의 게임 XP를 2배로 (예: `!xpx2 @철수 10m`, `!xpx2 all 60h`, "
+                                "`10days`, 최대 30일). `!xpx2`는 목록, `!xpx2 끄기 @사람|all`은 끝내기."),
     ("£servers", "참여 중인 서버와 최근 24시간 메시지·명령어 수를 봅니다."),
     ("£DB", "로컬 DB와 파일 저장소 상태(응답 시간, 용량, 파일 수 등)를 봅니다."),
     ("£DB 파일 [서버ID]", "올라간 파일을 번호와 함께 봅니다. 서버ID를 붙이면 그 서버만 봅니다."),
@@ -1856,15 +1879,16 @@ def command_list_embed(guild_id=None):
         embed.add_field(name="!노래시작 [쉬움|보통|어려움] [장르] [문제 수] · !노래 <제목> · !노래추가 <곡>",
                         value="노래 맞히기: 노래 일부분(공식 미리듣기)을 듣고 가장 먼저 제목을 맞힌 사람의 개수가 기록됩니다. "
                               "`!노래추가`로 이 서버에 곡을 넣을 수 있습니다.", inline=False)
-    embed.add_field(name="!xp [이름] · !순위" + (" · !순위 전체" if rank_setting("global", guild_id) else ""),
-                    value="`!xp`는 내 XP와 게임별 기록(`!xp @사람`은 그 사람), `!순위`는 모든 게임을 합친 XP 순서. "
+    embed.add_field(name="!xp [이름|all] · !순위" + (" · !순위 전체" if rank_setting("global", guild_id) else ""),
+                    value="`!xp`는 내 XP와 게임별 기록(`!xp @사람`은 그 사람, `!xp all`은 모두), `!순위`는 모든 게임을 합친 XP 순서. "
                           "지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP.", inline=False)
     if rank_setting("bet", guild_id):
-        embed.add_field(name="!○○시작 ... 배팅 · !배팅 <XP> [@사람]",
+        embed.add_field(name="!○○시작 ... 배팅 · !배팅 <XP> [@사람] · !배팅현황",
                         value="게임 시작 명령어 끝에 `배팅`을 붙이면 배팅 판(예: `!국기시작 보통 배팅`, `!나라시작 배팅`). "
                               f"퀴즈는 첫 문제 전 {BET_OPEN_SECONDS}초, 나라 맞히기는 첫 추측 전까지 `!배팅 10`(나에게)·"
                               f"`!배팅 10 @사람`으로 {BET_MIN}~{BET_MAX} XP를 겁니다. 1등이 아닌 사람에게 건 XP를 모아 "
-                              f"1등에게 {BET_WINNER_SHARE:.0%}, 1등에게 건 사람들에게 건 만큼 나눠 줍니다.", inline=False)
+                              f"1등에게 {BET_WINNER_SHARE:.0%}, 1등에게 건 사람들에게 건 만큼 나눠 줍니다. "
+                              "`!배팅현황`으로 누가 누구에게 걸었는지 봅니다.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -4120,12 +4144,14 @@ HELP_COMMANDS = {
              "문구 칸: `{이름}` `{D}` `{년}` `{월}` `{일}` `{시}` `{분}` `{초}` (예: `{이름}까지 {일} 남았습니다`)"),
     "ranking": ("순위", "!순위",
                 "`!xp [이름 또는 @멘션]`\n"
+                "`!xp all`\n"
                 "`!순위`\n"
                 "`!순위 전체`\n\n"
                 "모든 게임을 합친 **XP 순서**예요. 🌍 나라(한 판)·🏛️ 수도·🗺️ 지도는 1 XP, "
                 "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. 아래 **🏆 전체**는 서버 순서, **👤 개인**은 고른 사람의 게임별 기록 "
                 "(📢 채팅방에 보내기로 공유).\n"
-                "🎲 각 게임의 **배팅 판** 버튼(또는 `!국기시작 보통 배팅`)으로 XP를 걸고 겨룰 수 있어요."),
+                "🎲 각 게임의 **배팅 판** 버튼(또는 `!국기시작 보통 배팅`)으로 XP를 걸고 겨룰 수 있어요. "
+                "`!배팅현황`으로 지금 걸린 배팅을 봐요."),
     "nara": ("나라 맞히기", "!나라시작",
              "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다.\n\n"
              "**명령어**\n"
@@ -5335,8 +5361,10 @@ async def nara_guess_command(ctx, *, name: str = ""):
         limit = nara.max_guesses(level)
         if code == answer:
             setter = f"\n-# 출제: <@{game['setter']}>" if game["setter"] else ""
+            bonus = 0 if game["setter"] else boost_bonus(ctx.guild.id, ctx.author.id, "nara")
             content = (f"{header}\n🎉 {ctx.author.mention}님이 정답을 맞혔습니다! 정답은 **{answer_name}**입니다.\n"
-                       f"-# 추측 시도 {len(guesses)}번{setter}\n-# {nara.summary(answer)}")
+                       f"-# 추측 시도 {len(guesses)}번{setter}" + (f" · 🔥 XP 2배 +{xp_text(bonus)}" if bonus else "")
+                       + f"\n-# {nara.summary(answer)}")
             if len(_nara_just_won) >= 300:
                 _nara_just_won.clear()
             _nara_just_won[ctx.channel.id] = (code, ctx.author.id, time.monotonic())
@@ -5730,11 +5758,12 @@ async def quiz_next(q, channel, game, header, answer_file=None):
             song_pick(game["guild_id"], game["genre"], recent) or game["answer"]
     else:
         answer = quiz.pick(game["level"], recent, q.key, quiz_works(q, game["guild_id"]))
+    recent = json.dumps((recent + [answer])[-QUIZ_RECENT:])
     with connect_db() as conn:
         conn.execute(f"UPDATE {q.table}_games SET answer = ?, number = number + 1, recent = ?, hinted = 0 "
-                     "WHERE channel_id = ?",
-                     (answer, json.dumps((recent + [answer])[-QUIZ_RECENT:]), channel.id))
-    await quiz_post_question(q, channel, quiz_game(q, channel.id), header)
+                     "WHERE channel_id = ?", (answer, recent, channel.id))
+    game = {**dict(game), "answer": answer, "number": game["number"] + 1, "recent": recent, "hinted": 0}  # no re-read
+    await quiz_post_question(q, channel, game, header)
 
 
 def anime_works_of(guild_id):
@@ -5912,10 +5941,11 @@ async def quiz_answer_command(q, ctx, text):
             )
             total = conn.execute(f"SELECT {level} FROM {q.table}_scores WHERE guild_id = ? AND user_id = ?",
                                  (ctx.guild.id, ctx.author.id)).fetchone()[0]
+            bonus = boost_bonus(ctx.guild.id, ctx.author.id, q.key, conn)
         header = (f"-# {ctx.author.mention}님의 정답 · {q.title}\n🎉 {quiz_reveal(q, answer, game['guild_id'])}\n"
-                  f"-# {quiz.LEVEL_NAMES[level]} 누적 {total}개\n")
+                  f"-# {quiz.LEVEL_NAMES[level]} 누적 {total}개" + (f" · 🔥 XP 2배 +{xp_text(bonus)}" if bonus else "") + "\n")
         answer_file = await song_answer_file(game["guild_id"], answer) if q is SONG_QUIZ else None
-        await quiz_next(q, ctx.channel, quiz_game(q, ctx.channel.id), header, answer_file)
+        await quiz_next(q, ctx.channel, {**dict(game), "scores": json.dumps(scores)}, header, answer_file)  # no re-read
 
 
 async def quiz_skip_command(q, ctx):
@@ -6064,6 +6094,7 @@ def xp_of(guild_id, user_id, conn=None):
         parts = [f"SELECT ({count}) * {weight} FROM {table} WHERE guild_id = ?1 AND user_id = ?2"
                  for _, _, _, table, count, weight, _ in XP_SOURCES]
         parts.append("SELECT SUM(delta) FROM xp_bets WHERE guild_id = ?1 AND user_id = ?2")
+        parts.append("SELECT SUM(delta) FROM xp_bonus WHERE guild_id = ?1 AND user_id = ?2")
         _xp_of_sql = "SELECT " + " + ".join(f"COALESCE(({p}), 0)" for p in parts)
     if conn is None:
         with connect_db() as conn:
@@ -6283,6 +6314,169 @@ async def bet_command(ctx, amount: str = "", *, who: str = ""):
                     allowed_mentions=discord.AllowedMentions.none())
 
 
+@bot.command(name="배팅현황", aliases=["배팅목록", "베팅현황"])
+@commands.guild_only()
+async def bet_status_command(ctx):
+    """The bet rounds of this channel: who bet how much on whom, and when betting closes."""
+    rows = []
+    if any(ch == ctx.channel.id for _, ch in bet_live()):
+        with connect_db() as conn:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM bet_rounds WHERE channel_id = ?", (ctx.channel.id,))]
+    if not rows:
+        await ctx.reply("이 채널에는 진행 중인 배팅 판이 없습니다. `!국기시작 보통 배팅`처럼 `배팅`을 붙여 시작해 보세요.",
+                        mention_author=False)
+        return
+    titles = {q.key: q.title for q in QUIZZES} | {"nara": "나라 맞히기"}
+    embed = discord.Embed(title="🎲 배팅 현황", color=discord.Color.gold())
+    for row in rows:
+        bets = bet_entries(row["bets"])
+        if row["open_until"] == BET_UNTIL_GUESS:
+            state = "🟢 배팅 중 · 첫 추측 전까지"
+        elif row["open_until"] > time.time():
+            state = f"🟢 배팅 중 · {max(1, int(row['open_until'] - time.time()))}초 뒤 마감"
+        else:
+            state = "🔒 마감 · 판이 끝나면 정산"
+        pot = sum(a for a, _ in bets.values())
+        people = "\n".join(f"<@{uid}> **{xp_text(a)}** → " + ("자신" if target == uid else f"<@{target}>")
+                           for uid, (a, target) in sorted(bets.items(), key=lambda kv: -kv[1][0]))
+        embed.add_field(name=f"{titles.get(row['game'], row['game'])} · 판돈 {xp_text(pot)} ({len(bets)}명)",
+                        value=f"{state}\n{people or '아직 아무도 배팅하지 않았습니다.'}"[:1024], inline=False)
+    embed.set_footer(text="!배팅 <XP> (나에게) · !배팅 <XP> @사람 · 1등에게 판돈의 20%, 1등에게 건 사람에게 80%")
+    await ctx.reply(embed=embed, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ---------------------------------------------------------------- XP 2배 (봇 관리자)
+# `!xpx2 @사람 10m` / `!xpx2 all 60h`: while it lasts, each correct answer in that server gives its XP once more,
+# saved as extra rows (xp_bonus) since XP itself is worked out from the game records. Bot owner only; anyone else
+# gets no reaction. Only the server it was typed in; 배팅 winnings are not doubled.
+BOOST_MAX_SECONDS = 30 * 86400
+BOOST_ALL = "all"
+BOOST_UNITS = {"m": 60, "min": 60, "mins": 60, "분": 60, "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600,
+               "hours": 3600, "시간": 3600, "d": 86400, "day": 86400, "days": 86400, "일": 86400}
+_boosts = None  # {guild id: {target ("all" or a user id as text): until}}
+
+
+def parse_boost_time(text):
+    """'10m', '60h', '10days', '1h30m', '10분' -> seconds, or None."""
+    text = text.strip().lower().replace(" ", "")
+    pairs = re.findall(r"(\d+)([a-z가-힣]+)", text)
+    if not pairs or "".join(n + u for n, u in pairs) != text or any(u not in BOOST_UNITS for _, u in pairs):
+        return None
+    return sum(int(n) * BOOST_UNITS[u] for n, u in pairs)
+
+
+def boosts():
+    global _boosts
+    if _boosts is None:
+        _boosts = {}
+        with connect_db() as conn:
+            for r in conn.execute("SELECT guild_id, target, until FROM xp_boosts WHERE until > ?", (time.time(),)):
+                _boosts.setdefault(r["guild_id"], {})[r["target"]] = r["until"]
+    return _boosts
+
+
+def boost_until(guild_id, user_id):
+    """When this person's XP 2배 here ends, or 0. A dict look-up (runs on every correct answer)."""
+    here = boosts().get(guild_id)
+    if not here:
+        return 0
+    until = max(here.get(BOOST_ALL, 0), here.get(str(user_id), 0))
+    return until if until > time.time() else 0
+
+
+def boost_bonus(guild_id, user_id, game, conn=None):
+    """The extra XP of one correct answer during XP 2배 (saved, on conn when given), or 0."""
+    if not guild_id or not boost_until(guild_id, user_id):
+        return 0
+    xp = next(weight for key, _, _, _, _, weight, _ in XP_SOURCES if key == game)
+    sql = "INSERT INTO xp_bonus(guild_id, user_id, delta, game, at) VALUES (?, ?, ?, ?, ?)"
+    if conn is None:
+        with connect_db() as conn:
+            conn.execute(sql, (guild_id, user_id, xp, game, time.time()))
+    else:
+        conn.execute(sql, (guild_id, user_id, xp, game, time.time()))
+    return xp
+
+
+def set_boost(guild_id, target, until, by):
+    with connect_db() as conn:
+        conn.execute("DELETE FROM xp_boosts WHERE until <= ?", (time.time(),))
+        if until:
+            conn.execute("INSERT OR REPLACE INTO xp_boosts(guild_id, target, until, given_by, at) VALUES (?, ?, ?, ?, ?)",
+                         (guild_id, target, until, by, time.time()))
+        else:
+            conn.execute("DELETE FROM xp_boosts WHERE guild_id = ? AND target = ?", (guild_id, target))
+    global _boosts
+    _boosts = None
+
+
+def active_boosts(guild_id=None):
+    """[(guild id, target, until)] still going, soonest end first."""
+    now = time.time()
+    rows = [(g, t, u) for g, targets in boosts().items() for t, u in targets.items()
+            if u > now and (guild_id is None or g == guild_id)]
+    return sorted(rows, key=lambda r: r[2])
+
+
+def boost_who(target):
+    return "이 서버의 모든 사람" if target == BOOST_ALL else f"<@{target}>"
+
+
+XPX2_USAGE = ("`!xpx2 @사람 10m` · `!xpx2 all 60h` · `!xpx2 끄기 @사람|all` · `!xpx2` (목록)\n"
+              "-# 시간: m(분) · h(시간) · d/days(일), 최대 30일 · 이 서버에만 적용")
+
+
+@bot.command(name="xpx2", aliases=["xp2배"], hidden=True)
+@commands.guild_only()
+async def xp_boost_command(ctx, *, text: str = ""):
+    """Bot owner only: !xpx2 <@사람|all> <시간> · !xpx2 끄기 <@사람|all> · !xpx2 (list)."""
+    if not await bot.is_owner(ctx.author):
+        return
+    words = text.split()
+    if not words:
+        rows = active_boosts(ctx.guild.id)
+        lines = [f"🔥 {boost_who(t)} · <t:{int(u)}:f>까지 (<t:{int(u)}:R>)" for _, t, u in rows]
+        await ctx.reply(("**XP 2배 중**\n" + "\n".join(lines)) if lines else f"이 서버에 걸린 XP 2배가 없습니다.\n{XPX2_USAGE}",
+                        mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        return
+    off = words[0] in ("끄기", "off", "취소", "해제", "끝")
+    if off:
+        who, seconds = " ".join(words[1:]), None
+    else:
+        seconds, who = parse_boost_time(words[-1]), " ".join(words[:-1])
+        if seconds is None and len(words) >= 3:  # "10 m"
+            seconds, who = parse_boost_time(words[-2] + words[-1]), " ".join(words[:-2])
+        if seconds is None or not who:
+            await ctx.reply(f"사용법: {XPX2_USAGE}", mention_author=False)
+            return
+        if not 60 <= seconds <= BOOST_MAX_SECONDS:
+            await ctx.reply("시간은 1분부터 30일까지 정할 수 있습니다.", mention_author=False)
+            return
+    if who.strip().lower() in ("all", "전체", "모두", "everyone", "@everyone"):
+        target = BOOST_ALL
+    else:
+        member = await find_member(ctx, who) if who.strip() else None
+        if member is None or member.bot:
+            await ctx.reply(f"이 서버에서 `{discord.utils.escape_markdown(who[:40])}`님을 찾지 못했습니다.\n{XPX2_USAGE}",
+                            mention_author=False)
+            return
+        target = str(member.id)
+    if off:
+        if target not in boosts().get(ctx.guild.id, {}):
+            await ctx.reply(f"{boost_who(target)}에게 걸린 XP 2배가 없습니다.", mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none())
+            return
+        set_boost(ctx.guild.id, target, 0, ctx.author.id)
+        await ctx.reply(f"🔥 {boost_who(target)}의 XP 2배를 끝냈습니다.", mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none())
+        return
+    until = time.time() + seconds
+    set_boost(ctx.guild.id, target, until, ctx.author.id)
+    await ctx.send(f"🔥 **XP 2배!** {boost_who(target)} · {human_duration(seconds)} 동안 (<t:{int(until)}:f>까지)\n"
+                   "-# 이 서버에서 게임을 맞히면 XP를 두 배로 받습니다 (배팅 제외)",
+                   allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False))
+
+
 # ---------------------------------------------------------------- 랭킹 (XP)
 # One ranking over all games, worked out from the per-game records that are already kept (so past
 # answers count and nothing new is stored). 지리 (나라 한 판, 수도·지도 한 문제) 1 XP; 국기·애니캐·노래 0.5 XP.
@@ -6338,6 +6532,7 @@ def xp_totals(guild_id=None, guild_ids=None):
     parts = [f"SELECT user_id, ({count}) * {weight} AS xp FROM {table} {where}"
              for _, _, _, table, count, weight, _ in XP_SOURCES]
     parts.append(f"SELECT user_id, delta AS xp FROM xp_bets {where}")  # XP won or lost in 배팅
+    parts.append(f"SELECT user_id, delta AS xp FROM xp_bonus {where}")  # extra XP of XP 2배
     params = ids * len(parts)
     with connect_db() as conn:
         rows = conn.execute(f"SELECT user_id, SUM(xp) AS xp FROM ({' UNION ALL '.join(parts)}) "
@@ -6366,6 +6561,10 @@ def xp_breakdown(guild_id, user_id):
                            "FROM xp_bets WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)).fetchone()
         if row[1] or row[2]:
             out.append(("bet", "XP 배팅", "🎲", row[1], f"{row[1]}승 {row[2]}패", row[0], "승"))
+        row = conn.execute("SELECT COALESCE(SUM(delta), 0), COUNT(*) FROM xp_bonus WHERE guild_id = ? AND user_id = ?",
+                           (guild_id, user_id)).fetchone()
+        if row[1]:
+            out.append(("bonus", "XP 2배 보너스", "🔥", row[1], f"{row[1]}번", row[0], "번"))
     return out
 
 
@@ -6498,11 +6697,14 @@ def ranking_detail_embed(guild, member):
                           description=f"**{xp_text(total)}**" + (f" · 서버 {place}위" if place else ""),
                           color=discord.Color.gold())
     for key, title, emoji, count, detail, xp, unit in rows:
-        if key == "bet":
+        if key in ("bet", "bonus"):
             embed.add_field(name=f"{emoji} {title}", value=f"**{detail}**\n→ {'+' if xp >= 0 else ''}{xp_text(xp)}", inline=True)
             continue
         embed.add_field(name=f"{emoji} {title}",
                         value=f"**{count}{unit}**" + (f" ({detail})" if detail else "") + f"\n→ {xp_text(xp)}", inline=True)
+    until = boost_until(guild.id, member.id)
+    if until:
+        embed.description += f"\n🔥 XP 2배 중 · <t:{int(until)}:R> 끝"
     embed.set_footer(text="지리(나라 한 판·수도·지도) 1 XP · 국기·애니캐·노래 0.5 XP · 출제 판은 제외")
     return embed
 
@@ -6529,7 +6731,11 @@ GLOBAL_RANK_OFF = "이 서버에서는 전체 랭킹을 쓸 수 없습니다. (�
 @bot.command(name="xp", aliases=["내xp", "XP확인"])
 @commands.guild_only()
 async def xp_command(ctx, *, who: str = ""):
-    """!xp: my XP · !xp @사람 / 이름: someone else's."""
+    """!xp: my XP · !xp @사람 / 이름: someone else's · !xp all / 전체: everyone in this server (as !순위)."""
+    if who.strip().lower() in ("all", "전체", "모두"):
+        embed, page, pages = await ranking_embed(ctx.guild, ctx.author.id)
+        await ctx.reply(embed=embed, view=rank_page_view("s", page, pages), mention_author=False)
+        return
     member = await find_member(ctx, who)
     if member is None:
         await ctx.reply(f"이 서버에서 `{discord.utils.escape_markdown(who[:40])}`님을 찾지 못했습니다. "
@@ -7515,6 +7721,9 @@ async def dashboard_snapshot():
                   "reason": b["reason"], "at": int(b["created_at"])} for b in all_upload_bans()],
         "virusCheck": bool(VIRUSTOTAL_KEY), "blockedFiles": [],
         "ranking": {name: rank_setting(name) for name in RANK_SETTINGS},
+        "xpBoosts": [{"guildId": str(g), "guild": bot.get_guild(g).name if bot.get_guild(g) else str(g),
+                      "target": t, "targetName": "" if t == BOOST_ALL else user_name(int(t)), "until": int(u)}
+                     for g, t, u in active_boosts()],
         "uptime": {"interval": uptime_interval(), "days": history_days(), "background": uptime_background_on(),
                    "running": monitor_servers.is_running(), "servers": uptime_server_list()},
     }
