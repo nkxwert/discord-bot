@@ -1089,6 +1089,8 @@ async def on_ready():
         tidy_memory.start()
     if not save_traffic.is_running():
         save_traffic.start()
+    if not _bet_resumed:
+        bet_resume()
     print(f"로그인 완료: {bot.user} (ID: {bot.user.id})")
 
 
@@ -1858,10 +1860,11 @@ def command_list_embed(guild_id=None):
                     value="`!xp`는 내 XP와 게임별 기록(`!xp @사람`은 그 사람), `!순위`는 모든 게임을 합친 XP 순서. "
                           "지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP.", inline=False)
     if rank_setting("bet", guild_id):
-        embed.add_field(name="!○○시작 ... 배팅 · !배팅 <XP>",
+        embed.add_field(name="!○○시작 ... 배팅 · !배팅 <XP> [@사람]",
                         value="게임 시작 명령어 끝에 `배팅`을 붙이면 배팅 판(예: `!국기시작 보통 배팅`, `!나라시작 배팅`). "
-                              f"처음 {BET_OPEN_SECONDS}초 동안 `!배팅 10`처럼 {BET_MIN}~{BET_MAX} XP를 걸고, "
-                              "배팅한 사람 중 가장 많이 맞힌 사람이 판돈을 모두 가져갑니다.", inline=False)
+                              f"퀴즈는 첫 문제 전 {BET_OPEN_SECONDS}초, 나라 맞히기는 첫 추측 전까지 `!배팅 10`(나에게)·"
+                              f"`!배팅 10 @사람`으로 {BET_MIN}~{BET_MAX} XP를 겁니다. 1등이 아닌 사람에게 건 XP를 모아 "
+                              f"1등에게 {BET_WINNER_SHARE:.0%}, 1등에게 건 사람들에게 건 만큼 나눠 줍니다.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -5506,7 +5509,7 @@ def nara_buttons(bet=False, guild_id=None):
 async def show_nara_page(interaction, details=None, notice=None, bet=False):
     """/도움말 → 게임 → 나라 맞히기: the game's own buttons (difficulty, ranking, country info); bet: 배팅 starts."""
     if bet:
-        details = BET_MODE_TEXT + (f"\n{details}" if details else "")
+        details = BET_MODE_TEXT.format(when=BET_WHEN_NARA) + (f"\n{details}" if details else "")
     await show_help(interaction, page="game", selected="nara", details=details, notice=notice,
                     extra_items=nara_buttons(bet, interaction.guild.id if interaction.guild else None))
 
@@ -5760,6 +5763,10 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
         game = quiz_game(q, channel.id)
         header = f"-# {user.mention}님의 요청 · {q.title}" + (" · 🎲 배팅" if bet else "")
         if game:
+            wait = bet_waiting(q.key, channel.id)
+            if wait:
+                await channel.send(f"{header}\n🎲 배팅을 받는 중입니다. {wait}초 뒤 첫 문제가 나옵니다. `!배팅 <XP> [@사람]`")
+                return
             busy = "\n-# 진행 중인 판이 있어서 배팅 판으로 시작하지 못했습니다." if bet and not bet_round(q.key, channel.id) else ""
             await quiz_post_question(q, channel, game, f"{header}\n진행 중인 퀴즈를 이어서 합니다.{busy}")
             return
@@ -5783,9 +5790,43 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
         works = quiz_works(q, guild.id if guild else None)
         if works:
             header += f"\n-# 이 서버에서 고른 작품 {len(works)}개에서 나옵니다 · 바꾸기: `!캐릭설정`"
-        if bet and guild:
-            await open_bets(q.key, q.title, channel, guild)
+        if bet and guild:  # the first question waits until the betting closes
+            await open_bets(q.key, q.title, channel, guild, BET_OPEN_SECONDS, then=lambda: quiz_bet_closed(q, channel),
+                            header=header)
+            return
         await quiz_post_question(q, channel, quiz_game(q, channel.id), header)
+
+
+async def quiz_bet_closed(q, channel):
+    """The betting of a bet quiz is over: now the first question."""
+    async with quiz_lock(q, channel.id):
+        game = quiz_game(q, channel.id)
+        if game and game["number"] == 1:
+            await quiz_post_question(q, channel, game, "-# 🎲 배팅이 끝났습니다. 첫 문제!")
+
+
+_bet_resumed = False
+
+
+def bet_resume():
+    """After a restart: the quizzes still taking bets close (and post their first question) on time again."""
+    global _bet_resumed
+    _bet_resumed = True
+    with connect_db() as conn:
+        rows = conn.execute("SELECT game, channel_id, open_until FROM bet_rounds WHERE open_until > 0").fetchall()
+    for r in rows:
+        q = next((q for q in QUIZZES if q.key == r["game"]), None)
+        channel = bot.get_channel(r["channel_id"])
+        if q is None or channel is None:
+            continue
+
+        async def later(q=q, channel=channel, until=r["open_until"]):
+            await asyncio.sleep(max(0.0, until - time.time()))
+            if await close_bets(q.key, channel):
+                await quiz_bet_closed(q, channel)
+        task = asyncio.get_running_loop().create_task(later())
+        _bet_tasks.add(task)
+        task.add_done_callback(_bet_tasks.discard)
 
 
 async def quiz_start_command(q, ctx, options):
@@ -5829,6 +5870,10 @@ async def quiz_answer_command(q, ctx, text):
         await ctx.reply(f"이 채널에는 진행 중인 {q.title} 퀴즈가 없습니다. `!{q.start}`으로 시작해 주세요.",
                         mention_author=False)
         return
+    wait = bet_waiting(q.key, ctx.channel.id)
+    if wait:
+        await ctx.reply(f"🎲 배팅을 받는 중입니다. {wait}초 뒤 첫 문제가 나옵니다.", mention_author=False)
+        return
     if not text:
         await quiz_post_question(q, ctx.channel, game)
         return
@@ -5870,7 +5915,6 @@ async def quiz_answer_command(q, ctx, text):
         header = (f"-# {ctx.author.mention}님의 정답 · {q.title}\n🎉 {quiz_reveal(q, answer, game['guild_id'])}\n"
                   f"-# {quiz.LEVEL_NAMES[level]} 누적 {total}개\n")
         answer_file = await song_answer_file(game["guild_id"], answer) if q is SONG_QUIZ else None
-        await close_bets(q.key, ctx.channel)  # the first answer ends the betting
         await quiz_next(q, ctx.channel, quiz_game(q, ctx.channel.id), header, answer_file)
 
 
@@ -5879,6 +5923,10 @@ async def quiz_skip_command(q, ctx):
         game = quiz_game(q, ctx.channel.id)
         if game is None:
             await ctx.reply(f"이 채널에는 진행 중인 {q.title} 퀴즈가 없습니다.", mention_author=False)
+            return
+        wait = bet_waiting(q.key, ctx.channel.id)
+        if wait:
+            await ctx.reply(f"🎲 배팅을 받는 중입니다. {wait}초 뒤 첫 문제가 나옵니다.", mention_author=False)
             return
         answer_file = await song_answer_file(game["guild_id"], game["answer"]) if q is SONG_QUIZ else None
         await quiz_next(q, ctx.channel, game,
@@ -5894,7 +5942,12 @@ async def quiz_stop_command(q, ctx):
             return
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (ctx.channel.id,))
+        waiting = bet_waiting(q.key, ctx.channel.id)  # stopped before the first question: nothing to reveal
         refunded = refund_bets(q.key, ctx.channel.id)
+        if waiting:
+            await ctx.channel.send(f"-# {ctx.author.mention}님이 멈췄습니다 · {q.title}\n🏁 첫 문제 전에 멈췄습니다."
+                                   + (f"\n{refunded}" if refunded else ""))
+            return
         answer_file = await song_answer_file(game["guild_id"], game["answer"]) if q is SONG_QUIZ else None
         await ctx.channel.send(f"-# {ctx.author.mention}님이 멈췄습니다 · {q.title}\n"
                                f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n-# {quiz_result_line(game)}"
@@ -5926,15 +5979,19 @@ async def quiz_ranking_command(q, ctx):
 
 
 # ---------------------------------------------------------------- XP 배팅
-# A game started with "배팅" (`!국기시작 보통 배팅`, `!나라시작 배팅`) takes bets for BET_OPEN_SECONDS or until the
-# first answer. Only people who bet are affected: at the end the bettor(s) with the most correct answers take
-# the whole pot (a tie splits it); if no bettor scored, or fewer than two people bet, everyone gets their XP back.
-# XP only moves between bettors (nothing is created), and one person can win at most BET_DAILY_WIN XP a day.
+# A game started with "배팅" (`!국기시작 보통 배팅`, `!나라시작 배팅`) first takes bets: `!배팅 10` (on yourself) or
+# `!배팅 10 @사람` (on someone else). Quizzes wait BET_OPEN_SECONDS before the first question; 나라 맞히기 takes
+# bets until the first guess. At the end, whoever came 1st (most correct answers in the whole game; 나라: who got
+# it) is the winner: bets on someone else are lost, BET_WINNER_SHARE of that goes to the 1st-place player(s) and
+# the rest to the people who bet on them, in proportion to what they bet. XP only moves between the bettors and
+# the 1st-place player (nothing is created), and one person can win at most BET_DAILY_WIN XP a day.
 BET_OPEN_SECONDS = 30
 BET_MIN, BET_MAX = 1, 50
 BET_DAILY_WIN = 100
+BET_WINNER_SHARE = 0.2
 BET_WORDS = {"배팅", "베팅", "bet", "내기"}
 BET_OFF = "이 서버에서는 XP 배팅을 쓸 수 없습니다. (관리자 설정)"
+BET_UNTIL_GUESS = -1  # open_until of a 나라 맞히기 round: open until the first guess, however long that takes
 _bet_tasks = set()
 
 
@@ -5964,24 +6021,67 @@ def bet_round(game, channel_id):
     return dict(row) if row else None
 
 
+def bet_is_open(row, now=None):
+    return bool(row) and (row["open_until"] == BET_UNTIL_GUESS or row["open_until"] > (now or time.time()))
+
+
 def bet_round_in(channel_id):
+    """The bet round of this channel, an open one first (a channel can run 나라 and a quiz at once)."""
     if not any(ch == channel_id for _, ch in bet_live()):
         return None
     with connect_db() as conn:
-        row = conn.execute("SELECT * FROM bet_rounds WHERE channel_id = ? ORDER BY open_until DESC LIMIT 1",
-                           (channel_id,)).fetchone()
-    return dict(row) if row else None
+        rows = [dict(r) for r in conn.execute("SELECT * FROM bet_rounds WHERE channel_id = ?", (channel_id,))]
+    rows.sort(key=lambda r: not bet_is_open(r))
+    return rows[0] if rows else None
 
 
-def xp_of(guild_id, user_id):
-    return sum(r[5] for r in xp_breakdown(guild_id, user_id))
+def bet_entries(bets_json):
+    """{bettor id: (XP, the id they bet on)}; rounds saved before betting on others were {id: XP}."""
+    out = {}
+    for uid, value in json.loads(bets_json).items():
+        amount, target = (value, uid) if isinstance(value, (int, float)) else value
+        out[str(uid)] = (amount, str(target))
+    return out
 
 
-def staked_elsewhere(guild_id, user_id, game, channel_id):
+def bet_waiting(game, channel_id):
+    """Seconds left before a bet quiz posts its first question, or 0 (no bet round, or it is closed)."""
+    if (game, channel_id) not in bet_live():
+        return 0
+    row = bet_round(game, channel_id)
+    if not row or row["open_until"] <= 0:
+        return 0
+    return max(1, int(row["open_until"] - time.time() + 0.999))
+
+
+_xp_of_sql = None
+
+
+def xp_of(guild_id, user_id, conn=None):
+    """This person's XP in this server in one query (the same sum as xp_breakdown)."""
+    global _xp_of_sql
+    if _xp_of_sql is None:
+        parts = [f"SELECT ({count}) * {weight} FROM {table} WHERE guild_id = ?1 AND user_id = ?2"
+                 for _, _, _, table, count, weight, _ in XP_SOURCES]
+        parts.append("SELECT SUM(delta) FROM xp_bets WHERE guild_id = ?1 AND user_id = ?2")
+        _xp_of_sql = "SELECT " + " + ".join(f"COALESCE(({p}), 0)" for p in parts)
+    if conn is None:
+        with connect_db() as conn:
+            return conn.execute(_xp_of_sql, (guild_id, user_id)).fetchone()[0]
+    return conn.execute(_xp_of_sql, (guild_id, user_id)).fetchone()[0]
+
+
+def staked_elsewhere(guild_id, user_id, game, channel_id, conn=None):
     """XP this person has riding on other bet games in this server (it can't be bet twice)."""
-    with connect_db() as conn:
-        rows = conn.execute("SELECT game, channel_id, bets FROM bet_rounds WHERE guild_id = ?", (guild_id,)).fetchall()
-    return sum(json.loads(r["bets"]).get(str(user_id), 0) for r in rows if (r["game"], r["channel_id"]) != (game, channel_id))
+    sql, args = ("SELECT game, channel_id, bets FROM bet_rounds WHERE guild_id = ? AND bets LIKE ?",
+                 (guild_id, f'%"{user_id}"%'))
+    if conn is None:
+        with connect_db() as conn:
+            rows = conn.execute(sql, args).fetchall()
+    else:
+        rows = conn.execute(sql, args).fetchall()
+    return sum(bet_entries(r["bets"]).get(str(user_id), (0, 0))[0]
+               for r in rows if (r["game"], r["channel_id"]) != (game, channel_id))
 
 
 def won_today(guild_id, user_id):
@@ -5991,44 +6091,57 @@ def won_today(guild_id, user_id):
                             "AND delta > 0 AND at >= ?", (guild_id, user_id, start)).fetchone()[0]
 
 
-async def open_bets(game, title, channel, guild):
-    """Make this game a bet game and tell the channel how to join; the window closes on its own."""
-    until = time.time() + BET_OPEN_SECONDS
+BET_RULE_LINE = (f"-# 판이 끝나면 1등(가장 많이 맞힌 사람)이 아닌 사람에게 건 XP를 모아 1등에게 "
+                 f"{BET_WINNER_SHARE:.0%}, 1등에게 건 사람들에게 건 만큼 나눠 줍니다 · 배팅하지 않으면 XP는 그대로예요")
+
+
+async def open_bets(game, title, channel, guild, seconds=None, then=None, header=None):
+    """Make this game a bet game and tell the channel how to join. With seconds the window closes on its own
+    and then() runs (a quiz posts its first question); without, it stays open until close_bets (나라: first guess)."""
+    until = time.time() + seconds if seconds else BET_UNTIL_GUESS
     with connect_db() as conn:
         conn.execute("INSERT OR REPLACE INTO bet_rounds(game, channel_id, guild_id, open_until, bets) VALUES (?, ?, ?, ?, '{}')",
                      (game, channel.id, guild.id, until))
     bet_live().add((game, channel.id))
-    await channel.send(f"🎲 **배팅 판**입니다! {BET_OPEN_SECONDS}초 안에(첫 정답 전까지) `!배팅 <XP>`로 참여하세요. "
-                       f"({BET_MIN}~{BET_MAX} XP)\n-# 배팅한 사람 중 가장 많이 맞힌 사람이 판돈을 모두 가져갑니다 · "
-                       "배팅하지 않으면 XP는 그대로예요")
+    when = f"**{seconds}초 동안** 배팅을 받고 첫 문제가 나옵니다" if seconds else "**첫 추측 전까지** 배팅을 받습니다"
+    await channel.send((f"{header}\n" if header else "") + f"🎲 **{title} 배팅 판**입니다! {when}.\n"
+                       f"`!배팅 <XP>`는 나에게, `!배팅 <XP> @사람`은 그 사람에게 겁니다. ({BET_MIN}~{BET_MAX} XP)\n"
+                       + BET_RULE_LINE)
+    if not seconds:
+        return
 
     async def close_later():
-        await asyncio.sleep(BET_OPEN_SECONDS + 1)
-        await close_bets(game, channel)
+        await asyncio.sleep(seconds)
+        if await close_bets(game, channel) and then:
+            await then()
     task = asyncio.get_running_loop().create_task(close_later())
     _bet_tasks.add(task)
     task.add_done_callback(_bet_tasks.discard)
 
 
 def bet_list_text(bets):
-    pot = sum(bets.values())
-    people = " · ".join(f"<@{uid}> {xp_text(n)}" for uid, n in bets.items())
-    return f"🎲 배팅 마감 · 판돈 **{xp_text(pot)}** ({len(bets)}명)\n-# {people}" if bets else "🎲 배팅 마감 · 아무도 배팅하지 않았습니다."
+    if not bets:
+        return "🎲 배팅 마감 · 아무도 배팅하지 않았습니다."
+    pot = sum(a for a, _ in bets.values())
+    people = " · ".join(f"<@{uid}> {xp_text(a)}" + ("" if target == uid else f" → <@{target}>")
+                        for uid, (a, target) in bets.items())
+    return f"🎲 배팅 마감 · 판돈 **{xp_text(pot)}** ({len(bets)}명)\n-# {people}"
 
 
 async def close_bets(game, channel):
-    """Stop taking bets (first answer, or the time is up) and show who is in."""
+    """Stop taking bets (the time is up, or the first guess) and show who is in. True if it was open."""
     row = bet_round(game, channel.id)
     if not row or row["open_until"] == 0:
-        return
+        return False
     with connect_db() as conn:
         conn.execute("UPDATE bet_rounds SET open_until = 0 WHERE game = ? AND channel_id = ?", (game, channel.id))
-    bets = json.loads(row["bets"])
+    bets = bet_entries(row["bets"])
     note = "" if len(bets) != 1 else "\n-# 배팅한 사람이 한 명뿐이라 판이 끝나면 돌려받습니다."
     try:
         await channel.send(bet_list_text(bets) + note)
     except discord.HTTPException:
         pass
+    return True
 
 
 def refund_bets(game, channel_id):
@@ -6042,6 +6155,31 @@ def refund_bets(game, channel_id):
     return "-# 🎲 배팅은 모두 돌려받았습니다." if json.loads(row["bets"]) else None
 
 
+def bet_payout(bets, scores):
+    """(None, why) when everyone gets their XP back, else ({user id: XP won (+) or lost (-)}, winners).
+    bets {bettor: (XP, target)}, scores {user: correct answers}."""
+    if len(bets) < 2:
+        return None, "배팅한 사람이 한 명뿐이라"
+    best = max(scores.values(), default=0)
+    if best <= 0:
+        return None, "맞힌 사람이 없어"
+    winners = {uid for uid, n in scores.items() if n == best}
+    backed = {uid: a for uid, (a, target) in bets.items() if target in winners}
+    lost = {uid: a for uid, (a, target) in bets.items() if target not in winners}
+    if not lost:
+        return None, "모두 1등에게 걸어서"
+    if not backed:
+        return None, "1등에게 건 사람이 없어"
+    pool = sum(lost.values())
+    out = {uid: -float(a) for uid, a in lost.items()}
+    for uid in winners:
+        out[uid] = out.get(uid, 0.0) + pool * BET_WINNER_SHARE / len(winners)
+    stake = sum(backed.values())
+    for uid, a in backed.items():
+        out[uid] = out.get(uid, 0.0) + pool * (1 - BET_WINNER_SHARE) * a / stake
+    return {uid: round(v, 1) for uid, v in out.items()}, winners
+
+
 def settle_bets(game, channel_id, scores):
     """At the end of a bet game: scores {user id: correct answers}. Returns the text to post, or None."""
     row = bet_round(game, channel_id)
@@ -6050,31 +6188,31 @@ def settle_bets(game, channel_id, scores):
     with connect_db() as conn:
         conn.execute("DELETE FROM bet_rounds WHERE game = ? AND channel_id = ?", (game, channel_id))
     bet_live().discard((game, channel_id))
-    bets = {str(k): v for k, v in json.loads(row["bets"]).items()}
+    bets = bet_entries(row["bets"])
     if not bets:
         return None
-    pot = sum(bets.values())
-    best = max((scores.get(uid, 0) for uid in bets), default=0)
-    if len(bets) < 2 or best == 0:
-        why = "배팅한 사람이 한 명뿐이라" if len(bets) < 2 else "배팅한 사람 중 맞힌 사람이 없어"
-        return f"🎲 {why} 배팅한 XP를 모두 돌려받았습니다. (판돈 {xp_text(pot)})"
-    winners = [uid for uid in bets if scores.get(uid, 0) == best]
-    losers = [uid for uid in bets if uid not in winners]
-    if not losers:
-        return f"🎲 배팅한 사람 모두 {best}개로 같아서 판돈을 돌려받았습니다."
-    prize = sum(bets[uid] for uid in losers)
-    share = prize / len(winners)
+    scores = {str(k): v for k, v in scores.items()}
+    pot = sum(a for a, _ in bets.values())
+    result, winners = bet_payout(bets, scores)
+    if result is None:
+        return f"🎲 {winners} 배팅한 XP를 모두 돌려받았습니다. (판돈 {xp_text(pot)})"
     now, guild_id = time.time(), row["guild_id"]
-    lines, rows = [f"🎲 **배팅 결과** · 판돈 {xp_text(pot)}"], []
-    for uid in winners:
-        room = max(0.0, BET_DAILY_WIN - won_today(guild_id, int(uid)))
-        gain = min(share, room)
-        rows.append((guild_id, int(uid), gain, game, now))
-        capped = " (오늘 배팅으로 얻을 수 있는 XP 한도에 걸림)" if gain < share else ""
-        lines.append(f"🏆 <@{uid}> **+{xp_text(gain)}** (맞힌 개수 {scores.get(uid, 0)}){capped}")
-    for uid in losers:
-        rows.append((guild_id, int(uid), -float(bets[uid]), game, now))
-        lines.append(f"-# <@{uid}> −{xp_text(bets[uid])} (맞힌 개수 {scores.get(uid, 0)})")
+    first = " · ".join(f"<@{uid}>" for uid in sorted(winners))
+    lines, rows = [f"🎲 **배팅 결과** · 판돈 {xp_text(pot)} · 1등 {first} (맞힌 개수 {scores[next(iter(winners))]})"], []
+    for uid, delta in sorted(result.items(), key=lambda kv: -kv[1]):
+        if delta > 0:
+            room = max(0.0, BET_DAILY_WIN - won_today(guild_id, int(uid)))
+            gain = round(min(delta, room), 1)
+            rows.append((guild_id, int(uid), gain, game, now))
+            backer = uid in bets and bets[uid][1] in winners
+            why = ("1등 + 1등에게 걸어서" if backer else "1등 보너스") if uid in winners else "1등에게 걸어서"
+            capped = " (오늘 배팅으로 얻을 수 있는 XP 한도에 걸림)" if gain < delta else ""
+            lines.append(f"🏆 <@{uid}> **+{xp_text(gain)}** ({why}){capped}")
+        elif delta < 0:
+            rows.append((guild_id, int(uid), delta, game, now))
+            target = bets[uid][1]
+            on = "자신" if target == uid else f"<@{target}>"
+            lines.append(f"-# <@{uid}> −{xp_text(-delta)} ({on}에게 걸었음)")
     with connect_db() as conn:
         conn.executemany("INSERT INTO xp_bets(guild_id, user_id, delta, game, at) VALUES (?, ?, ?, ?, ?)",
                          [r for r in rows if r[2]])
@@ -6082,15 +6220,28 @@ def settle_bets(game, channel_id, scores):
     return "\n".join(lines)
 
 
+async def bet_target(ctx, text):
+    """The member a bet is on: the author when text is empty. (member, error message)."""
+    if not text.strip():
+        return ctx.author, None
+    member = await find_member(ctx, text)
+    if member is None:
+        return None, f"이 서버에서 `{discord.utils.escape_markdown(text.strip()[:40])}`님을 찾지 못했습니다."
+    if member.bot:
+        return None, "봇에게는 배팅할 수 없습니다."
+    return member, None
+
+
 @bot.command(name="배팅", aliases=["베팅", "bet"])
 @commands.guild_only()
-async def bet_command(ctx, amount: str = ""):
+async def bet_command(ctx, amount: str = "", *, who: str = ""):
+    """!배팅 <XP> (on yourself) · !배팅 <XP> @사람 / 이름 (on them)."""
     row = bet_round_in(ctx.channel.id)
     if row is None:
         await ctx.reply("이 채널에는 배팅 판이 없습니다. `!국기시작 보통 배팅`처럼 `배팅`을 붙여 시작해 주세요.",
                         mention_author=False)
         return
-    if row["open_until"] < time.time():
+    if not bet_is_open(row):
         await ctx.reply("배팅이 이미 마감됐습니다. 다음 배팅 판을 기다려 주세요!", mention_author=False)
         return
     try:
@@ -6098,27 +6249,38 @@ async def bet_command(ctx, amount: str = ""):
     except ValueError:
         value = 0
     if value != int(value) or not BET_MIN <= value <= BET_MAX:
-        await ctx.reply(f"`!배팅 <XP>`처럼 {BET_MIN}~{BET_MAX} 사이 정수로 써 주세요. 예: `!배팅 10`", mention_author=False)
+        await ctx.reply(f"`!배팅 <XP> [@사람]`처럼 {BET_MIN}~{BET_MAX} 사이 정수로 써 주세요. "
+                        "예: `!배팅 10` (나에게) · `!배팅 10 @친구`", mention_author=False)
         return
     value = int(value)
-    have = xp_of(ctx.guild.id, ctx.author.id) - staked_elsewhere(ctx.guild.id, ctx.author.id, row["game"], ctx.channel.id)
-    if value > have:
-        await ctx.reply(f"XP가 부족합니다. 걸 수 있는 XP: **{xp_text(max(have, 0))}**", mention_author=False)
+    target, error = await bet_target(ctx, who)
+    if error:
+        await ctx.reply(error, mention_author=False)
         return
-    with connect_db() as conn:
+    with connect_db() as conn:  # one connection for the checks and the bet itself
+        have = (xp_of(ctx.guild.id, ctx.author.id, conn)
+                - staked_elsewhere(ctx.guild.id, ctx.author.id, row["game"], ctx.channel.id, conn))
         current = conn.execute("SELECT bets, open_until FROM bet_rounds WHERE game = ? AND channel_id = ?",
                                (row["game"], ctx.channel.id)).fetchone()
-        if current is None or current["open_until"] < time.time():
-            await ctx.reply("배팅이 이미 마감됐습니다.", mention_author=False)
-            return
-        bets = json.loads(current["bets"])
-        changed = str(ctx.author.id) in bets
-        bets[str(ctx.author.id)] = value
-        conn.execute("UPDATE bet_rounds SET bets = ? WHERE game = ? AND channel_id = ?",
-                     (json.dumps(bets), row["game"], ctx.channel.id))
-    left = max(1, int(current["open_until"] - time.time()))
-    await ctx.reply(f"🎲 {'배팅을 바꿨습니다' if changed else '배팅했습니다'}: **{value} XP** · 판돈 {xp_text(sum(bets.values()))} "
-                    f"({len(bets)}명) · {left}초 뒤 마감", mention_author=False)
+        if value > have or not bet_is_open(current):
+            current = None
+        else:
+            bets = json.loads(current["bets"])
+            changed = str(ctx.author.id) in bets
+            bets[str(ctx.author.id)] = [value, str(target.id)]
+            conn.execute("UPDATE bet_rounds SET bets = ? WHERE game = ? AND channel_id = ?",
+                         (json.dumps(bets), row["game"], ctx.channel.id))
+    if current is None:
+        await ctx.reply(f"XP가 부족합니다. 걸 수 있는 XP: **{xp_text(max(have, 0))}**" if value > have
+                        else "배팅이 이미 마감됐습니다.", mention_author=False)
+        return
+    pot = sum(a for a, _ in bet_entries(json.dumps(bets)).values())
+    left = ("첫 추측 전까지" if current["open_until"] == BET_UNTIL_GUESS
+            else f"{max(1, int(current['open_until'] - time.time()))}초 뒤 마감")
+    on = "나" if target.id == ctx.author.id else target.mention
+    await ctx.reply(f"🎲 {'배팅을 바꿨습니다' if changed else '배팅했습니다'}: {on}에게 **{value} XP** · "
+                    f"판돈 {xp_text(pot)} ({len(bets)}명) · {left}", mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none())
 
 
 # ---------------------------------------------------------------- 랭킹 (XP)
@@ -6557,6 +6719,9 @@ async def quiz_hint_command(ctx):
     lines = []
     for q in QUIZZES:
         game = quiz_game(q, ctx.channel.id)
+        if game and bet_waiting(q.key, ctx.channel.id):
+            lines.append(f"🎲 {q.title}: 배팅을 받는 중이라 아직 문제가 없습니다.")
+            continue
         if game:
             word = quiz_hint_word(q, game["answer"], game["guild_id"])
             if q is SONG_QUIZ and not game["hinted"]:  # first the singer, then the initials
@@ -7075,8 +7240,11 @@ async def song_delete_command(ctx, number: str = ""):
     await ctx.reply(f"🗑️ 지웠습니다: **{row['title']}** - {row['artist']}", mention_author=False)
 
 
-BET_MODE_TEXT = ("🎲 **배팅 판** · 아래 버튼으로 시작하면 처음 30초 동안(첫 정답 전까지) `!배팅 <XP>`로 1~50 XP를 걸 수 있어요. "
-                 "배팅한 사람 중 가장 많이 맞힌 사람이 판돈을 모두 가져가고, 배팅하지 않은 사람의 XP는 그대로예요.")
+BET_MODE_TEXT = ("🎲 **배팅 판** · 아래 버튼으로 시작하면 {when} `!배팅 <XP>`(나에게)·`!배팅 <XP> @사람`으로 "
+                 "1~50 XP를 걸 수 있어요. 1등이 아닌 사람에게 건 XP를 모아 1등에게 20%, 1등에게 건 사람들에게 건 만큼 "
+                 "나눠 주고, 배팅하지 않은 사람의 XP는 그대로예요.")
+BET_WHEN_QUIZ = "첫 문제 전 30초 동안"
+BET_WHEN_NARA = "첫 추측 전까지"
 
 
 def bet_toggle(key, bet, guild_id):
@@ -7111,7 +7279,7 @@ async def show_quiz_page(q, interaction, details=None, extra=(), bet=False):
         works = anime_works_of(interaction.guild.id)
         details = f"-# 이 서버: 고른 작품 {len(works)}개" if works else "-# 이 서버: 모든 작품"
     if bet:
-        details = BET_MODE_TEXT + (f"\n{details}" if details else "")
+        details = BET_MODE_TEXT.format(when=BET_WHEN_QUIZ) + (f"\n{details}" if details else "")
     await show_help(interaction, page="game", selected=q.key, details=details,
                     extra_items=[*quiz_buttons(q, bet, interaction.guild.id if interaction.guild else None), *extra])
 
