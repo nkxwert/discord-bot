@@ -8,7 +8,7 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 import cards
 
@@ -106,6 +106,18 @@ def _runs(line):
     return runs
 
 
+def _grow(mask, by):
+    """The letters made `by` pixels fatter in every direction: the outline. Done here instead of with Pillow's
+    stroke_width, whose FreeType stroker leaves parts of some letters without an outline (the ㅇ of 하).
+    A blur spreads each letter evenly (round corners like a pen); everything it reaches beyond a small level
+    becomes solid, which puts the edge about `by` pixels out. A few ms, against ~60 for repeated max filters."""
+    sigma = by / 2
+    return mask.filter(ImageFilter.GaussianBlur(sigma)).point(_GROW_LEVELS)
+
+
+_GROW_LEVELS = [min(255, v * 51) for v in range(256)]  # level 5 (of 255) and up: solid, a soft edge below
+
+
 def render(text):
     """PNG bytes of the 글자콘 for already-cleaned text."""
     lines = wrap(text)
@@ -115,14 +127,18 @@ def render(text):
     pad = STROKE * 2
     width = int(max(widths)) + pad * 2
     height = line_height * len(lines) + pad * 2
-    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
+    letters = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(letters)
     for i, line in enumerate(lines):
         x = pad + (width - pad * 2 - widths[i]) / 2
         baseline = pad + i * line_height + ascent
         for run, face in _runs(line):
-            draw.text((x, baseline), run, font=face, fill=FILL, stroke_width=STROKE, stroke_fill=OUTLINE, anchor="ls")
+            draw.text((x, baseline), run, font=face, fill=255, anchor="ls")
             x += face.getlength(run)
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    image.paste(OUTLINE, mask=_grow(letters, STROKE))
+    image.paste(FILL, mask=letters)
+    letters.close()
     box = image.getbbox()
     if box:
         image = image.crop((max(0, box[0] - 4), max(0, box[1] - 4), min(width, box[2] + 4), min(height, box[3] + 4)))
