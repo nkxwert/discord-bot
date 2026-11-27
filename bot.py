@@ -566,6 +566,27 @@ def init_db():
         conn.execute("CREATE TABLE IF NOT EXISTS anime_works (guild_id INTEGER PRIMARY KEY, works TEXT NOT NULL)")
         # Small key/value settings changed with owner commands (e.g. £DB 기간).
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        # XP 배팅: one row per bet game in progress (who bet how much), and the XP each settled bet moved
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bet_rounds (
+                game TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                open_until REAL NOT NULL,
+                bets TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (game, channel_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS xp_bets (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                delta REAL NOT NULL,
+                game TEXT NOT NULL,
+                at REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_xp_bets_user ON xp_bets(guild_id, user_id)")
         # £servers activity: message / command counts per server per hour, a week at most (no content, no authors)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS traffic (
@@ -1836,6 +1857,11 @@ def command_list_embed(guild_id=None):
     embed.add_field(name="!순위 · !순위 자세히 [이름]" + (" · !순위 전체" if rank_setting("global", guild_id) else ""),
                     value="모든 게임을 합친 XP 순서: 지리(나라 한 판·수도·지도) 1 XP, 국기·애니캐·노래 0.5 XP. "
                           "`자세히`는 게임별 기록.", inline=False)
+    if rank_setting("bet", guild_id):
+        embed.add_field(name="!○○시작 ... 배팅 · !배팅 <XP>",
+                        value="게임 시작 명령어 끝에 `배팅`을 붙이면 배팅 판(예: `!국기시작 보통 배팅`, `!나라시작 배팅`). "
+                              f"처음 {BET_OPEN_SECONDS}초 동안 `!배팅 10`처럼 {BET_MIN}~{BET_MAX} XP를 걸고, "
+                              "배팅한 사람 중 가장 많이 맞힌 사람이 판돈을 모두 가져갑니다.", inline=False)
     embed.add_field(name="!정보 <나라>", value="나라의 소개(위키백과)와 수도·인구·면적·언어·통화·이웃 나라를 봅니다. `!나라정보`도 됩니다.",
                     inline=False)
     embed.add_field(name="/글자콘 글자:<글자> [메시지:<메시지>]",
@@ -4092,7 +4118,8 @@ HELP_COMMANDS = {
     "ranking": ("순위", "!순위",
                 "`!순위` · `!순위 자세히 [이름 또는 @멘션]` · `!순위 전체`(켜진 서버만)\n"
                 "모든 게임을 합친 **XP 순서**예요. 🌍 나라(한 판)·🏛️ 수도·🗺️ 지도는 1 XP, "
-                "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. `!순위 자세히`로 게임별 기록을 봅니다."),
+                "🚩 국기·🎌 애니캐·🎵 노래는 0.5 XP. `!순위 자세히`로 게임별 기록을 봅니다.\n"
+                "🎲 각 게임의 **배팅 판** 버튼(또는 `!국기시작 보통 배팅`)으로 XP를 걸고 겨룰 수 있어요."),
     "nara": ("나라 맞히기", "!나라시작",
              "봇이 몰래 고른 나라를 채널의 모두가 함께 맞힙니다.\n\n"
              "**명령어**\n"
@@ -5206,13 +5233,18 @@ def nara_title(level, setter=None):
     return f"{NARA_LEVEL_EMOJI[level]} **나라 맞히기 · {nara.LEVEL_NAMES[level]}**"
 
 
-async def nara_start(channel, guild, user, level=nara.NORMAL, answer=None):
+async def nara_start(channel, guild, user, level=nara.NORMAL, answer=None, bet=False):
     """Start a game in this channel, or show the one already going on there. With answer, user chose it
     (!나라출제): they can't guess, and winning it doesn't count in the ranking."""
+    if bet and not rank_setting("bet", guild.id if guild else None):
+        await channel.send(f"-# {user.mention}님의 요청 · 나라 맞히기\n{BET_OFF}")
+        return
     async with nara_lock(channel.id):
         game = nara_game(channel.id)
-        header = f"-# {user.mention}님의 요청 · 나라 맞히기"
+        header = f"-# {user.mention}님의 요청 · 나라 맞히기" + (" · 🎲 배팅" if bet else "")
         if game:
+            if bet and not bet_round("nara", channel.id):
+                header += "\n-# 진행 중인 판이 있어서 배팅 판으로 시작하지 못했습니다."
             guesses = json.loads(game["guesses"])
             other = ""
             if game["level"] != level and not game["setter"]:
@@ -5231,6 +5263,8 @@ async def nara_start(channel, guild, user, level=nara.NORMAL, answer=None):
             header = f"-# {user.mention}님의 출제 · 나라 맞히기"
             rule = f"{user.mention}님이 낸 나라를 맞혀 보세요! {rule}"
         content = f"{header}\n{nara_title(level, setter)}\n{rule}"
+        if bet and guild and not setter:  # (출제 판은 배팅 없음: 출제자가 답을 압니다)
+            await open_bets("nara", "나라 맞히기", channel, guild)
         message = await nara_post_board(channel, game, [], content)
         with connect_db() as conn:
             conn.execute(
@@ -5246,11 +5280,16 @@ async def nara_start_command(ctx, *, level: str = ""):
     if level.strip() == "출제":
         await nara_set_command(ctx)
         return
+    bet, level = split_bet_word(level)
+    if bet and not rank_setting("bet", ctx.guild.id):
+        await ctx.reply(BET_OFF, mention_author=False)
+        return
     chosen = nara.level_of(level)
     if chosen is None:
-        await ctx.reply("난이도는 `쉬움`, `보통`, `어려움`입니다. 예: `!나라시작 쉬움`", mention_author=False)
+        await ctx.reply("난이도는 `쉬움`, `보통`, `어려움`입니다. 예: `!나라시작 쉬움` · 배팅 판: `!나라시작 보통 배팅`",
+                        mention_author=False)
         return
-    await nara_start(ctx.channel, ctx.guild, ctx.author, chosen)
+    await nara_start(ctx.channel, ctx.guild, ctx.author, chosen, bet=bet)
 
 
 @bot.command(name="guess", aliases=["추측"])
@@ -5284,6 +5323,7 @@ async def nara_guess_command(ctx, *, name: str = ""):
                             "-# 이 추측은 횟수에 들어가지 않습니다.", mention_author=False)
             return
         guesses.append([code, ctx.author.id])
+        await close_bets("nara", ctx.channel)  # the first guess ends the betting (the board starts giving hints)
         header = f"-# {ctx.author.mention}님의 추측 · {country['ko']}"
         answer_name = nara.countries()[answer]["ko"]
         limit = nara.max_guesses(level)
@@ -5294,7 +5334,8 @@ async def nara_guess_command(ctx, *, name: str = ""):
             if len(_nara_just_won) >= 300:
                 _nara_just_won.clear()
             _nara_just_won[ctx.channel.id] = (code, ctx.author.id, time.monotonic())
-            await nara_post_board(ctx.channel, game, guesses, content, finished=True)
+            settled = settle_bets("nara", ctx.channel.id, {str(ctx.author.id): 1})
+            await nara_post_board(ctx.channel, game, guesses, content + (f"\n{settled}" if settled else ""), finished=True)
             column = {nara.EASY: "easy_wins", nara.NORMAL: "wins", nara.HARD: "hard_wins"}[level]
             with connect_db() as conn:
                 conn.execute("DELETE FROM nara_games WHERE channel_id = ?", (ctx.channel.id,))
@@ -5309,7 +5350,8 @@ async def nara_guess_command(ctx, *, name: str = ""):
         if limit and len(guesses) >= limit:
             content = (f"{header}\n💀 {limit}번 안에 맞히지 못했습니다. 정답은 **{answer_name}**입니다.\n"
                        f"-# {nara.summary(answer)}")
-            await nara_post_board(ctx.channel, game, guesses, content, finished=True)
+            settled = settle_bets("nara", ctx.channel.id, {})
+            await nara_post_board(ctx.channel, game, guesses, content + (f"\n{settled}" if settled else ""), finished=True)
             nara_end_game(ctx.channel.id)
             return
         content = header + (f"\n-# 남은 기회 {limit - len(guesses)}번" if limit else "")
@@ -5327,9 +5369,10 @@ async def nara_giveup_command(ctx):
             await ctx.reply("이 채널에는 진행 중인 나라 맞히기 판이 없습니다.", mention_author=False)
             return
         guesses, answer = json.loads(game["guesses"]), game["answer"]
+        refunded = refund_bets("nara", ctx.channel.id)
         content = (f"-# {ctx.author.mention}님이 포기했습니다 · 나라 맞히기\n"
                    f"🏳️ 정답은 **{nara.countries()[answer]['ko']}**입니다.\n"
-                   f"-# 추측 시도 {len(guesses)}번\n-# {nara.summary(answer)}")
+                   f"-# 추측 시도 {len(guesses)}번\n-# {nara.summary(answer)}" + (f"\n{refunded}" if refunded else ""))
         await nara_post_board(ctx.channel, game, guesses, content, finished=True)
         nara_end_game(ctx.channel.id)
 
@@ -5428,14 +5471,15 @@ async def nara_ranking_command(ctx):
     await nara_ranking_send(ctx)
 
 
-def help_run_nara(level):
+def help_run_nara(level, bet=False):
     async def handler(interaction):
         if interaction.guild is None or interaction.channel is None:
             await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
             return
-        await show_nara_page(interaction)
-        ctx = HelpContext(interaction, f"나라 맞히기 · {nara.LEVEL_NAMES[level]}")
-        await run_from_help(ctx, nara_start(interaction.channel, interaction.guild, interaction.user, level), channel_only=True)
+        await show_nara_page(interaction, bet=bet)
+        ctx = HelpContext(interaction, f"나라 맞히기 · {nara.LEVEL_NAMES[level]}" + (" · 배팅" if bet else ""))
+        await run_from_help(ctx, nara_start(interaction.channel, interaction.guild, interaction.user, level, bet=bet),
+                            channel_only=True)
     return handler
 
 
@@ -5448,18 +5492,21 @@ async def help_run_nara_rank(interaction):
                          details=f"**이 서버 순위**\n{ranking}" if ranking else "아직 이 서버에서 나라를 맞힌 사람이 없습니다.")
 
 
-def nara_buttons():
-    return [HelpButton("nara_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
-            HelpButton("nara_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
-            HelpButton("nara_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
+def nara_buttons(bet=False, guild_id=None):
+    start, word = ("nara_bet_", "배팅") if bet else ("nara_", "시작")
+    return [HelpButton(f"{start}easy", f"쉬움 {word}", "🟢", discord.ButtonStyle.success, row=2),
+            HelpButton(f"{start}normal", f"보통 {word}", "🌍", discord.ButtonStyle.primary, row=2),
+            HelpButton(f"{start}hard", f"어려움 {word}", "🔥", discord.ButtonStyle.danger, row=2),
             HelpButton("nara_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2),
-            HelpButton("nara_info", "나라 정보", "📖", discord.ButtonStyle.secondary, row=2)]
+            HelpButton("nara_info", "나라 정보", "📖", discord.ButtonStyle.secondary, row=2)] + bet_toggle("nara", bet, guild_id)
 
 
-async def show_nara_page(interaction, details=None, notice=None):
-    """/도움말 → 게임 → 나라 맞히기: the game's own buttons (difficulty, ranking, country info)."""
+async def show_nara_page(interaction, details=None, notice=None, bet=False):
+    """/도움말 → 게임 → 나라 맞히기: the game's own buttons (difficulty, ranking, country info); bet: 배팅 starts."""
+    if bet:
+        details = BET_MODE_TEXT + (f"\n{details}" if details else "")
     await show_help(interaction, page="game", selected="nara", details=details, notice=notice,
-                    extra_items=nara_buttons())
+                    extra_items=nara_buttons(bet, interaction.guild.id if interaction.guild else None))
 
 
 # !정보: the introduction from Korean Wikipedia and the numbers, all bundled in assets/countries.json. (Asking
@@ -5664,8 +5711,9 @@ async def quiz_next(q, channel, game, header, answer_file=None):
     if game["number"] >= game["total"]:
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (channel.id,))
-        await channel.send(f"{header}\n🏁 **{q.title} · {game['total']}문제 끝!**\n-# {quiz_result_line(game)}",
-                           **({"file": answer_file} if answer_file else {}))
+        settled = settle_bets(q.key, channel.id, json.loads(game["scores"]))
+        await channel.send(f"{header}\n🏁 **{q.title} · {game['total']}문제 끝!**\n-# {quiz_result_line(game)}"
+                           + (f"\n{settled}" if settled else ""), **({"file": answer_file} if answer_file else {}))
         return
     if answer_file:
         await channel.send(header.rstrip(), file=answer_file)
@@ -5701,16 +5749,17 @@ def quiz_works(q, guild_id):
     return anime_works_of(guild_id) if q is ANIME_QUIZ else None
 
 
-async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFAULT_COUNT, genre=None):
-    off = game_off_message(q.key, guild)
-    if off:  # a /도움말 message opened before the game was switched off
+async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFAULT_COUNT, genre=None, bet=False):
+    off = game_off_message(q.key, guild) or (BET_OFF if bet and not rank_setting("bet", guild.id if guild else None) else None)
+    if off:  # a /도움말 message opened before the game (or 배팅) was switched off
         await channel.send(f"-# {user.mention}님의 요청 · {q.title}\n{off}")
         return
     async with quiz_lock(q, channel.id):
         game = quiz_game(q, channel.id)
-        header = f"-# {user.mention}님의 요청 · {q.title}"
+        header = f"-# {user.mention}님의 요청 · {q.title}" + (" · 🎲 배팅" if bet else "")
         if game:
-            await quiz_post_question(q, channel, game, f"{header}\n진행 중인 퀴즈를 이어서 합니다.")
+            busy = "\n-# 진행 중인 판이 있어서 배팅 판으로 시작하지 못했습니다." if bet and not bet_round(q.key, channel.id) else ""
+            await quiz_post_question(q, channel, game, f"{header}\n진행 중인 퀴즈를 이어서 합니다.{busy}")
             return
         if q is SONG_QUIZ:
             answer = song_pick(guild.id if guild else None, genre)
@@ -5732,6 +5781,8 @@ async def quiz_start(q, channel, guild, user, level=quiz.NORMAL, count=quiz.DEFA
         works = quiz_works(q, guild.id if guild else None)
         if works:
             header += f"\n-# 이 서버에서 고른 작품 {len(works)}개에서 나옵니다 · 바꾸기: `!캐릭설정`"
+        if bet and guild:
+            await open_bets(q.key, q.title, channel, guild)
         await quiz_post_question(q, channel, quiz_game(q, channel.id), header)
 
 
@@ -5741,6 +5792,10 @@ async def quiz_start_command(q, ctx, options):
         await ctx.reply(off, mention_author=False)
         return
     genre = None
+    bet, options = split_bet_word(options)
+    if bet and not rank_setting("bet", ctx.guild.id if ctx.guild else None):
+        await ctx.reply(BET_OFF, mention_author=False)
+        return
     if q is SONG_QUIZ:
         genre, options = quiz.split_song_options(options)
     parsed = quiz.parse_start(options)
@@ -5753,9 +5808,9 @@ async def quiz_start_command(q, ctx, options):
         return
     if parsed is None:
         await ctx.reply(f"`!{q.start} [쉬움|보통|어려움] [문제 수 1~{quiz.MAX_COUNT}]`처럼 써 주세요. "
-                        f"예: `!{q.start} 어려움 20`", mention_author=False)
+                        f"예: `!{q.start} 어려움 20` · 배팅 판: `!{q.start} 보통 배팅`", mention_author=False)
         return
-    await quiz_start(q, ctx.channel, ctx.guild, ctx.author, *parsed, genre=genre)
+    await quiz_start(q, ctx.channel, ctx.guild, ctx.author, *parsed, genre=genre, bet=bet)
 
 
 async def quiz_react(message, emoji):
@@ -5813,6 +5868,7 @@ async def quiz_answer_command(q, ctx, text):
         header = (f"-# {ctx.author.mention}님의 정답 · {q.title}\n🎉 {quiz_reveal(q, answer, game['guild_id'])}\n"
                   f"-# {quiz.LEVEL_NAMES[level]} 누적 {total}개\n")
         answer_file = await song_answer_file(game["guild_id"], answer) if q is SONG_QUIZ else None
+        await close_bets(q.key, ctx.channel)  # the first answer ends the betting
         await quiz_next(q, ctx.channel, quiz_game(q, ctx.channel.id), header, answer_file)
 
 
@@ -5836,10 +5892,11 @@ async def quiz_stop_command(q, ctx):
             return
         with connect_db() as conn:
             conn.execute(f"DELETE FROM {q.table}_games WHERE channel_id = ?", (ctx.channel.id,))
+        refunded = refund_bets(q.key, ctx.channel.id)
         answer_file = await song_answer_file(game["guild_id"], game["answer"]) if q is SONG_QUIZ else None
         await ctx.channel.send(f"-# {ctx.author.mention}님이 멈췄습니다 · {q.title}\n"
-                               f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n-# {quiz_result_line(game)}",
-                               **({"file": answer_file} if answer_file else {}))
+                               f"🏁 마지막 문제 정답: {quiz_reveal(q, game['answer'], game['guild_id'])}\n-# {quiz_result_line(game)}"
+                               + (f"\n{refunded}" if refunded else ""), **({"file": answer_file} if answer_file else {}))
 
 
 def quiz_ranking_text(q, guild_id, limit=10):
@@ -5866,6 +5923,202 @@ async def quiz_ranking_command(q, ctx):
     await ctx.reply(embed=embed, mention_author=False)
 
 
+# ---------------------------------------------------------------- XP 배팅
+# A game started with "배팅" (`!국기시작 보통 배팅`, `!나라시작 배팅`) takes bets for BET_OPEN_SECONDS or until the
+# first answer. Only people who bet are affected: at the end the bettor(s) with the most correct answers take
+# the whole pot (a tie splits it); if no bettor scored, or fewer than two people bet, everyone gets their XP back.
+# XP only moves between bettors (nothing is created), and one person can win at most BET_DAILY_WIN XP a day.
+BET_OPEN_SECONDS = 30
+BET_MIN, BET_MAX = 1, 50
+BET_DAILY_WIN = 100
+BET_WORDS = {"배팅", "베팅", "bet", "내기"}
+BET_OFF = "이 서버에서는 XP 배팅을 쓸 수 없습니다. (관리자 설정)"
+_bet_tasks = set()
+
+
+def split_bet_word(text):
+    """(betting?, the rest) from what follows a start command: '보통 배팅 20' -> (True, '보통 20')."""
+    words = text.split()
+    rest = [w for w in words if w.lower() not in BET_WORDS]
+    return len(rest) != len(words), " ".join(rest)
+
+
+_bet_live = None  # {(game, channel id)} with a bet round: lets normal games skip the DB look-up on every answer
+
+
+def bet_live():
+    global _bet_live
+    if _bet_live is None:
+        with connect_db() as conn:
+            _bet_live = {(r["game"], r["channel_id"]) for r in conn.execute("SELECT game, channel_id FROM bet_rounds")}
+    return _bet_live
+
+
+def bet_round(game, channel_id):
+    if (game, channel_id) not in bet_live():
+        return None
+    with connect_db() as conn:
+        row = conn.execute("SELECT * FROM bet_rounds WHERE game = ? AND channel_id = ?", (game, channel_id)).fetchone()
+    return dict(row) if row else None
+
+
+def bet_round_in(channel_id):
+    if not any(ch == channel_id for _, ch in bet_live()):
+        return None
+    with connect_db() as conn:
+        row = conn.execute("SELECT * FROM bet_rounds WHERE channel_id = ? ORDER BY open_until DESC LIMIT 1",
+                           (channel_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def xp_of(guild_id, user_id):
+    return sum(r[5] for r in xp_breakdown(guild_id, user_id))
+
+
+def staked_elsewhere(guild_id, user_id, game, channel_id):
+    """XP this person has riding on other bet games in this server (it can't be bet twice)."""
+    with connect_db() as conn:
+        rows = conn.execute("SELECT game, channel_id, bets FROM bet_rounds WHERE guild_id = ?", (guild_id,)).fetchall()
+    return sum(json.loads(r["bets"]).get(str(user_id), 0) for r in rows if (r["game"], r["channel_id"]) != (game, channel_id))
+
+
+def won_today(guild_id, user_id):
+    start = time.time() - (time.time() + 9 * 3600) % 86400  # midnight, Korean time
+    with connect_db() as conn:
+        return conn.execute("SELECT COALESCE(SUM(delta), 0) FROM xp_bets WHERE guild_id = ? AND user_id = ? "
+                            "AND delta > 0 AND at >= ?", (guild_id, user_id, start)).fetchone()[0]
+
+
+async def open_bets(game, title, channel, guild):
+    """Make this game a bet game and tell the channel how to join; the window closes on its own."""
+    until = time.time() + BET_OPEN_SECONDS
+    with connect_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO bet_rounds(game, channel_id, guild_id, open_until, bets) VALUES (?, ?, ?, ?, '{}')",
+                     (game, channel.id, guild.id, until))
+    bet_live().add((game, channel.id))
+    await channel.send(f"🎲 **배팅 판**입니다! {BET_OPEN_SECONDS}초 안에(첫 정답 전까지) `!배팅 <XP>`로 참여하세요. "
+                       f"({BET_MIN}~{BET_MAX} XP)\n-# 배팅한 사람 중 가장 많이 맞힌 사람이 판돈을 모두 가져갑니다 · "
+                       "배팅하지 않으면 XP는 그대로예요")
+
+    async def close_later():
+        await asyncio.sleep(BET_OPEN_SECONDS + 1)
+        await close_bets(game, channel)
+    task = asyncio.get_running_loop().create_task(close_later())
+    _bet_tasks.add(task)
+    task.add_done_callback(_bet_tasks.discard)
+
+
+def bet_list_text(bets):
+    pot = sum(bets.values())
+    people = " · ".join(f"<@{uid}> {xp_text(n)}" for uid, n in bets.items())
+    return f"🎲 배팅 마감 · 판돈 **{xp_text(pot)}** ({len(bets)}명)\n-# {people}" if bets else "🎲 배팅 마감 · 아무도 배팅하지 않았습니다."
+
+
+async def close_bets(game, channel):
+    """Stop taking bets (first answer, or the time is up) and show who is in."""
+    row = bet_round(game, channel.id)
+    if not row or row["open_until"] == 0:
+        return
+    with connect_db() as conn:
+        conn.execute("UPDATE bet_rounds SET open_until = 0 WHERE game = ? AND channel_id = ?", (game, channel.id))
+    bets = json.loads(row["bets"])
+    note = "" if len(bets) != 1 else "\n-# 배팅한 사람이 한 명뿐이라 판이 끝나면 돌려받습니다."
+    try:
+        await channel.send(bet_list_text(bets) + note)
+    except discord.HTTPException:
+        pass
+
+
+def refund_bets(game, channel_id):
+    """The game was stopped or given up: nothing is settled, everyone keeps their XP."""
+    row = bet_round(game, channel_id)
+    if not row:
+        return None
+    with connect_db() as conn:
+        conn.execute("DELETE FROM bet_rounds WHERE game = ? AND channel_id = ?", (game, channel_id))
+    bet_live().discard((game, channel_id))
+    return "-# 🎲 배팅은 모두 돌려받았습니다." if json.loads(row["bets"]) else None
+
+
+def settle_bets(game, channel_id, scores):
+    """At the end of a bet game: scores {user id: correct answers}. Returns the text to post, or None."""
+    row = bet_round(game, channel_id)
+    if not row:
+        return None
+    with connect_db() as conn:
+        conn.execute("DELETE FROM bet_rounds WHERE game = ? AND channel_id = ?", (game, channel_id))
+    bet_live().discard((game, channel_id))
+    bets = {str(k): v for k, v in json.loads(row["bets"]).items()}
+    if not bets:
+        return None
+    pot = sum(bets.values())
+    best = max((scores.get(uid, 0) for uid in bets), default=0)
+    if len(bets) < 2 or best == 0:
+        why = "배팅한 사람이 한 명뿐이라" if len(bets) < 2 else "배팅한 사람 중 맞힌 사람이 없어"
+        return f"🎲 {why} 배팅한 XP를 모두 돌려받았습니다. (판돈 {xp_text(pot)})"
+    winners = [uid for uid in bets if scores.get(uid, 0) == best]
+    losers = [uid for uid in bets if uid not in winners]
+    if not losers:
+        return f"🎲 배팅한 사람 모두 {best}개로 같아서 판돈을 돌려받았습니다."
+    prize = sum(bets[uid] for uid in losers)
+    share = prize / len(winners)
+    now, guild_id = time.time(), row["guild_id"]
+    lines, rows = [f"🎲 **배팅 결과** · 판돈 {xp_text(pot)}"], []
+    for uid in winners:
+        room = max(0.0, BET_DAILY_WIN - won_today(guild_id, int(uid)))
+        gain = min(share, room)
+        rows.append((guild_id, int(uid), gain, game, now))
+        capped = " (오늘 배팅으로 얻을 수 있는 XP 한도에 걸림)" if gain < share else ""
+        lines.append(f"🏆 <@{uid}> **+{xp_text(gain)}** (맞힌 개수 {scores.get(uid, 0)}){capped}")
+    for uid in losers:
+        rows.append((guild_id, int(uid), -float(bets[uid]), game, now))
+        lines.append(f"-# <@{uid}> −{xp_text(bets[uid])} (맞힌 개수 {scores.get(uid, 0)})")
+    with connect_db() as conn:
+        conn.executemany("INSERT INTO xp_bets(guild_id, user_id, delta, game, at) VALUES (?, ?, ?, ?, ?)",
+                         [r for r in rows if r[2]])
+    _global_xp["at"] = 0.0
+    return "\n".join(lines)
+
+
+@bot.command(name="배팅", aliases=["베팅", "bet"])
+@commands.guild_only()
+async def bet_command(ctx, amount: str = ""):
+    row = bet_round_in(ctx.channel.id)
+    if row is None:
+        await ctx.reply("이 채널에는 배팅 판이 없습니다. `!국기시작 보통 배팅`처럼 `배팅`을 붙여 시작해 주세요.",
+                        mention_author=False)
+        return
+    if row["open_until"] < time.time():
+        await ctx.reply("배팅이 이미 마감됐습니다. 다음 배팅 판을 기다려 주세요!", mention_author=False)
+        return
+    try:
+        value = float(amount)
+    except ValueError:
+        value = 0
+    if value != int(value) or not BET_MIN <= value <= BET_MAX:
+        await ctx.reply(f"`!배팅 <XP>`처럼 {BET_MIN}~{BET_MAX} 사이 정수로 써 주세요. 예: `!배팅 10`", mention_author=False)
+        return
+    value = int(value)
+    have = xp_of(ctx.guild.id, ctx.author.id) - staked_elsewhere(ctx.guild.id, ctx.author.id, row["game"], ctx.channel.id)
+    if value > have:
+        await ctx.reply(f"XP가 부족합니다. 걸 수 있는 XP: **{xp_text(max(have, 0))}**", mention_author=False)
+        return
+    with connect_db() as conn:
+        current = conn.execute("SELECT bets, open_until FROM bet_rounds WHERE game = ? AND channel_id = ?",
+                               (row["game"], ctx.channel.id)).fetchone()
+        if current is None or current["open_until"] < time.time():
+            await ctx.reply("배팅이 이미 마감됐습니다.", mention_author=False)
+            return
+        bets = json.loads(current["bets"])
+        changed = str(ctx.author.id) in bets
+        bets[str(ctx.author.id)] = value
+        conn.execute("UPDATE bet_rounds SET bets = ? WHERE game = ? AND channel_id = ?",
+                     (json.dumps(bets), row["game"], ctx.channel.id))
+    left = max(1, int(current["open_until"] - time.time()))
+    await ctx.reply(f"🎲 {'배팅을 바꿨습니다' if changed else '배팅했습니다'}: **{value} XP** · 판돈 {xp_text(sum(bets.values()))} "
+                    f"({len(bets)}명) · {left}초 뒤 마감", mention_author=False)
+
+
 # ---------------------------------------------------------------- 랭킹 (XP)
 # One ranking over all games, worked out from the per-game records that are already kept (so past
 # answers count and nothing new is stored). 지리 (나라 한 판, 수도·지도 한 문제) 1 XP; 국기·애니캐·노래 0.5 XP.
@@ -5881,7 +6134,8 @@ RANK_PAGE_SIZE = 15
 # Admin panel switches (settings rows "rank:show:default", "rank:show:<server id>", "rank:global:..."):
 # show  = 순위 보이기 (medals, 1. 2. 3., "n위"); global = 전체 랭킹 (!순위 전체, and the server's records count in it).
 # A server without its own value follows the default; the defaults start off.
-RANK_SETTINGS = {"show": "순위 보이기", "global": "전체 랭킹"}
+RANK_SETTINGS = {"show": "순위 보이기", "global": "전체 랭킹", "bet": "XP 배팅"}
+RANK_DEFAULTS = {"show": False, "global": False, "bet": True}  # until the admin panel sets a default
 
 
 def rank_values():
@@ -5896,7 +6150,7 @@ def rank_setting(name, guild_id=None):
     values = rank_values()
     if guild_id and f"rank:{name}:{guild_id}" in values:
         return values[f"rank:{name}:{guild_id}"]
-    return values.get(f"rank:{name}:default", False)
+    return values.get(f"rank:{name}:default", RANK_DEFAULTS.get(name, False))
 
 
 def global_rank_guilds():
@@ -5919,6 +6173,7 @@ def xp_totals(guild_id=None, guild_ids=None):
         where = f"WHERE guild_id IN ({','.join('?' * len(ids))})"
     parts = [f"SELECT user_id, ({count}) * {weight} AS xp FROM {table} {where}"
              for _, _, _, table, count, weight, _ in XP_SOURCES]
+    parts.append(f"SELECT user_id, delta AS xp FROM xp_bets {where}")  # XP won or lost in 배팅
     params = ids * len(parts)
     with connect_db() as conn:
         rows = conn.execute(f"SELECT user_id, SUM(xp) AS xp FROM ({' UNION ALL '.join(parts)}) "
@@ -5943,6 +6198,10 @@ def xp_breakdown(guild_id, user_id):
             names = ("쉬움", "보통") if key == "anime" else ("쉬움", "보통", "어려움")  # 애니캐 has no 어려움
             detail = " · ".join(f"{n} {v}" for n, v in zip(names, levels) if v)
             out.append((key, title, emoji, total, detail, total * weight, unit))
+        row = conn.execute("SELECT COALESCE(SUM(delta), 0), COALESCE(SUM(delta > 0), 0), COALESCE(SUM(delta < 0), 0) "
+                           "FROM xp_bets WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)).fetchone()
+        if row[1] or row[2]:
+            out.append(("bet", "XP 배팅", "🎲", row[1], f"{row[1]}승 {row[2]}패", row[0], "승"))
     return out
 
 
@@ -6075,6 +6334,9 @@ def ranking_detail_embed(guild, member):
                           description=f"**{xp_text(total)}**" + (f" · 서버 {place}위" if place else ""),
                           color=discord.Color.gold())
     for key, title, emoji, count, detail, xp, unit in rows:
+        if key == "bet":
+            embed.add_field(name=f"{emoji} {title}", value=f"**{detail}**\n→ {'+' if xp >= 0 else ''}{xp_text(xp)}", inline=True)
+            continue
         embed.add_field(name=f"{emoji} {title}",
                         value=f"**{count}{unit}**" + (f" ({detail})" if detail else "") + f"\n→ {xp_text(xp)}", inline=True)
     embed.set_footer(text="지리(나라 한 판·수도·지도) 1 XP · 국기·애니캐·노래 0.5 XP · 출제 판은 제외")
@@ -6715,19 +6977,34 @@ async def song_delete_command(ctx, number: str = ""):
     await ctx.reply(f"🗑️ 지웠습니다: **{row['title']}** - {row['artist']}", mention_author=False)
 
 
-def quiz_buttons(q):
-    buttons = [HelpButton(f"{q.key}_easy", "쉬움 시작", "🟢", discord.ButtonStyle.success, row=2),
-               HelpButton(f"{q.key}_normal", "보통 시작", "🌍", discord.ButtonStyle.primary, row=2),
-               HelpButton(f"{q.key}_hard", "어려움 시작", "🔥", discord.ButtonStyle.danger, row=2),
+BET_MODE_TEXT = ("🎲 **배팅 판** · 아래 버튼으로 시작하면 처음 30초 동안(첫 정답 전까지) `!배팅 <XP>`로 1~50 XP를 걸 수 있어요. "
+                 "배팅한 사람 중 가장 많이 맞힌 사람이 판돈을 모두 가져가고, 배팅하지 않은 사람의 XP는 그대로예요.")
+
+
+def bet_toggle(key, bet, guild_id):
+    """Row-3 button that flips a game page between normal and 배팅 starts (so the start buttons don't double)."""
+    if bet:
+        return [HelpButton(f"{key}_plain", "일반 판으로", "◀", discord.ButtonStyle.secondary, row=3)]
+    if rank_setting("bet", guild_id):
+        return [HelpButton(f"{key}_betmode", "배팅 판", "🎲", discord.ButtonStyle.secondary, row=3)]
+    return []
+
+
+def quiz_buttons(q, bet=False, guild_id=None):
+    start = f"{q.key}_bet_" if bet else f"{q.key}_"
+    word = "배팅" if bet else "시작"
+    buttons = [HelpButton(f"{start}easy", f"쉬움 {word}", "🟢", discord.ButtonStyle.success, row=2),
+               HelpButton(f"{start}normal", f"보통 {word}", "🌍", discord.ButtonStyle.primary, row=2),
+               HelpButton(f"{start}hard", f"어려움 {word}", "🔥", discord.ButtonStyle.danger, row=2),
                HelpButton(f"{q.key}_rank", "순위", "🏆", discord.ButtonStyle.secondary, row=2)]
     if q is ANIME_QUIZ:
         buttons = [b for b in buttons if not b.action.endswith("_hard")]
         buttons.append(HelpButton("anime_settings", "작품 고르기", "⚙️", discord.ButtonStyle.secondary, row=2))
-    return buttons
+    return buttons + bet_toggle(q.key, bet, guild_id)
 
 
-async def show_quiz_page(q, interaction, details=None, extra=()):
-    """/도움말 → 게임 → one quiz's page."""
+async def show_quiz_page(q, interaction, details=None, extra=(), bet=False):
+    """/도움말 → 게임 → one quiz's page (bet: its 배팅 version)."""
     off = game_off_message(q.key, interaction.guild)
     if off:  # a button from before the game was switched off
         await show_help(interaction, page="game", notice=off)
@@ -6735,20 +7012,23 @@ async def show_quiz_page(q, interaction, details=None, extra=()):
     if q is ANIME_QUIZ and interaction.guild and details is None:
         works = anime_works_of(interaction.guild.id)
         details = f"-# 이 서버: 고른 작품 {len(works)}개" if works else "-# 이 서버: 모든 작품"
+    if bet:
+        details = BET_MODE_TEXT + (f"\n{details}" if details else "")
     await show_help(interaction, page="game", selected=q.key, details=details,
-                    extra_items=[*quiz_buttons(q), *extra])
+                    extra_items=[*quiz_buttons(q, bet, interaction.guild.id if interaction.guild else None), *extra])
 
 
 def help_quiz_actions(q):
     """HELP_ACTIONS entries for one quiz's page and buttons."""
-    def start(level):
+    def start(level, bet=False):
         async def handler(interaction):
             if interaction.guild is None or interaction.channel is None:
                 await show_help(interaction, notice=SERVER_ONLY_MESSAGE)
                 return
-            await show_quiz_page(q, interaction)
-            ctx = HelpContext(interaction, f"{q.title} · {quiz.LEVEL_NAMES[level]}")
-            await run_from_help(ctx, quiz_start(q, interaction.channel, interaction.guild, interaction.user, level), channel_only=True)
+            await show_quiz_page(q, interaction, bet=bet)
+            ctx = HelpContext(interaction, f"{q.title} · {quiz.LEVEL_NAMES[level]}" + (" · 배팅" if bet else ""))
+            await run_from_help(ctx, quiz_start(q, interaction.channel, interaction.guild, interaction.user, level, bet=bet),
+                                channel_only=True)
         return handler
 
     async def rank(interaction):
@@ -6762,6 +7042,9 @@ def help_quiz_actions(q):
     return {
         f"run_{q.key}": lambda interaction: show_quiz_page(q, interaction),
         **{f"{q.key}_{level}": start(level) for level in (quiz.EASY, quiz.NORMAL, quiz.HARD)},
+        **{f"{q.key}_bet_{level}": start(level, bet=True) for level in (quiz.EASY, quiz.NORMAL, quiz.HARD)},
+        f"{q.key}_betmode": lambda interaction: show_quiz_page(q, interaction, bet=True),
+        f"{q.key}_plain": lambda interaction: show_quiz_page(q, interaction),
         f"{q.key}_rank": rank,
     }
 
@@ -6790,6 +7073,11 @@ HELP_ACTIONS = {
     "nara_normal": help_run_nara(nara.NORMAL),
     "nara_hard": help_run_nara(nara.HARD),
     "nara_rank": help_run_nara_rank,
+    "nara_bet_easy": help_run_nara(nara.EASY, bet=True),
+    "nara_bet_normal": help_run_nara(nara.NORMAL, bet=True),
+    "nara_bet_hard": help_run_nara(nara.HARD, bet=True),
+    "nara_betmode": lambda interaction: show_nara_page(interaction, bet=True),
+    "nara_plain": lambda interaction: show_nara_page(interaction),
     "run_ranking": help_run_ranking,
     "ranking_server": help_run_ranking,
     "ranking_all": lambda interaction: help_run_ranking(interaction, everywhere=True),
