@@ -6418,6 +6418,11 @@ def active_boosts(guild_id=None):
     return sorted(rows, key=lambda r: r[2])
 
 
+def boost_label(target):
+    """For the admin panel's messages: '모든 사람' / a name (or the ID)."""
+    return "모든 사람" if target == BOOST_ALL else (user_name(int(target)) or target)
+
+
 def boost_who(target):
     return "이 서버의 모든 사람" if target == BOOST_ALL else f"<@{target}>"
 
@@ -7948,6 +7953,25 @@ async def dashboard_job(job):
                     set_setting(key, "1" if value else "0")
                 where = "기본값" if guild_id == "default" else guild_label(guild_id)
                 message = f"{RANK_SETTINGS[name]} · {where}: " + ("기본값 따름" if value is None else "켜짐" if value else "꺼짐")
+        elif kind == "set_xp_boost":  # 관리자 패널의 🔥 XP 2배: {guild, target: "all" | user id, seconds (0 = 끝내기)}
+            guild_id, target, seconds = dashboard_guild_id(args.get("guild")), str(args.get("target") or ""), args.get("seconds")
+            if target.lower() in ("all", "전체", "모두"):
+                target = BOOST_ALL
+            if not guild_id or not bot.get_guild(guild_id):
+                ok, message = False, "봇이 들어가 있는 서버를 골라 주세요."
+            elif target != BOOST_ALL and not (target.isdigit() and 15 <= len(target) <= 21):
+                ok, message = False, "대상은 all 또는 디스코드 사용자 ID(숫자)여야 합니다."
+            elif not isinstance(seconds, int) or isinstance(seconds, bool) or not (seconds == 0 or 60 <= seconds <= BOOST_MAX_SECONDS):
+                ok, message = False, "시간은 1분부터 30일까지입니다."
+            elif seconds == 0:
+                if target not in boosts().get(guild_id, {}):
+                    ok, message = False, "걸린 XP 2배가 없습니다."
+                else:
+                    set_boost(guild_id, target, 0, 0)
+                    message = f"XP 2배 끝 · {guild_label(guild_id)} · {boost_label(target)}"
+            else:
+                set_boost(guild_id, target, time.time() + seconds, 0)
+                message = f"XP 2배 · {guild_label(guild_id)} · {boost_label(target)} · {human_duration(seconds)}"
         elif kind == "set_uptime_guild":
             guild_id = dashboard_guild_id(args.get("scope"))
             if not guild_id:
